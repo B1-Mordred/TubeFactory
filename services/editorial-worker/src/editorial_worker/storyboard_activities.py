@@ -12,6 +12,7 @@ from temporalio.exceptions import ApplicationError
 
 from editorial_core.editorial import validate_scene_spec, validate_storyboard
 from editorial_worker.config import Settings
+from editorial_worker.channel_workflow import channel_workflow_context
 from editorial_worker.contracts import StoryboardDraft
 from editorial_worker.db import append_audit
 from editorial_worker.model_activities import load_task_routes
@@ -31,8 +32,15 @@ async def load_storyboard_generation_context(request: dict[str, Any]) -> dict[st
         script = await connection.fetchrow(
             """SELECT s.id,s.status,s.current_version_id,sv.id AS script_version_id,
                       sv.version_number,sv.status AS version_status,sv.title,sv.content_hash,
-                      sv.coverage_percent,sv.total_duration_seconds
-               FROM scripts s JOIN script_versions sv ON sv.id=s.current_version_id
+                      sv.coverage_percent,sv.total_duration_seconds,
+                      cp.id AS channel_profile_id,cp.name AS channel_name,
+                      cp.editorial_rules AS channel_editorial_rules
+               FROM scripts s
+               JOIN script_versions sv ON sv.id=s.current_version_id
+               JOIN research_dossiers d ON d.id=s.research_dossier_id
+               JOIN opportunities o ON o.id=d.opportunity_id
+               JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               JOIN channel_profiles cp ON cp.id=sp.channel_profile_id
                WHERE s.id=$1 AND s.deleted_at IS NULL""",
             script_id,
         )
@@ -117,6 +125,7 @@ async def load_storyboard_generation_context(request: dict[str, Any]) -> dict[st
         if not segments:
             raise ApplicationError("approved script has no immutable segments", non_retryable=True)
         routes = await load_task_routes(connection, "storyboard")
+        channel_workflow = channel_workflow_context(script["channel_editorial_rules"])
         return {
             "script_id": str(script_id),
             "script_version_id": str(script_version_id),
@@ -125,10 +134,17 @@ async def load_storyboard_generation_context(request: dict[str, Any]) -> dict[st
             "actor_id": str(request["actor_id"]),
             "correlation_id": request["correlation_id"],
             "routes": routes,
+            "channel_workflow": channel_workflow,
             "structured_inputs": {
                 "script_id": str(script_id),
                 "script_version_id": str(script_version_id),
                 "title": script["title"],
+                "channel": {
+                    "id": str(script["channel_profile_id"]),
+                    "name": script["channel_name"],
+                    "workflow_key": channel_workflow["key"],
+                    "workflow_version": channel_workflow["version"],
+                },
                 "coverage_percent": script["coverage_percent"],
                 "total_duration_seconds": script["total_duration_seconds"],
                 "segments": segments,
@@ -155,10 +171,17 @@ async def load_scene_alternative_context(request: dict[str, Any]) -> dict[str, A
                       sv.coverage_percent,sv.total_duration_seconds,
                       sc.current_version_id AS scene_version_id,sc.locked,
                       scv.version_number AS scene_version,scv.scene_order,
-                      scv.scene_spec,scv.content_hash AS scene_content_hash
+                      scv.scene_spec,scv.content_hash AS scene_content_hash,
+                      cp.id AS channel_profile_id,cp.name AS channel_name,
+                      cp.editorial_rules AS channel_editorial_rules
                FROM storyboards sb
                JOIN storyboard_versions sbv ON sbv.id=sb.current_version_id
                JOIN script_versions sv ON sv.id=sbv.script_version_id
+               JOIN scripts s ON s.id=sb.script_id
+               JOIN research_dossiers d ON d.id=s.research_dossier_id
+               JOIN opportunities o ON o.id=d.opportunity_id
+               JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               JOIN channel_profiles cp ON cp.id=sp.channel_profile_id
                JOIN scenes sc ON sc.storyboard_id=sb.id
                JOIN scene_versions scv ON scv.id=sc.current_version_id
                WHERE sb.id=$1 AND sc.id=$2 AND sb.deleted_at IS NULL
@@ -256,6 +279,7 @@ async def load_scene_alternative_context(request: dict[str, Any]) -> dict[str, A
                 }
             )
         routes = await load_task_routes(connection, "storyboard")
+        channel_workflow = channel_workflow_context(row["channel_editorial_rules"])
         return {
             "storyboard_id": str(storyboard_id),
             "storyboard_version_id": str(row["current_version_id"]),
@@ -269,10 +293,17 @@ async def load_scene_alternative_context(request: dict[str, Any]) -> dict[str, A
             "correlation_id": request["correlation_id"],
             "instruction": str(request["instruction"]),
             "routes": routes,
+            "channel_workflow": channel_workflow,
             "structured_inputs": {
                 "script_id": str(row["script_id"]),
                 "script_version_id": str(row["script_version_id"]),
                 "title": row["title"],
+                "channel": {
+                    "id": str(row["channel_profile_id"]),
+                    "name": row["channel_name"],
+                    "workflow_key": channel_workflow["key"],
+                    "workflow_version": channel_workflow["version"],
+                },
                 "coverage_percent": row["coverage_percent"],
                 "total_duration_seconds": row["total_duration_seconds"],
                 "segments": segments,

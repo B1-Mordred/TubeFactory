@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from editorial_core.authorization import Role
+from editorial_core.channel_workflow import channel_automation_workflow
 from editorial_core.operating_policy import evaluate_operating_policy
 from editorial_core.publishing import PublishMode
 
@@ -508,6 +509,12 @@ class ChannelProfileWrite(StrictRequestModel):
         if not normalized:
             raise ValueError("at least one language is required")
         return normalized
+
+    @field_validator("editorial_rules")
+    @classmethod
+    def validated_channel_workflow(cls, value: dict[str, Any]) -> dict[str, Any]:
+        channel_automation_workflow(value)
+        return value
 
 
 class ChannelProfileUpdate(ChannelProfileWrite):

@@ -14,6 +14,7 @@ COPY services/api/src/youtuber_api/__init__.py /tmp/api/src/youtuber_api/__init_
 RUN python -m pip install --no-cache-dir /app/packages/core '/tmp/api[test]'
 
 COPY services/api /app/services/api
+COPY config /app/config
 RUN python -m pip install --no-cache-dir --no-deps /app/services/api
 
 WORKDIR /app/services/api

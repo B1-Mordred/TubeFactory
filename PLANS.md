@@ -20,6 +20,7 @@ The authoritative product requirements are the user-supplied mission brief. `doc
 - [x] 2026-07-21: Final reproducible deployment, migration, regression, security, observability and recovery audit passed; real Google action remains operator-credential-gated.
 - [x] 2026-07-21: Complete channel/subject lifecycle management passed: prefilled version-checked edits, audited soft deletion, schedule cleanup, dependency protection, responsive operator controls, and live validation.
 - [x] 2026-07-21: Add a searchable Archived profiles restore workspace and replace placeholder live-opportunity scoring with evidence-derived, auditable score version 2 traces.
+- [x] 2026-07-21: Configure and validate a channel-scoped FaktischSimpel explainer workflow with evidence-safe AI prompts, scheduled topic discovery, operator guidance, live browser evidence, and an illustrated DOCX operations guide.
 
 ## Milestones
 
@@ -63,6 +64,7 @@ PostgreSQL is authoritative for metadata and workflow-facing state; immutable la
 - 2026-07-21: Give dry-run and real uploads distinct stable release keys so a safe rehearsal never consumes or aliases the real external side effect.
 - 2026-07-21: Expose user-requested profile deletion as recoverable archival. Preserve linked workflows, evidence and audit history; archive subjects only after stopping their schedule, and block channel archival while active subjects remain.
 - 2026-07-21: Restore archived profiles as disabled records. Require the parent channel to be active before restoring a subject, keep its schedule paused, and create a new audited version instead of erasing archive history.
+- 2026-07-21: Treat channel automation instructions as trusted style refinements only. They may shape explanation structure, language and visuals but cannot relax approved-claim, exact-evidence, independent-verification, JSON-schema, human-approval or private-publication gates.
 
 ## Discoveries
 
@@ -70,6 +72,9 @@ PostgreSQL is authoritative for metadata and workflow-facing state; immutable la
 - 2026-07-20: The host has Docker 29.1.3 and Compose 2.40.3; host Python is 3.14 and npm is absent, so validation must run in pinned containers.
 - 2026-07-20: The installed ExecPlan skill omitted its required `references/PLANS.md`; this plan therefore embeds all context needed for continuation.
 - 2026-07-21: Live score concentration at 53 is caused by placeholder constants in `persist-live-opportunities`: five positive dimensions and two penalties are constant, while the remaining formulas receive the same one-result/one-domain inputs for most clusters. PostgreSQL confirmed 175 active opportunities at 53 and only seven at other values.
+- 2026-07-21: FaktischSimpel existed as enabled channel version 2 with its German description and evidence-first rule, but had no subject profile and the editorial workers selected only one global prompt per task. Channel-specific tone therefore requires bounded additional system instructions resolved through the dossier-to-channel lineage, while retaining the global strict response contracts.
+- 2026-07-21: Initial script generation accidentally referenced regeneration-only selection fields, while the regeneration workflow did not receive them. The operational instruction was moved to regeneration and both paths now receive the channel workflow through their lineage.
+- 2026-07-21: A clean editorial-worker build exposed stale pre-TubeFactory dependency names in the editorial and publisher package metadata. The package requirements now match the renamed local distributions, so the result no longer depends on an old Docker layer.
 
 ## Validation and acceptance evidence
 
@@ -165,3 +170,12 @@ Compose stop/start must preserve named volumes. Migrations are forward-only and 
 - Before the upgrade, 175 active opportunities had the identical 53 trace. Current latest live-discovery scores span 30 integer values from 26 through 74; 19 round to 53 naturally, with varied component and reason traces, and no latest score retains the placeholder component set.
 - API regression passed with 96 tests, research-worker regression passed with 40 tests, and the Next.js TypeScript and optimized production build gates passed. Rebuilt API, research-worker and web services are healthy in the 25-service deployment.
 - Browser checks at desktop and 390 pixels confirmed archived search/empty states, dependency-aware restore controls and score-version-2 detail presentation. A live 51/100 finding showed seven observed components, three penalties and finding-specific reasons; the TubeFactory browser console reported zero errors and zero warnings.
+
+2026-07-21 FaktischSimpel workflow evidence:
+
+- Channel version 3 contains validated workflow `faktischsimpel.explainer` with 13 visible production stages, separate Writer, independent Verifier and Storyboard prompts, and all six mandatory human gates. Compiled instruction lengths are 2,389, 1,910 and 1,773 characters, below the 5,000-character task boundary.
+- The worker resolves the channel through dossier/opportunity/subject lineage for initial generation, regeneration, verification, storyboard generation and scene alternatives. Channel instructions remain bounded style refinements layered beneath global evidence, schema, validation and private-publication contracts.
+- `FaktischSimpel Themenradar` was created disabled, its six-strategy search plan and falsification branch were reviewed, then version 3 was enabled. PostgreSQL confirmed Cron `0 7 * * 1`, timezone `Europe/Berlin` and an active Temporal schedule.
+- A manual live-discovery workflow completed validated planning, seven private metasearch calls, clustering and scoring at `OPPORTUNITY_REVIEW` 100%. The observed run produced no candidates, which remains a valid non-fabricating outcome; the weekly schedule stays active.
+- Core plus API regression passed with 101 tests; editorial-worker regression passed with 16 tests; publisher-worker regression passed with 3 tests after the dependency-name correction. The web TypeScript test and production Next.js build passed, and all rebuilt services are healthy after deployment.
+- Playwright captured the live 13-stage workflow, full Writer prompt, validated search plan, active schedule, searchable six-step task guide and completed discovery trace. The illustrated 11-page A4 DOCX is `docs/FaktischSimpel-Automatisierungsworkflow.docx`; LibreOffice conversion and visual inspection confirmed readable cover, screenshots and exact prompt appendix.

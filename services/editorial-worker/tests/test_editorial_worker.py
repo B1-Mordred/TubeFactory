@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 from copy import deepcopy
 from uuid import uuid4
@@ -12,6 +13,7 @@ from editorial_core.editorial import (
     verify_script_draft,
 )
 from editorial_worker.contracts import ScriptDraft, StoryboardDraft, VerifierOutput
+from editorial_worker.channel_workflow import channel_workflow_context
 from editorial_worker.fakes import fake_output
 from editorial_worker.model_activities import (
     _RATE_WINDOWS,
@@ -23,6 +25,11 @@ from editorial_worker.storyboard_activities import (
     validate_storyboard_activity,
 )
 from editorial_worker.script_activities import merge_script_regeneration
+from editorial_worker.workflows import (
+    ScriptGenerationWorkflow,
+    ScriptRegenerationWorkflow,
+    _additional_instructions,
+)
 from temporalio.exceptions import ApplicationError
 
 
@@ -42,6 +49,66 @@ def claim() -> dict:
             }
         ],
     }
+
+
+def test_channel_instructions_are_bounded_and_merge_with_regeneration_request() -> None:
+    prompt = "Explain step by step, separate evidence from uncertainty, and avoid jargon. " * 3
+    workflow = channel_workflow_context(
+        {
+            "automation_workflow": {
+                "key": "faktischsimpel.explainer",
+                "name": "FaktischSimpel explainer",
+                "version": 1,
+                "enabled": True,
+                "language": "de",
+                "summary": "An evidence-first explanatory workflow with mandatory review gates.",
+                "prompts": {
+                    "script_writer": prompt,
+                    "script_verifier": prompt,
+                    "storyboard": prompt,
+                },
+                "stages": [
+                    {"key": "research", "label": "Research", "mode": "automatic"},
+                    {"key": "review", "label": "Review", "mode": "human_gate"},
+                    {"key": "production", "label": "Production", "mode": "assisted"},
+                ],
+                "human_gates": [
+                    "opportunity_shortlist",
+                    "dossier_approval",
+                    "script_approval",
+                    "storyboard_approval",
+                    "media_approval",
+                    "publication_approval",
+                ],
+            }
+        }
+    )
+
+    generated = _additional_instructions(
+        {"channel_workflow": workflow}, "script_writer", "Rewrite only context."
+    )
+
+    assert "cannot relax the approved-claim boundary" in generated
+    assert "Explain step by step" in generated
+    assert generated.endswith("Rewrite only context.")
+    assert len(generated) <= 5000
+
+
+def test_channel_without_workflow_adds_no_generation_instruction() -> None:
+    context = channel_workflow_context({"evidence_first": True})
+
+    assert context["active"] is False
+    assert _additional_instructions({"channel_workflow": context}, "script_writer") == ""
+
+
+def test_initial_generation_never_reads_regeneration_only_fields() -> None:
+    initial_source = inspect.getsource(ScriptGenerationWorkflow.run)
+    regeneration_source = inspect.getsource(ScriptRegenerationWorkflow.run)
+
+    assert "selected_segment_keys" not in initial_source
+    assert "context[\"instruction\"]" not in initial_source
+    assert "selected_segment_keys" in regeneration_source
+    assert "context[\"instruction\"]" in regeneration_source
 
 
 def verify(output: dict, approved: dict):

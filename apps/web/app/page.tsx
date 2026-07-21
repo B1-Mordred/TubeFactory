@@ -63,6 +63,12 @@ type SubjectProfile = {
 };
 type ArchivedChannelProfile = ChannelProfile & { archived_at: string };
 type ArchivedSubjectProfile = SubjectProfile & { archived_at: string };
+type ChannelAutomationWorkflow = {
+  key: string; name: string; version: number; enabled: boolean; language: string; summary: string;
+  prompts: Record<"script_writer" | "script_verifier" | "storyboard", string>;
+  stages: { key: string; label: string; mode: "automatic" | "assisted" | "human_gate" }[];
+  human_gates: string[];
+};
 type SubjectSchedule = { schedule_id: string; exists: boolean; paused: boolean; cron: string | null; timezone: string; action_count: number; next_action_times: string[] };
 type SearchPlan = { subject_topic: string; strategies: { purpose: string; query: string; language: string; region: string | null }[]; falsification_queries: string[] };
 type Opportunity = { id: string; version: number; subject_profile_id: string; title: string; summary: string; editorial_rationale: string; estimated_cost: Record<string, unknown>; policy_snapshot: { mode?: string; required_human_gates?: string[]; [key: string]: unknown }; decision: string; score: number | null; score_version: number | null; score_components: Record<string, number>; score_penalties: Record<string, number>; score_weights: Record<string, number>; score_reasoning: string[]; grouping_reason: string[]; source_count: number; snapshot_count: number; research_state: string | null; created_at: string };
@@ -251,6 +257,22 @@ const helpTasks: HelpTask[] = [
       "Expand a result to inspect its archived version, configuration summary and archive time.",
       "Restore an archived Channel before restoring any subjects that belong to it.",
       "Restore the subject. It returns disabled and its schedule stays paused until you deliberately enable and apply it.",
+    ],
+  },
+  {
+    id: "faktischsimpel-explainer",
+    title: "Produce a FaktischSimpel explainer",
+    summary: "Move a discovered question through evidence, channel-specific writing, independent checking, visuals and exact-version approvals.",
+    category: "FaktischSimpel workflow",
+    page: "profiles",
+    keywords: ["faktischsimpel", "explainer", "erklärvideo", "automation", "evidence", "prompt", "workflow"],
+    steps: [
+      "In Channels & subjects, confirm that FaktischSimpel Erklärvideo is enabled and the Themenradar schedule is active.",
+      "In Research & evidence, review a finding in full. Shortlist only a question with a clear audience benefit and adequate source potential.",
+      "Acquire sources, approve exact claims, counterevidence and unresolved questions, then approve the dossier version.",
+      "Generate the script. The channel prompt enforces German step-by-step explanation; a separately routed model checks evidence, uncertainty and understandable structure.",
+      "Approve the exact verified script, generate and review the explanatory storyboard, then approve the exact storyboard version.",
+      "Produce media, resolve blocking QA findings, approve the exact render, upload privately and authorize publication separately.",
     ],
   },
   {
@@ -831,6 +853,12 @@ function recordStrings(record: Record<string, unknown>, name: string): string[] 
   return Array.isArray(value) ? value.map(item => String(item)) : [];
 }
 
+function automationWorkflow(channel: ChannelProfile): ChannelAutomationWorkflow | null {
+  const value = channel.editorial_rules.automation_workflow;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as ChannelAutomationWorkflow;
+}
+
 function jsonObjectFromForm(data: FormData, name: string): Record<string, unknown> {
   const value = JSON.parse(String(data.get(name) || "{}")) as unknown;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${readableDetailName(name)} must be a JSON object.`);
@@ -1045,6 +1073,8 @@ function ProfilesPanel({ csrf, role, activeChannelId, onChannelsChanged }: { csr
 
   const scopedSubjects = activeChannelId ? subjects.filter(subject => subject.channel_profile_id === activeChannelId) : subjects;
   const channelNames = new Map(channels.map(channel => [channel.id, channel.name]));
+  const automatedChannels = channels.map(channel => ({ channel, workflow: automationWorkflow(channel) }))
+    .filter(item => item.workflow && (!activeChannelId || item.channel.id === activeChannelId)) as { channel: ChannelProfile; workflow: ChannelAutomationWorkflow }[];
   return <><div className="page-heading"><div><p className="eyebrow">Discovery configuration</p><h1>Channels and subjects</h1></div><span className="status good">Monitoring online</span></div>
     {message && <div className="notice">{message}</div>}
     <div className="profile-grid">
@@ -1057,6 +1087,7 @@ function ProfilesPanel({ csrf, role, activeChannelId, onChannelsChanged }: { csr
         {(role === "admin" || role === "editor") && <form onSubmit={createSubject}><label>Channel<select name="channel_profile_id" value={selectedChannel} onChange={event => setSelectedChannel(event.target.value)} required><option value="">Select a channel</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></label><label>Profile name<input name="name" required /></label><label>Topic<input name="topic" required /></label><label>Research goal<textarea name="research_goal" rows={3} required /></label><label>Seed queries, one per line<textarea name="seed_queries" rows={3} required /></label><label>Excluded terms, one per line<textarea name="negative_keywords" rows={2} placeholder="Satire&#10;Kommentar" /></label><div className="form-pair"><label>Language<input name="language" defaultValue="en" required /></label><label>Risk<select name="risk" defaultValue="medium"><option>low</option><option>medium</option><option>high</option></select></label></div><div className="form-pair"><label>Operating profile<select name="operating_mode" defaultValue="assisted"><option value="assisted">Assisted</option><option value="supervised">Supervised</option><option value="trusted">Trusted</option></select></label><label>Sensitive categories, comma separated<input name="sensitive_topics" placeholder="health, politics" /></label></div><div className="form-pair"><label>Minimum factual claims / 100 words<input name="evidence_density_minimum" type="number" min="0" max="100" step="0.1" defaultValue="1" /></label><label>Repeated-scene limit<input name="repeated_scene_limit" type="number" min="0" max="100" defaultValue="1" /></label></div><small className="muted">Sensitive categories: identifiable_accusation, health, legal, finance, politics, breaking_news, misinformation_fact_checking.</small><div className="form-pair"><label>Recent article window (days)<input name="lookback_days" type="number" min="1" max="365" defaultValue="7" required /></label><label>IANA timezone<input name="timezone" defaultValue="UTC" required /></label></div><label>Temporal cron<input name="cron" placeholder="0 6 * * *" /></label><button className="primary" disabled={!channels.length}>Create disabled subject</button></form>}
       </section>
     </div>
+    {automatedChannels.map(({ channel, workflow }) => <section className="panel channel-automation" key={`automation-${channel.id}`}><div className="panel-title"><div><p className="eyebrow">Channel-scoped production</p><h2>{workflow.name}</h2><p>{workflow.summary}</p></div><span className={`status ${workflow.enabled ? "good" : "waiting"}`}>{workflow.enabled ? `active · v${workflow.version}` : `disabled · v${workflow.version}`}</span></div><div className="automation-stage-list">{workflow.stages.map((stage, index) => <article key={stage.key}><span>{index + 1}</span><div><strong>{stage.label}</strong><small>{stage.mode === "human_gate" ? "Human approval" : stage.mode === "automatic" ? "Automatic" : "Operator assisted"}</small></div></article>)}</div><div className="automation-prompt-grid"><details><summary>Writer prompt</summary><pre>{workflow.prompts.script_writer}</pre></details><details><summary>Independent verifier prompt</summary><pre>{workflow.prompts.script_verifier}</pre></details><details><summary>Storyboard prompt</summary><pre>{workflow.prompts.storyboard}</pre></details></div><div className="notice"><strong>Mandatory gates remain:</strong> opportunity, dossier, script, storyboard, exact media render and publication approval. The workflow cannot publish automatically.</div></section>)}
     {editingProfile && <ProfileEditDialog target={editingProfile} channels={channels} onClose={() => setEditingProfile(null)} onSaveChannel={updateChannel} onSaveSubject={updateSubject} />}
     {archiveProfile && <ArchiveProfileDialog target={archiveProfile} blockingSubjects={archiveProfile.kind === "channel" ? subjects.filter(subject => subject.channel_profile_id === archiveProfile.profile.id) : []} onClose={() => setArchiveProfile(null)} onArchive={archiveSelected} />}
     {plan && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Validated search plan</p><h2>{plan.subject_topic}</h2></div><button className="secondary compact" onClick={() => setPlan(null)}>Close</button></div><div className="strategy-list">{plan.strategies.map((strategy, index) => <article key={`${strategy.purpose}-${index}`}><span className="chip">{strategy.purpose}</span><code>{strategy.query}</code><small>{strategy.language}{strategy.region ? ` · ${strategy.region}` : ""}</small></article>)}</div><div className="notice"><strong>Falsification branch:</strong> {plan.falsification_queries.join("; ")}</div></section>}

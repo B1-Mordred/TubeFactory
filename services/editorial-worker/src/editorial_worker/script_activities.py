@@ -17,6 +17,7 @@ from editorial_core.editorial import (
     verify_script_draft,
 )
 from editorial_worker.config import Settings
+from editorial_worker.channel_workflow import channel_workflow_context
 from editorial_worker.contracts import ScriptDraft, VerifierOutput
 from editorial_worker.db import append_audit
 from editorial_worker.model_activities import load_task_routes
@@ -65,8 +66,13 @@ async def load_script_generation_context(request: dict[str, Any]) -> dict[str, A
                       d.executive_summary,d.chronology,d.unresolved_questions,
                       d.alternative_explanations,d.safe_conclusions,
                       d.prohibited_overstatements,d.proposed_angles,d.reviewed_by,d.reviewed_at,
-                      o.title AS opportunity_title,o.summary AS opportunity_summary
-               FROM research_dossiers d JOIN opportunities o ON o.id=d.opportunity_id
+                      o.title AS opportunity_title,o.summary AS opportunity_summary,
+                      cp.id AS channel_profile_id,cp.name AS channel_name,
+                      cp.editorial_rules AS channel_editorial_rules
+               FROM research_dossiers d
+               JOIN opportunities o ON o.id=d.opportunity_id
+               JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               JOIN channel_profiles cp ON cp.id=sp.channel_profile_id
                WHERE d.id=$1 AND d.deleted_at IS NULL""",
             dossier_id,
         )
@@ -167,8 +173,15 @@ async def load_script_generation_context(request: dict[str, Any]) -> dict[str, A
             for row in claim_rows
             if row["status"] == "disputed"
         ]
+        channel_workflow = channel_workflow_context(dossier["channel_editorial_rules"])
         structured_inputs = {
             "title": dossier["opportunity_title"],
+            "channel": {
+                "id": str(dossier["channel_profile_id"]),
+                "name": dossier["channel_name"],
+                "workflow_key": channel_workflow["key"],
+                "workflow_version": channel_workflow["version"],
+            },
             "dossier": {
                 "id": str(dossier["id"]),
                 "version": dossier["version"],
@@ -197,6 +210,7 @@ async def load_script_generation_context(request: dict[str, Any]) -> dict[str, A
             "evidence_claim_ids_by_id": evidence_claim_ids_by_id,
             "writer_routes": writer_routes,
             "verifier_routes": verifier_routes,
+            "channel_workflow": channel_workflow,
         }
     finally:
         await connection.close()

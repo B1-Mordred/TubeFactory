@@ -1,0 +1,151 @@
+{
+  "channel": {
+    "audience": {
+      "address": "Du",
+      "language": "de",
+      "prior_knowledge": "interessierte Allgemeinheit ohne vorausgesetztes Fachwissen",
+      "learning_goal": "Zusammenhänge verstehen, einordnen und anhand der Quellen selbst weiterrecherchieren"
+    },
+    "editorial_rules": {
+      "evidence_first": true,
+      "automation_workflow": {
+        "key": "faktischsimpel.explainer",
+        "name": "FaktischSimpel Erklärvideo",
+        "version": 1,
+        "enabled": true,
+        "language": "de",
+        "summary": "Evidenzgebundene Erklärvideos, die ohne Vorwissen beginnen, komplexe Zusammenhänge schrittweise aufbauen und Gesichertes, unterschiedliche Einschätzungen sowie offene Fragen sichtbar trennen.",
+        "prompts": {
+          "script_writer": "Schreibe ein deutsches Erklärvideo für eine interessierte Allgemeinheit ohne vorausgesetztes Fachwissen. Sprich die Zuschauerin oder den Zuschauer respektvoll mit Du an. Beginne mit einer konkreten Frage oder Alltagssituation und liefere früh eine mentale Landkarte: Was erklären wir, welche Schritte folgen und warum ist das relevant? Baue das Verständnis danach in kleinen, logisch abhängigen Schritten auf. Führe jeden unvermeidbaren Fachbegriff vor seiner ersten Nutzung in einem einfachen Satz ein. Verwende kurze, natürliche Sätze und höchstens einen neuen Kerngedanken pro Satz. Eine Analogie darf Verständnis schaffen, muss aber als Analogie erkennbar bleiben und darf nie als Beleg dienen.\n\nDie vollständige Ausgabe braucht mindestens acht Segmente und diese Funktionen: hook, thesis, context, evidence, counterevidence, uncertainty, conclusion und call_to_action. Nutze zusätzliche context- oder evidence-Segmente, wenn ein Zwischenschritt sonst übersprungen würde. Erkläre Ursache und Korrelation niemals als dasselbe. Kennzeichne klar: (1) was durch die freigegebenen Belege gesichert ist, (2) welche Deutungen oder fachlichen Einschätzungen voneinander abweichen und warum, und (3) welche Fragen mit den vorliegenden Quellen offenbleiben. Formuliere Unsicherheit präzise statt mit vagen Floskeln. Vermeide Sensationssprache, falsche Ausgewogenheit, absolute Aussagen ohne passenden Beleg und unnötige Fachsprache.\n\nNutze ausschließlich freigegebene Claims und ihre exakten Evidence-IDs. Jede Tatsachenbehauptung muss mit einer Annotation über den exakt identischen Narrationstext verknüpft sein; Start- und Endposition müssen stimmen. Zitate müssen exakt bleiben. Der Schluss fasst nicht nur zusammen, sondern gibt ein belastbares Einordnungsmodell. Der Call-to-Action lädt zum Prüfen der verlinkten Primärquellen oder zu einer sachlichen Anschlussfrage ein; keine leere Like-und-Abo-Formel. Zielumfang: ungefähr 6 bis 10 Minuten, sofern das Dossier keinen engeren Rahmen verlangt.",
+          "script_verifier": "Prüfe den Entwurf unabhängig als strenger Fakten- und Verständlichkeitsredakteur für FaktischSimpel. Akzeptiere keine Aussage allein deshalb, weil sie plausibel klingt. Melde als error: Tatsachen ohne gültige Claim- und Evidence-Verknüpfung, Überdehnung eines Belegs, Verwechslung von Korrelation und Ursache, erfundene Details, eine als Beweis verwendete Analogie, verschleierte Unsicherheit, ausgelassene zentrale Gegenbelege oder eine falsche Darstellung von Konsens. Melde außerdem als error, wenn die Pflichtfunktionen hook, thesis, context, evidence, counterevidence, uncertainty, conclusion und call_to_action fehlen oder die Erklärschritte logisch springen.\n\nPrüfe die Verständlichkeit konkret: Fachbegriffe müssen vor Nutzung erklärt sein; ein Satz soll höchstens einen neuen Kerngedanken tragen; die Zuschauer sollen jederzeit wissen, welcher Schritt gerade erklärt wird. Unterschiedliche Einschätzungen sind nur dann als solche zu präsentieren, wenn das Dossier sie belegt. Offene Fragen dürfen nicht rhetorisch geschlossen werden. Prüfe, ob wörtliche Zitate exakt, Annotationstexte identisch mit der Narration und alle Offsets plausibel sind. Warnungen sind für Stilverbesserungen reserviert; Beleg-, Struktur- und Sicherheitsprobleme sind errors. Setze valid nur dann auf true, wenn keine error-Meldung verbleibt und die deterministische Claim-Abdeckung vollständig ist. Führe in jeder Meldung Segment, problematische Aussage und eine konkrete Korrekturrichtung an, ohne selbst neue Fakten einzuführen.",
+          "storyboard": "Entwickle ein ruhiges, anschauliches Storyboard für FaktischSimpel. Jede Szene muss genau den zugeordneten Narrationsschritt verständlicher machen; dekorative Bilder ohne Erklärfunktion sind zu vermeiden. Bevorzuge klare Diagramme, beschriftete Abläufe, Vergleiche, Zeitleisten, einfache Karten, maßstäbliche Größenvergleiche, Quellen-Screenshots und sparsame Hervorhebungen. Verwende Charts nur mit Achsen, Einheit, Zeitraum und sichtbarer Quellenzuordnung. On-Screen-Text soll pro Einblendung kurz sein, in der Regel höchstens sechs Wörter, und die Narration ergänzen statt wiederholen.\n\nGesichertes, unterschiedliche Einschätzungen und offene Fragen brauchen visuell unterscheidbare, aber nicht wertende Muster. Nutze für Belege eine zurückhaltende Quellenzeile; zeige Primärquellen bevorzugt. Verwende keine fotorealistische KI-Rekonstruktion realer Ereignisse oder Personen. Generierte abstrakte Illustrationen müssen synthetic_media_flag=true tragen und dürfen keine Evidenz vortäuschen. Halte Markenstil und Übergänge konsistent: heller neutraler Hintergrund, dunkles Grün, gedecktes Gold als Akzent, keine hektischen Zooms oder Clickbait-Symbole. Jede Szene benötigt konkrete accessibility_notes; Farbe allein darf nie Information transportieren. Verknüpfe ausschließlich die im Segment erlaubten Claim-, Source- und Narration-IDs und gib nur das geforderte JSON zurück."
+        },
+        "stages": [
+          {"key": "topic_discovery", "label": "Themenradar und Dublettenprüfung", "mode": "automatic"},
+          {"key": "opportunity_review", "label": "Thema und Nutzenversprechen prüfen", "mode": "human_gate"},
+          {"key": "source_acquisition", "label": "Quellen sichern und normalisieren", "mode": "automatic"},
+          {"key": "dossier_review", "label": "Claims, Gegenbelege und offene Fragen freigeben", "mode": "human_gate"},
+          {"key": "script_generation", "label": "Schrittweises deutsches Erklärskript", "mode": "automatic"},
+          {"key": "independent_verification", "label": "Unabhängige Fakten- und Verständlichkeitsprüfung", "mode": "automatic"},
+          {"key": "script_review", "label": "Exakte Skriptversion freigeben", "mode": "human_gate"},
+          {"key": "storyboard_generation", "label": "Erklärendes, quellengebundenes Storyboard", "mode": "automatic"},
+          {"key": "storyboard_review", "label": "Szenen und Quellenbindungen freigeben", "mode": "human_gate"},
+          {"key": "media_production", "label": "Narration, Visuals, Schnitt und QA", "mode": "automatic"},
+          {"key": "media_review", "label": "Exakten Render prüfen und freigeben", "mode": "human_gate"},
+          {"key": "private_upload", "label": "Privater YouTube-Upload", "mode": "assisted"},
+          {"key": "publication_review", "label": "Veröffentlichung separat autorisieren", "mode": "human_gate"}
+        ],
+        "human_gates": [
+          "opportunity_shortlist",
+          "dossier_approval",
+          "script_approval",
+          "storyboard_approval",
+          "media_approval",
+          "publication_approval"
+        ]
+      }
+    },
+    "brand_kit": {
+      "primary": "#174C3C",
+      "accent": "#D6A43A",
+      "background": "#F6F3EA",
+      "visual_style": "ruhig, präzise, diagrammorientiert, nicht sensationalistisch"
+    },
+    "default_render_settings": {
+      "aspect_ratio": "16:9",
+      "resolution": "1920x1080",
+      "captions": true,
+      "target_loudness_lufs": -14
+    },
+    "default_publish_settings": {
+      "privacy": "private",
+      "automatic_publication": false
+    }
+  },
+  "subject": {
+    "name": "FaktischSimpel Themenradar",
+    "enabled": true,
+    "topic": "Erklärungsbedürftige Zusammenhänge aus Wissenschaft, Technik, Gesellschaft und Alltag mit belastbarer Evidenz und erkennbarem Nutzen für ein deutschsprachiges Publikum",
+    "research_goal": "Finde konkrete, zeitgemäße Fragen, bei denen ein FaktischSimpel-Video einen komplexen Zusammenhang ohne Vorwissen schrittweise erklären kann. Bevorzuge Themen mit zugänglichen Primärquellen, klar trennbaren gesicherten Erkenntnissen, fachlichen Einschätzungen und offenen Fragen. Vermeide bloße Nachrichtenwiedergabe; gesucht wird ein dauerhaft nützliches Erklärstück mit nachvollziehbarem Erkenntnisgewinn.",
+    "excluded_angles": [
+      "reine Nachrichtennacherzählung ohne erklärbaren Zusammenhang",
+      "Empörung, Angst oder Prominenz als einziges Nutzenversprechen",
+      "medizinische, rechtliche oder finanzielle Einzelfallberatung",
+      "Themen ohne mindestens zwei voneinander unabhängige belastbare Quellen"
+    ],
+    "seed_queries": [
+      "aktuelle Studie überraschender Zusammenhang Alltag Deutschland",
+      "neue Forschung warum funktioniert Technik Auswirkungen Alltag",
+      "gesellschaftlicher Trend Daten Ursachen Einordnung Deutschland",
+      "wissenschaftlicher Konsens offene Fragen aktuelle Forschung"
+    ],
+    "related_concepts": [
+      "Ursache und Korrelation",
+      "wissenschaftlicher Konsens",
+      "Messunsicherheit",
+      "Systemzusammenhang",
+      "Alltagsauswirkung",
+      "Technikfolgen"
+    ],
+    "negative_keywords": [
+      "Promi",
+      "Horoskop",
+      "Gewinnspiel",
+      "Produktwerbung",
+      "Sportergebnis",
+      "reine Meinung"
+    ],
+    "languages": ["de"],
+    "regions": ["DE", "AT", "CH"],
+    "domain_policy": {
+      "allow": [],
+      "block": ["tiktok.com", "instagram.com", "pinterest.com"]
+    },
+    "source_requirements": {
+      "minimum_independent": 2,
+      "minimum_primary": 1,
+      "expected_primary_types": ["official record", "original study", "official dataset"]
+    },
+    "schedule": {
+      "cron": "0 7 * * 1",
+      "timezone": "Europe/Berlin"
+    },
+    "freshness_policy": {
+      "lookback_days": 21,
+      "maximum_source_age_days": 3650
+    },
+    "format_policy": {
+      "target": "evidence_first_explainer",
+      "duration_seconds": 480
+    },
+    "editorial_profile": {
+      "tone": "sachlich, anschaulich, schrittweise, ruhig und ohne unnötige Fachsprache",
+      "address": "Du",
+      "distinguish": ["gesichert", "unterschiedliche Einschätzungen", "offen"]
+    },
+    "risk": "medium",
+    "budget": {
+      "tokens": 75000,
+      "gpu_seconds": 1800,
+      "currency_minor": 0
+    },
+    "opportunity_weights": {
+      "audience_fit": 1.25,
+      "evidence_potential": 1.35,
+      "novelty": 1.0,
+      "timeliness": 0.75,
+      "educational_value": 1.35,
+      "visual_explainability": 1.1,
+      "channel_differentiation": 1.0,
+      "risk": 1.2,
+      "estimated_cost": 0.75,
+      "duplication": 1.1
+    },
+    "approval_profile": {
+      "mode": "supervised",
+      "sensitive_topics": ["finance", "health", "politics"],
+      "evidence_density_minimum": 1.5,
+      "repeated_scene_limit": 1
+    }
+  }
+}
