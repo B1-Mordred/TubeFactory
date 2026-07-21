@@ -409,17 +409,28 @@ async def search_searxng(
     language: str,
     policy: DomainPolicy,
     maximum_results: int = 10,
+    lookback_days: int | None = None,
 ) -> list[dict[str, Any]]:
     parts = urlsplit(endpoint)
     if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
         raise ValueError("SEARXNG_ENDPOINT must be an absolute HTTP(S) URL without credentials")
     timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=12)
+    params = {"q": query, "format": "json", "language": language, "safesearch": "1"}
+    if lookback_days is not None:
+        if lookback_days <= 1:
+            params["time_range"] = "day"
+        elif lookback_days <= 7:
+            params["time_range"] = "week"
+        elif lookback_days <= 31:
+            params["time_range"] = "month"
+        else:
+            params["time_range"] = "year"
     async with aiohttp.ClientSession(
         timeout=timeout, cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False
     ) as session:
         async with session.get(
             endpoint.rstrip("/") + "/search",
-            params={"q": query, "format": "json", "language": language, "safesearch": "1"},
+            params=params,
             allow_redirects=False,
             headers={"Accept": "application/json", "Accept-Encoding": "identity"},
         ) as response:
@@ -429,9 +440,11 @@ async def search_searxng(
             )
             if response.content_length is not None and response.content_length > 2_000_000:
                 raise ValueError("SearXNG response exceeds the configured byte limit")
-            raw = await response.content.read(2_000_001)
-            if len(raw) > 2_000_000:
-                raise ValueError("SearXNG response exceeds the configured byte limit")
+            raw = bytearray()
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                raw.extend(chunk)
+                if len(raw) > 2_000_000:
+                    raise ValueError("SearXNG response exceeds the configured byte limit")
             payload = json.loads(raw)
     findings: list[dict[str, Any]] = []
     for item in payload.get("results", []):

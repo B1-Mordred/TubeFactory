@@ -86,6 +86,10 @@ class SubjectScheduleGateway:
             await self.client.create_schedule(schedule_id, schedule)
         except ScheduleAlreadyRunningError:
             await handle.update(lambda _: ScheduleUpdate(schedule=schedule))
+            if enabled:
+                await handle.unpause(note="Enabled subject profile reconciled by TubeFactory")
+            else:
+                await handle.pause(note="Disabled subject profile reconciled by TubeFactory")
         return await self.describe(subject_profile_id)
 
     async def describe(self, subject_profile_id: UUID) -> dict[str, Any]:

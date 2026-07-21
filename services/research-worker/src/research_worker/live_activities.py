@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -26,6 +27,46 @@ def _json(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
 
+def _publication_at(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def _finding_signature(title: str, summary: str) -> tuple[str, frozenset[str]]:
+    """Return an exact fingerprint and tokens for cross-run claim-cluster checks.
+
+    Discovery results do not include the complete article body. The exact fingerprint
+    therefore covers the normalized title and search excerpt; immutable full-content
+    hashes and near-duplicate checks are applied later during source acquisition.
+    """
+
+    normalized = " ".join(f"{title} {summary}".casefold().split())
+    fingerprint = hashlib.sha256(normalized.encode()).hexdigest()
+    return fingerprint, frozenset(re.findall(r"[\w-]{3,}", normalized))
+
+
+def _matches_processed_claim(
+    finding: SearchFinding,
+    processed_signatures: tuple[tuple[str, frozenset[str]], ...],
+    *,
+    similarity_threshold: float = 0.86,
+) -> bool:
+    fingerprint, tokens = _finding_signature(finding.title, finding.summary)
+    for processed_fingerprint, processed_tokens in processed_signatures:
+        if fingerprint == processed_fingerprint:
+            return True
+        union = tokens | processed_tokens
+        similarity = len(tokens & processed_tokens) / len(union) if union else 0.0
+        if similarity >= similarity_threshold:
+            return True
+    return False
+
+
 @activity.defn(name="load-live-search-plan")
 async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
     settings = Settings()
@@ -34,13 +75,30 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
         subject = await connection.fetchrow(
             """SELECT id, topic, research_goal, seed_queries, related_concepts,
                       negative_keywords, languages, regions, source_requirements,
-                      domain_policy, opportunity_weights
+                      domain_policy, opportunity_weights, freshness_policy
                FROM subject_profiles
                WHERE id=$1 AND enabled=true AND deleted_at IS NULL""",
             UUID(str(request["subject_profile_id"])),
         )
         if subject is None:
             raise ValueError("enabled subject profile does not exist")
+        workflow_id = str(request.get("workflow_id", ""))
+        if workflow_id:
+            actor_id = request.get("actor_id")
+            await connection.execute(
+                """INSERT INTO workflow_control_records
+                   (workflow_id,workflow_type,request_payload,parent_workflow_id,correlation_id,
+                    started_by,created_at)
+                   VALUES($1,$2,$3::jsonb,NULL,$4,$5,$6)
+                   ON CONFLICT (workflow_id) DO NOTHING""",
+                workflow_id,
+                # Scheduled discovery shares the live-discovery control and retry surface.
+                "live-discovery",
+                json.dumps(request),
+                str(request.get("correlation_id", workflow_id))[:160],
+                UUID(str(actor_id)) if actor_id else None,
+                datetime.now(timezone.utc),
+            )
         requirements = _json(subject["source_requirements"]) or {}
         plan = plan_search(
             SubjectBrief(
@@ -80,6 +138,7 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
             "strategies": strategies[:12],
             "domain_policy": _json(subject["domain_policy"]) or {"allow": [], "block": []},
             "opportunity_weights": _json(subject["opportunity_weights"]) or {},
+            "freshness_policy": _json(subject["freshness_policy"]) or {"lookback_days": 30},
         }
     finally:
         await connection.close()
@@ -94,6 +153,7 @@ async def search_live_strategy(request: dict[str, Any]) -> dict[str, Any]:
         query=str(strategy["query"])[:2000],
         language=str(strategy["language"])[:20],
         policy=DomainPolicy.from_mapping(request.get("domain_policy")),
+        lookback_days=max(1, int((request.get("freshness_policy") or {}).get("lookback_days", 30))),
     )
     return {"strategy": strategy, "results": results}
 
@@ -122,7 +182,6 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
         for item in raw_findings
     )
     unique = deduplicate_findings(findings)
-    clusters = cluster_findings(unique)
     provenance: dict[str, tuple[dict[str, Any], dict[str, Any], int]] = {}
     for item, strategy, rank in entries:
         try:
@@ -149,6 +208,10 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
                 "SELECT pg_advisory_xact_lock(hashtext($1))",
                 f"research.live_discovery:{idempotency_key}",
             )
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"research.live_discovery.subject:{subject_id}",
+            )
             existing = await connection.fetchval(
                 """SELECT result FROM idempotency_records
                    WHERE scope='research.live_discovery' AND idempotency_key=$1 AND status='succeeded'""",
@@ -157,7 +220,32 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
             if existing:
                 return _json(existing)
             weights = request.get("opportunity_weights") or {}
-            total_unique_domains = len({finding.canonical_url.split("/", 3)[2] for finding in unique})
+            previously_processed_urls = set(
+                await connection.fetchval(
+                    """SELECT coalesce(array_agg(canonical_url), ARRAY[]::text[])
+                       FROM source_documents
+                       WHERE deleted_at IS NULL AND canonical_url = ANY($1::text[])""",
+                    [finding.canonical_url for finding in unique],
+                )
+            )
+            processed_rows = await connection.fetch(
+                """SELECT title, summary
+                   FROM opportunities
+                   WHERE subject_profile_id=$1 AND deleted_at IS NULL""",
+                subject_id,
+            )
+            processed_signatures = tuple(
+                _finding_signature(str(row["title"]), str(row["summary"] or ""))
+                for row in processed_rows
+            )
+            new_unique = tuple(
+                finding
+                for finding in unique
+                if finding.canonical_url not in previously_processed_urls
+                and not _matches_processed_claim(finding, processed_signatures)
+            )
+            clusters = cluster_findings(new_unique)
+            total_unique_domains = len({finding.canonical_url.split("/", 3)[2] for finding in new_unique})
             for cluster in clusters[:25]:
                 representative = cluster.findings[0]
                 cluster_domains = {
@@ -195,6 +283,7 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
                     representative.summary or "Live discovery result awaiting editorial triage.",
                     json.dumps(
                         [
+                            "classification: potential misinformation",
                             *cluster.grouping_reasons,
                             f"{len(cluster.findings)} deduplicated result(s)",
                             f"{len(cluster_domains)} source domain(s)",
@@ -228,7 +317,7 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
                         """INSERT INTO source_documents
                         (id,version,created_at,updated_at,deleted_at,canonical_url,title,author,
                          publisher,source_type,publication_at,event_at,reputation,domain)
-                        VALUES($1,1,$2,$2,NULL,$3,$4,NULL,NULL,$5,NULL,NULL,$6::jsonb,$7)
+                        VALUES($1,1,$2,$2,NULL,$3,$4,NULL,$5,$6,$7,NULL,$8::jsonb,$9)
                         ON CONFLICT (canonical_url) DO UPDATE SET
                           title=EXCLUDED.title, updated_at=EXCLUDED.updated_at,
                           version=source_documents.version+1
@@ -237,7 +326,9 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
                         now,
                         finding.canonical_url,
                         finding.title,
+                        urlsplit(finding.canonical_url).hostname or "",
                         finding.source_type,
+                        _publication_at(finding.published_at),
                         json.dumps(
                             {
                                 "discovered_via": "searxng",
@@ -269,6 +360,8 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
                 "raw_result_count": len(findings),
                 "deduplicated_result_count": len(unique),
                 "duplicate_count": len(findings) - len(unique),
+                "previously_processed_count": len(unique) - len(new_unique),
+                "new_candidate_count": len(new_unique),
                 "source_domain_count": total_unique_domains,
             }
             await connection.execute(

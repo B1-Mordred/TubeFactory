@@ -65,6 +65,7 @@ class LiveDiscoveryWorkflow:
                 {
                     "strategy": strategy,
                     "domain_policy": plan["domain_policy"],
+                    "freshness_policy": plan["freshness_policy"],
                 },
                 start_to_close_timeout=timedelta(seconds=45),
                 retry_policy=RetryPolicy(maximum_attempts=3),
@@ -298,7 +299,7 @@ class ScheduledSubjectDiscoveryWorkflow:
             *[
                 workflow.execute_activity(
                     "search-live-strategy",
-                    {"strategy": strategy, "domain_policy": plan["domain_policy"]},
+                    {"strategy": strategy, "domain_policy": plan["domain_policy"], "freshness_policy": plan["freshness_policy"]},
                     start_to_close_timeout=timedelta(seconds=45),
                     retry_policy=RetryPolicy(maximum_attempts=3),
                 )

@@ -16,10 +16,84 @@ from research_worker.acquisition import (
     RobotsPolicyCache,
     acquire_public_source,
     robots_text_allows,
+    search_searxng,
     validate_identity_content_encoding,
     validate_redirect_target,
     validate_source_target,
 )
+
+
+@pytest.mark.asyncio
+async def test_searxng_search_applies_configured_freshness_window(
+    unused_tcp_port: int,
+) -> None:
+    observed: dict[str, str] = {}
+
+    async def search(request: web.Request) -> web.Response:
+        observed.update(request.query)
+        return web.json_response(
+            {
+                "results": [
+                    {
+                        "url": "https://example.org/report",
+                        "title": "Example report",
+                        "content": "Evidence summary",
+                        "publishedDate": "2026-07-21T08:00:00Z",
+                    }
+                ]
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/search", search)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
+    await site.start()
+    try:
+        results = await search_searxng(
+            f"http://127.0.0.1:{unused_tcp_port}",
+            query="Faktencheck",
+            language="de",
+            policy=DomainPolicy(),
+            lookback_days=7,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert observed["time_range"] == "week"
+    assert observed["language"] == "de"
+    assert results[0]["published_at"] == "2026-07-21T08:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_searxng_search_reads_streamed_json_to_eof(unused_tcp_port: int) -> None:
+    async def search(_request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": "application/json"})
+        await response.prepare(_request)
+        await response.write(b'{"results":[{"url":"https://example.org/')
+        await asyncio.sleep(0.01)
+        await response.write(b'report","title":"Streamed report","content":"Complete"}]}')
+        await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_get("/search", search)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
+    await site.start()
+    try:
+        results = await search_searxng(
+            f"http://127.0.0.1:{unused_tcp_port}",
+            query="streamed",
+            language="de",
+            policy=DomainPolicy(),
+        )
+    finally:
+        await runner.cleanup()
+
+    assert results[0]["title"] == "Streamed report"
 
 
 def test_domain_policy_supports_exact_and_subdomain_rules() -> None:
