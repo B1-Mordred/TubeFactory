@@ -21,7 +21,7 @@ jobs:
         run: |
           python -m pip install ./packages/core './services/api[test]' './services/workflow-worker[test]' './services/research-worker[test]'
       - name: Run unit and contract tests
-        run: pytest -q packages/core/tests services/api/tests services/workflow-worker/tests services/research-worker/tests
+        run: pytest --import-mode=importlib -q packages/core/tests services/api/tests services/workflow-worker/tests services/research-worker/tests
 
   web:
     runs-on: ubuntu-24.04
