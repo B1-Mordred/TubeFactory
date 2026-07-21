@@ -19,6 +19,7 @@ The authoritative product requirements are the user-supplied mission brief. `doc
 - [x] 2026-07-21: Increment 5 optimization and hardening acceptance gate passed.
 - [x] 2026-07-21: Final reproducible deployment, migration, regression, security, observability and recovery audit passed; real Google action remains operator-credential-gated.
 - [x] 2026-07-21: Complete channel/subject lifecycle management passed: prefilled version-checked edits, audited soft deletion, schedule cleanup, dependency protection, responsive operator controls, and live validation.
+- [x] 2026-07-21: Add a searchable Archived profiles restore workspace and replace placeholder live-opportunity scoring with evidence-derived, auditable score version 2 traces.
 
 ## Milestones
 
@@ -61,12 +62,14 @@ PostgreSQL is authoritative for metadata and workflow-facing state; immutable la
 - 2026-07-21: Keep Google credentials and plaintext refresh tokens inside a dedicated publisher egress gateway; return only ciphertext to the API and never place secrets in Temporal history.
 - 2026-07-21: Give dry-run and real uploads distinct stable release keys so a safe rehearsal never consumes or aliases the real external side effect.
 - 2026-07-21: Expose user-requested profile deletion as recoverable archival. Preserve linked workflows, evidence and audit history; archive subjects only after stopping their schedule, and block channel archival while active subjects remain.
+- 2026-07-21: Restore archived profiles as disabled records. Require the parent channel to be active before restoring a subject, keep its schedule paused, and create a new audited version instead of erasing archive history.
 
 ## Discoveries
 
 - 2026-07-20: The repository contained only an empty Git repository on branch `dev`.
 - 2026-07-20: The host has Docker 29.1.3 and Compose 2.40.3; host Python is 3.14 and npm is absent, so validation must run in pinned containers.
 - 2026-07-20: The installed ExecPlan skill omitted its required `references/PLANS.md`; this plan therefore embeds all context needed for continuation.
+- 2026-07-21: Live score concentration at 53 is caused by placeholder constants in `persist-live-opportunities`: five positive dimensions and two penalties are constant, while the remaining formulas receive the same one-result/one-domain inputs for most clusters. PostgreSQL confirmed 175 active opportunities at 53 and only seven at other values.
 
 ## Validation and acceptance evidence
 
@@ -151,3 +154,14 @@ Compose stop/start must preserve named volumes. Migrations are forward-only and 
 - API regression passed with 93 tests. The Next.js TypeScript check and optimized production build passed, and the rebuilt API and web images are deployed.
 - A disposable live channel was edited from version 1 to 2. Its disposable subject was edited from version 1 to 2, enabled, reconciled to an active `0 4 * * *` schedule, then archived; PostgreSQL confirmed `schedule_paused=true`, `enabled=false`, `deleted_at` set and version 4. The channel was then archived at version 3, disappeared from the workspace selector, and the selected scope safely reset to All channels.
 - Desktop and 390-pixel browser checks confirmed the prefilled editors and dependency-aware archive dialog. The browser console reported zero errors and zero warnings; all 25 deployed services were running without unhealthy or starting containers.
+
+2026-07-21 archived profiles and scoring-trace evidence:
+
+- The Administration navigation now exposes a searchable Archived profiles workspace to readers. It filters by profile type and identifying content, exposes complete archived configuration on demand, and limits restore controls to editors and administrators.
+- Restore is audited and optimistic-version checked. A restored channel remains disabled; a subject restore is blocked until its parent channel is active, and a restored subject remains disabled so its existing cron cannot run without an explicit later enable action.
+- A disposable archived channel and subject were restored through the live UI in dependency order, verified as disabled, and archived again. PostgreSQL retained both restore and archive events; the subject was again archived before its parent channel.
+- Live-discovery scoring now derives all seven positive components and three penalties from observed rank, topic/query coverage, source count/type/diversity, content specificity, publication freshness, purpose, domain rarity and prior-finding similarity. Stored reasons include the observed inputs rather than generic constant text.
+- The append-only upgrade added score version 2 to all 191 legacy placeholder-scored opportunities and preserved every original score row. For 19 records without source links, the trace explicitly uses stored title/summary/subject signals with zero-source, unavailable-rank and unavailable-date inputs rather than inventing provenance.
+- Before the upgrade, 175 active opportunities had the identical 53 trace. Current latest live-discovery scores span 30 integer values from 26 through 74; 19 round to 53 naturally, with varied component and reason traces, and no latest score retains the placeholder component set.
+- API regression passed with 96 tests, research-worker regression passed with 40 tests, and the Next.js TypeScript and optimized production build gates passed. Rebuilt API, research-worker and web services are healthy in the 25-service deployment.
+- Browser checks at desktop and 390 pixels confirmed archived search/empty states, dependency-aware restore controls and score-version-2 detail presentation. A live 51/100 finding showed seven observed components, three penalties and finding-specific reasons; the TubeFactory browser console reported zero errors and zero warnings.

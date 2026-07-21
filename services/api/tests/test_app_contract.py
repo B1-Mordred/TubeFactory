@@ -19,9 +19,13 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/channel-profiles" in paths
     assert "PUT" in methods_by_path["/api/v1/channel-profiles/{profile_id}"]
     assert "DELETE" in methods_by_path["/api/v1/channel-profiles/{profile_id}"]
+    assert "/api/v1/channel-profiles/archived" in paths
+    assert "POST" in methods_by_path["/api/v1/channel-profiles/{profile_id}/restore"]
     assert "/api/v1/subject-profiles" in paths
     assert "PUT" in methods_by_path["/api/v1/subject-profiles/{profile_id}"]
     assert "DELETE" in methods_by_path["/api/v1/subject-profiles/{profile_id}"]
+    assert "/api/v1/subject-profiles/archived" in paths
+    assert "POST" in methods_by_path["/api/v1/subject-profiles/{profile_id}/restore"]
     assert "/api/v1/subject-profiles/{profile_id}/test-search-plan" in paths
     assert "/api/v1/subject-profiles/{profile_id}/schedule" in paths
     assert "/api/v1/subject-profiles/{profile_id}/schedule/reconcile" in paths

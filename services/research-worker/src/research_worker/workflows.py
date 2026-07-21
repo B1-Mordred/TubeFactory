@@ -80,6 +80,9 @@ class LiveDiscoveryWorkflow:
             {
                 **request,
                 "opportunity_weights": plan["opportunity_weights"],
+                "topic": plan["topic"],
+                "risk": plan["risk"],
+                "freshness_policy": plan["freshness_policy"],
                 "result_sets": result_sets,
             },
             start_to_close_timeout=timedelta(minutes=2),
@@ -313,6 +316,9 @@ class ScheduledSubjectDiscoveryWorkflow:
             {
                 **execution_request,
                 "opportunity_weights": plan["opportunity_weights"],
+                "topic": plan["topic"],
+                "risk": plan["risk"],
+                "freshness_policy": plan["freshness_policy"],
                 "result_sets": result_sets,
             },
             start_to_close_timeout=timedelta(minutes=2),

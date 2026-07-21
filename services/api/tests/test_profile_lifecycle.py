@@ -145,3 +145,109 @@ async def test_subject_archive_rejects_stale_version_before_schedule_change(monk
 
     assert caught.value.status_code == 409
     assert schedule_gateway_created is False
+
+
+@pytest.mark.asyncio
+async def test_channel_restore_creates_disabled_audited_version(monkeypatch) -> None:
+    channel_id = uuid4()
+    channel = SimpleNamespace(
+        id=channel_id,
+        version=4,
+        enabled=False,
+        deleted_at=object(),
+        updated_at=None,
+    )
+    session = FakeSession({(ChannelProfileModel, channel_id): channel})
+    committed = []
+
+    async def capture_commit(**kwargs):
+        committed.append(kwargs)
+        return kwargs["profile"]
+
+    monkeypatch.setattr(profiles, "_commit_profile", capture_commit)
+
+    result = await profiles.restore_channel(
+        channel_id,
+        request_fixture(),
+        SimpleNamespace(id=uuid4()),
+        session,
+        expected_version=4,
+    )
+
+    assert result is channel
+    assert channel.deleted_at is None
+    assert channel.enabled is False
+    assert channel.version == 5
+    assert committed[0]["action"] == "channel_profile.restored"
+    assert committed[0]["context"]["enabled_after_restore"] is False
+
+
+@pytest.mark.asyncio
+async def test_subject_restore_requires_active_parent_channel(monkeypatch) -> None:
+    subject_id, channel_id = uuid4(), uuid4()
+    subject = SimpleNamespace(
+        id=subject_id,
+        channel_profile_id=channel_id,
+        version=3,
+        enabled=False,
+        deleted_at=object(),
+        updated_at=None,
+    )
+    channel = SimpleNamespace(id=channel_id, deleted_at=object())
+    session = FakeSession({
+        (SubjectProfileModel, subject_id): subject,
+        (ChannelProfileModel, channel_id): channel,
+    })
+    monkeypatch.setattr(profiles, "_commit_profile", no_commit)
+
+    with pytest.raises(HTTPException, match="channel first") as caught:
+        await profiles.restore_subject(
+            subject_id,
+            request_fixture(),
+            SimpleNamespace(id=uuid4()),
+            session,
+            expected_version=3,
+        )
+
+    assert caught.value.status_code == 409
+    assert subject.deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_subject_restore_stays_disabled_with_paused_schedule(monkeypatch) -> None:
+    subject_id, channel_id = uuid4(), uuid4()
+    subject = SimpleNamespace(
+        id=subject_id,
+        channel_profile_id=channel_id,
+        version=3,
+        enabled=False,
+        deleted_at=object(),
+        updated_at=None,
+    )
+    channel = SimpleNamespace(id=channel_id, deleted_at=None)
+    session = FakeSession({
+        (SubjectProfileModel, subject_id): subject,
+        (ChannelProfileModel, channel_id): channel,
+    })
+    committed = []
+
+    async def capture_commit(**kwargs):
+        committed.append(kwargs)
+        return kwargs["profile"]
+
+    monkeypatch.setattr(profiles, "_commit_profile", capture_commit)
+
+    result = await profiles.restore_subject(
+        subject_id,
+        request_fixture(),
+        SimpleNamespace(id=uuid4()),
+        session,
+        expected_version=3,
+    )
+
+    assert result is subject
+    assert subject.deleted_at is None
+    assert subject.enabled is False
+    assert subject.version == 4
+    assert committed[0]["action"] == "subject_profile.restored"
+    assert committed[0]["context"]["schedule_kept_paused"] is True

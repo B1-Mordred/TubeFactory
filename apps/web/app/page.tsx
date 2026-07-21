@@ -3,7 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 type Role = "admin" | "operator" | "editor" | "reviewer" | "viewer";
-const PAGE_IDS = new Set(["dashboard", "workflows", "profiles", "research", "editorial", "media", "publishing", "operations", "audit", "providers", "configuration", "users", "identity"]);
+const PAGE_IDS = new Set(["dashboard", "workflows", "profiles", "archived", "research", "editorial", "media", "publishing", "operations", "audit", "providers", "configuration", "users", "identity"]);
 type User = {
   id: string;
   username: string;
@@ -61,9 +61,11 @@ type SubjectProfile = {
   schedule: { cron: string | null; timezone: string }; created_at?: string; updated_at?: string;
   [key: string]: unknown;
 };
+type ArchivedChannelProfile = ChannelProfile & { archived_at: string };
+type ArchivedSubjectProfile = SubjectProfile & { archived_at: string };
 type SubjectSchedule = { schedule_id: string; exists: boolean; paused: boolean; cron: string | null; timezone: string; action_count: number; next_action_times: string[] };
 type SearchPlan = { subject_topic: string; strategies: { purpose: string; query: string; language: string; region: string | null }[]; falsification_queries: string[] };
-type Opportunity = { id: string; version: number; subject_profile_id: string; title: string; summary: string; editorial_rationale: string; estimated_cost: Record<string, unknown>; policy_snapshot: { mode?: string; required_human_gates?: string[]; [key: string]: unknown }; decision: string; score: number | null; score_components: Record<string, number>; score_penalties: Record<string, number>; score_reasoning: string[]; grouping_reason: string[]; source_count: number; snapshot_count: number; research_state: string | null; created_at: string };
+type Opportunity = { id: string; version: number; subject_profile_id: string; title: string; summary: string; editorial_rationale: string; estimated_cost: Record<string, unknown>; policy_snapshot: { mode?: string; required_human_gates?: string[]; [key: string]: unknown }; decision: string; score: number | null; score_version: number | null; score_components: Record<string, number>; score_penalties: Record<string, number>; score_weights: Record<string, number>; score_reasoning: string[]; grouping_reason: string[]; source_count: number; snapshot_count: number; research_state: string | null; created_at: string };
 type Dossier = { id: string; opportunity_id: string; dossier_version: number; version: number; status: string; executive_summary: string; completion_evaluation: { complete?: boolean; blockers?: string[]; [key: string]: unknown }; created_at: string };
 type DossierDetail = Dossier & { safe_conclusions: string[]; prohibited_overstatements: string[]; unresolved_questions: string[]; claims: { id: string; normalized_statement: string; claim_type: string; confidence: number; status: string; risk: string; central: boolean; version: number; evidence: { relationship: string; exact_text: string; source_independent: boolean; direct_evidence: boolean; primary_source: boolean; source: { title: string; canonical_url: string; publisher: string | null }; snapshot: { content_hash: string; retrieved_at: string } }[] }[] };
 type SourceBrowserItem = { id: string; canonical_url: string; title: string; author: string | null; publisher: string | null; source_type: string; publication_at: string | null; event_at: string | null; domain: string; snapshots: { id: string; snapshot_number: number; content_hash: string; mime_type: string; byte_size: number; retrieved_at: string; extraction_metadata: Record<string, unknown>; injection_markers: string[]; semantic_chunk_count: number }[]; relationships: { id: string; source_document_id: string; related_source_document_id: string; relationship: string; reason: string; confidence: number }[] };
@@ -235,6 +237,20 @@ const helpTasks: HelpTask[] = [
       "Enable the subject, then add or resume its schedule only after the search plan is correct.",
       "Use Edit on an existing card to change its complete versioned profile; advanced policies are preserved unless you change them.",
       "Use Archive to remove a profile from active lists while retaining workflows and audit history. Archive or reassign a channel's subjects first.",
+    ],
+  },
+  {
+    id: "restore-profile",
+    title: "Find and restore an archived profile",
+    summary: "Inspect archived Channels and subjects, then restore them safely as disabled records.",
+    category: "Archived profiles",
+    page: "archived",
+    keywords: ["restore", "recover", "undo", "archive", "deleted", "channel", "subject"],
+    steps: [
+      "Open Archived profiles and search by profile name, slug, topic or parent Channel.",
+      "Expand a result to inspect its archived version, configuration summary and archive time.",
+      "Restore an archived Channel before restoring any subjects that belong to it.",
+      "Restore the subject. It returns disabled and its schedule stays paused until you deliberately enable and apply it.",
     ],
   },
   {
@@ -563,7 +579,7 @@ function OpportunityReviewDialog({
 
           <section className="finding-section"><p className="eyebrow">Discovery trace</p><h3>Grouping and classification reasons</h3>{opportunity.grouping_reason.length ? <ul className="finding-reason-list">{opportunity.grouping_reason.map((reason, index) => <li key={`${reason}-${index}`}>{reason}</li>)}</ul> : <p className="muted">No grouping reasons were recorded.</p>}</section>
 
-          <section className="finding-section"><p className="eyebrow">Scoring trace</p><h3>Why this finding received {opportunity.score ?? "no score"}</h3><div className="finding-score-grid"><div><h4>Components</h4><DetailRecord values={opportunity.score_components} /></div><div><h4>Penalties</h4><DetailRecord values={opportunity.score_penalties} empty="No penalties applied" /></div></div>{opportunity.score_reasoning.length ? <ul className="finding-reason-list">{opportunity.score_reasoning.map((reason, index) => <li key={`${reason}-${index}`}>{reason}</li>)}</ul> : <p className="muted">No score narrative was recorded.</p>}</section>
+          <section className="finding-section"><p className="eyebrow">Scoring trace {opportunity.score_version ? `· version ${opportunity.score_version}` : ""}</p><h3>Why this finding received {opportunity.score === null ? "no score" : `${opportunity.score}/100`}</h3><div className="finding-score-grid"><div><h4>Observed components</h4><DetailRecord values={opportunity.score_components} /></div><div><h4>Penalties</h4><DetailRecord values={opportunity.score_penalties} empty="No penalties applied" /></div><div><h4>Configured weights</h4><DetailRecord values={opportunity.score_weights} empty="Default equal weights" /></div></div>{opportunity.score_reasoning.length ? <ul className="finding-reason-list">{opportunity.score_reasoning.map((reason, index) => <li key={`${reason}-${index}`}>{reason}</li>)}</ul> : <p className="muted">No score narrative was recorded.</p>}</section>
         </main>
 
         <div className="finding-detail-aside">
@@ -1044,6 +1060,61 @@ function ProfilesPanel({ csrf, role, activeChannelId, onChannelsChanged }: { csr
     {editingProfile && <ProfileEditDialog target={editingProfile} channels={channels} onClose={() => setEditingProfile(null)} onSaveChannel={updateChannel} onSaveSubject={updateSubject} />}
     {archiveProfile && <ArchiveProfileDialog target={archiveProfile} blockingSubjects={archiveProfile.kind === "channel" ? subjects.filter(subject => subject.channel_profile_id === archiveProfile.profile.id) : []} onClose={() => setArchiveProfile(null)} onArchive={archiveSelected} />}
     {plan && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Validated search plan</p><h2>{plan.subject_topic}</h2></div><button className="secondary compact" onClick={() => setPlan(null)}>Close</button></div><div className="strategy-list">{plan.strategies.map((strategy, index) => <article key={`${strategy.purpose}-${index}`}><span className="chip">{strategy.purpose}</span><code>{strategy.query}</code><small>{strategy.language}{strategy.region ? ` · ${strategy.region}` : ""}</small></article>)}</div><div className="notice"><strong>Falsification branch:</strong> {plan.falsification_queries.join("; ")}</div></section>}
+  </>;
+}
+
+function ArchivedProfilesPanel({ csrf, role, onChannelsChanged }: { csrf: string; role: Role; onChannelsChanged: () => Promise<void> }) {
+  const [archivedChannels, setArchivedChannels] = useState<ArchivedChannelProfile[]>([]);
+  const [archivedSubjects, setArchivedSubjects] = useState<ArchivedSubjectProfile[]>([]);
+  const [activeChannels, setActiveChannels] = useState<ChannelProfile[]>([]);
+  const [query, setQuery] = useState("");
+  const [kind, setKind] = useState<"all" | "channel" | "subject">("all");
+  const [busyId, setBusyId] = useState("");
+  const [message, setMessage] = useState("");
+  const canRestore = role === "admin" || role === "editor";
+  const refresh = useCallback(async () => {
+    try {
+      const [channels, subjects, active] = await Promise.all([
+        api<ArchivedChannelProfile[]>("/api/v1/channel-profiles/archived"),
+        api<ArchivedSubjectProfile[]>("/api/v1/subject-profiles/archived"),
+        api<ChannelProfile[]>("/api/v1/channel-profiles"),
+      ]);
+      setArchivedChannels(channels); setArchivedSubjects(subjects); setActiveChannels(active);
+    } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Archived profiles could not be loaded"); }
+  }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const activeChannelNames = new Map(activeChannels.map(channel => [channel.id, channel.name]));
+  const archivedChannelNames = new Map(archivedChannels.map(channel => [channel.id, channel.name]));
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const records: Array<{ kind: "channel" | "subject"; profile: ArchivedChannelProfile | ArchivedSubjectProfile; search: string }> = [
+    ...archivedChannels.map(profile => ({ kind: "channel" as const, profile, search: `${profile.name} ${profile.slug} ${profile.languages.join(" ")} ${String(profile.identity.description || "")}` })),
+    ...archivedSubjects.map(profile => ({ kind: "subject" as const, profile, search: `${profile.name} ${profile.topic} ${profile.research_goal} ${activeChannelNames.get(profile.channel_profile_id) || archivedChannelNames.get(profile.channel_profile_id) || ""}` })),
+  ].filter(record => (kind === "all" || record.kind === kind) && (!normalizedQuery || record.search.toLocaleLowerCase().includes(normalizedQuery)))
+    .sort((left, right) => new Date(right.profile.archived_at).getTime() - new Date(left.profile.archived_at).getTime());
+
+  async function restore(record: { kind: "channel" | "subject"; profile: ArchivedChannelProfile | ArchivedSubjectProfile }) {
+    setBusyId(record.profile.id); setMessage("");
+    try {
+      await api(`/api/v1/${record.kind === "channel" ? "channel" : "subject"}-profiles/${record.profile.id}/restore?expected_version=${record.profile.version}`, { method: "POST" }, csrf);
+      setMessage(`${record.kind === "channel" ? "Channel" : "Subject"} restored as disabled. Review it under Channels & subjects before enabling.`);
+      await Promise.all([refresh(), onChannelsChanged()]);
+    } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Profile could not be restored"); }
+    finally { setBusyId(""); }
+  }
+
+  return <><div className="page-heading"><div><p className="eyebrow">Recoverable history</p><h1>Archived profiles</h1><p>Inspect and restore Channels or subjects without erasing their archive history.</p></div><span className="chip">{archivedChannels.length + archivedSubjects.length} archived</span></div>
+    {message && <div className="notice">{message}</div>}
+    <section className="panel archived-profile-panel">
+      <div className="archive-toolbar"><label>Search archived profiles<input type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Name, slug, topic or Channel" /></label><label>Profile type<select value={kind} onChange={event => setKind(event.target.value as typeof kind)}><option value="all">All profiles</option><option value="channel">Channels</option><option value="subject">Subjects</option></select></label><button type="button" className="secondary" onClick={() => void refresh()}>Refresh</button></div>
+      <div className="archive-summary"><span><strong>{archivedChannels.length}</strong> Channels</span><span><strong>{archivedSubjects.length}</strong> subjects</span><span>Restores are disabled by default</span></div>
+      <div className="archive-record-list">{records.map(record => {
+        const profile = record.profile;
+        const subject = record.kind === "subject" ? profile as ArchivedSubjectProfile : null;
+        const parentName = subject ? activeChannelNames.get(subject.channel_profile_id) || archivedChannelNames.get(subject.channel_profile_id) || "Unavailable Channel" : "";
+        const parentActive = subject ? activeChannelNames.has(subject.channel_profile_id) : true;
+        return <article className="archive-record" key={`${record.kind}-${profile.id}`}><div className="archive-record-heading"><div><span className="chip">{record.kind}</span><strong>{profile.name}</strong><small>Archived {new Date(profile.archived_at).toLocaleString()} · version {profile.version}</small>{subject && <small>Channel: {parentName} · {subject.schedule.cron || "Manual only"}</small>}</div>{canRestore && <button type="button" className="primary compact" disabled={busyId === profile.id || !parentActive} onClick={() => void restore(record)}>{busyId === profile.id ? "Restoring…" : parentActive ? `Restore ${record.kind}` : "Restore Channel first"}</button>}</div><details><summary>Inspect archived configuration</summary>{record.kind === "channel" ? <div className="archive-inspection"><p><strong>Slug:</strong> {(profile as ArchivedChannelProfile).slug}</p><p><strong>Languages:</strong> {(profile as ArchivedChannelProfile).languages.join(", ")}</p><p><strong>Description:</strong> {String((profile as ArchivedChannelProfile).identity.description || "No description")}</p></div> : <div className="archive-inspection"><p><strong>Topic:</strong> {subject?.topic}</p><p><strong>Research goal:</strong> {subject?.research_goal}</p><p><strong>Seed queries:</strong> {subject?.seed_queries.join(" · ")}</p><p><strong>Schedule:</strong> {subject?.schedule.cron || "Manual only"} · {subject?.schedule.timezone}</p></div>}<pre>{JSON.stringify(profile, null, 2)}</pre></details></article>;
+      })}{!records.length && <p className="empty">{normalizedQuery ? "No archived profile matches this search." : "No archived profiles in this category."}</p>}</div>
+    </section>
   </>;
 }
 
@@ -1905,6 +1976,7 @@ export default function Home() {
       { id: "audit", label: "Audit log", help: "Trace immutable operator and system actions." },
     ] },
     { label: "Administration", items: [
+      { id: "archived", label: "Archived profiles", help: "Search, inspect and safely restore archived Channels and subjects as disabled records." },
       { id: "providers", label: "Providers & prompts", help: "Configure model providers, prompts and task assignments.", roles: ["admin"] },
       { id: "configuration", label: "Configuration", help: "Review and activate versioned application settings.", roles: ["admin"] },
       { id: "users", label: "Users", help: "Create accounts, assign roles and manage access.", roles: ["admin"] },
@@ -1923,5 +1995,5 @@ export default function Home() {
       return "";
     });
   }
-  return <><div className="app-shell"><aside><div className="brand"><div className="brand-mark">TF</div><div><strong>TubeFactory</strong><small>Editorial control plane</small></div><UsageTip text="Search longer procedures by task, or hover and focus controls for concise guidance." onClick={() => setHelpOpen(true)} /></div><label className="channel-switcher">Channel workspace<select aria-label="Channel workspace" value={activeChannelId} onChange={event => chooseChannel(event.target.value)}><option value="">All channels</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select><small>{activeChannel ? `${activeChannel.enabled ? "Enabled" : "Disabled"} · ${activeChannel.languages.join(", ")}` : `${channels.length} channels in portfolio`}</small></label><nav aria-label="Main navigation">{navGroups.map(group => { const visible = group.items.filter(item => !item.roles || item.roles.includes(session.user.role)); return visible.length ? <div className="nav-group" key={group.label}><span>{group.label}</span>{visible.map(item => <button key={item.id} className={page === item.id ? "active nav-help" : "nav-help"} data-usage={item.help} aria-label={item.label + ". " + item.help} onClick={() => choosePage(item.id)}>{item.label}</button>)}</div> : null; })}</nav><div className="profile"><span className="avatar">{session.user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.display_name}</strong><small>{session.user.role}</small></span><button className="sign-out" onClick={async () => { await api("/api/v1/auth/logout", { method: "POST" }, session.csrf_token); setSession(null); }}>Sign out</button></div></aside><main className="workspace"><div className="scope-bar"><div><span className="eyebrow">Current workspace</span><strong>{activeChannel?.name || "All channels"}</strong></div><span>{activeChannel ? "Every channel-aware queue is filtered to this channel." : "Portfolio view across every channel."}</span></div>{page === "dashboard" && <Dashboard capabilities={capabilities} activeChannelId={activeChannelId} />}{page === "profiles" && <ProfilesPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} onChannelsChanged={refreshChannelChoices} />}{page === "research" && <ResearchPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "editorial" && <EditorialPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "media" && <MediaPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "publishing" && <PublishingPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "operations" && <OperationsPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "identity" && <IdentityPanel session={session} onSession={setSession} />}{page === "providers" && <ProviderPanel csrf={session.csrf_token} />}{page === "workflows" && <WorkflowPanel csrf={session.csrf_token} activeChannelId={activeChannelId} onOpenPage={choosePage} />}{page === "configuration" && <ConfigPanel csrf={session.csrf_token} />}{page === "users" && <UsersPanel csrf={session.csrf_token} />}{page === "audit" && <AuditPanel />}</main></div><HelpPanel open={helpOpen} onClose={() => setHelpOpen(false)} currentPage={page} role={session.user.role} onOpenPage={choosePage} /></>;
+  return <><div className="app-shell"><aside><div className="brand"><div className="brand-mark">TF</div><div><strong>TubeFactory</strong><small>Editorial control plane</small></div><UsageTip text="Search longer procedures by task, or hover and focus controls for concise guidance." onClick={() => setHelpOpen(true)} /></div><label className="channel-switcher">Channel workspace<select aria-label="Channel workspace" value={activeChannelId} onChange={event => chooseChannel(event.target.value)}><option value="">All channels</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select><small>{activeChannel ? `${activeChannel.enabled ? "Enabled" : "Disabled"} · ${activeChannel.languages.join(", ")}` : `${channels.length} channels in portfolio`}</small></label><nav aria-label="Main navigation">{navGroups.map(group => { const visible = group.items.filter(item => !item.roles || item.roles.includes(session.user.role)); return visible.length ? <div className="nav-group" key={group.label}><span>{group.label}</span>{visible.map(item => <button key={item.id} className={page === item.id ? "active nav-help" : "nav-help"} data-usage={item.help} aria-label={item.label + ". " + item.help} onClick={() => choosePage(item.id)}>{item.label}</button>)}</div> : null; })}</nav><div className="profile"><span className="avatar">{session.user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.display_name}</strong><small>{session.user.role}</small></span><button className="sign-out" onClick={async () => { await api("/api/v1/auth/logout", { method: "POST" }, session.csrf_token); setSession(null); }}>Sign out</button></div></aside><main className="workspace"><div className="scope-bar"><div><span className="eyebrow">Current workspace</span><strong>{activeChannel?.name || "All channels"}</strong></div><span>{activeChannel ? "Every channel-aware queue is filtered to this channel." : "Portfolio view across every channel."}</span></div>{page === "dashboard" && <Dashboard capabilities={capabilities} activeChannelId={activeChannelId} />}{page === "profiles" && <ProfilesPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} onChannelsChanged={refreshChannelChoices} />}{page === "archived" && <ArchivedProfilesPanel csrf={session.csrf_token} role={session.user.role} onChannelsChanged={refreshChannelChoices} />}{page === "research" && <ResearchPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "editorial" && <EditorialPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "media" && <MediaPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "publishing" && <PublishingPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "operations" && <OperationsPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "identity" && <IdentityPanel session={session} onSession={setSession} />}{page === "providers" && <ProviderPanel csrf={session.csrf_token} />}{page === "workflows" && <WorkflowPanel csrf={session.csrf_token} activeChannelId={activeChannelId} onOpenPage={choosePage} />}{page === "configuration" && <ConfigPanel csrf={session.csrf_token} />}{page === "users" && <UsersPanel csrf={session.csrf_token} />}{page === "audit" && <AuditPanel />}</main></div><HelpPanel open={helpOpen} onClose={() => setHelpOpen(false)} currentPage={page} role={session.user.role} onOpenPage={choosePage} /></>;
 }

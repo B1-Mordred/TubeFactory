@@ -523,6 +523,10 @@ class ChannelProfileView(ChannelProfileWrite):
     updated_at: datetime
 
 
+class ArchivedChannelProfileView(ChannelProfileView):
+    archived_at: datetime
+
+
 class ProfileArchiveView(BaseModel):
     id: UUID
     version: int
@@ -623,6 +627,10 @@ class SubjectProfileView(SubjectProfileWrite):
     version: int
     created_at: datetime
     updated_at: datetime
+
+
+class ArchivedSubjectProfileView(SubjectProfileView):
+    archived_at: datetime
 
 
 class SearchStrategyView(BaseModel):
@@ -952,8 +960,10 @@ class OpportunityListItem(BaseModel):
     grouping_reason: list[str]
     estimated_cost: dict[str, Any]
     score: int | None
+    score_version: int | None = None
     score_components: dict[str, float]
     score_penalties: dict[str, float]
+    score_weights: dict[str, float] = Field(default_factory=dict)
     score_reasoning: list[str]
     source_count: int = Field(ge=0)
     snapshot_count: int = Field(ge=0)

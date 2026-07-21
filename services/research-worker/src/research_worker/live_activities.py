@@ -12,6 +12,8 @@ import asyncpg
 from temporalio import activity
 
 from editorial_core.discovery import (
+    FindingCluster,
+    OpportunityScore,
     SearchFinding,
     SubjectBrief,
     cluster_findings,
@@ -67,6 +69,124 @@ def _matches_processed_claim(
     return False
 
 
+def _clamped_score(value: float) -> int:
+    return round(max(0.0, min(100.0, value)))
+
+
+def _similarity(tokens: frozenset[str], other: frozenset[str]) -> float:
+    union = tokens | other
+    return len(tokens & other) / len(union) if union else 0.0
+
+
+def _score_live_cluster(
+    cluster: FindingCluster,
+    provenance: dict[str, tuple[dict[str, Any], dict[str, Any], int]],
+    processed_signatures: tuple[tuple[str, frozenset[str]], ...],
+    *,
+    topic: str,
+    subject_risk: str,
+    lookback_days: int,
+    total_unique_domains: int,
+    weights: dict[str, float] | None = None,
+    now: datetime | None = None,
+    source_provenance_available: bool = True,
+) -> OpportunityScore:
+    """Derive an auditable score from the actual search result and cluster signals."""
+
+    observed_at = now or datetime.now(timezone.utc)
+    representative = cluster.findings[0]
+    text = f"{representative.title} {representative.summary}"
+    _, content_tokens = _finding_signature(representative.title, representative.summary)
+    _, topic_tokens = _finding_signature(topic, "")
+    scored_findings = cluster.findings if source_provenance_available else ()
+    cluster_domains = {
+        hostname
+        for finding in scored_findings
+        if (hostname := urlsplit(finding.canonical_url).hostname)
+    }
+    entries = [provenance.get(finding.canonical_url, ({}, {}, 10)) for finding in scored_findings]
+    best_rank = min((rank for _, _, rank in entries), default=None)
+    rank_quality = max(0.0, min(1.0, 1.0 - (best_rank - 1) / 12)) if best_rank is not None else 0.0
+    query_tokens = frozenset(
+        token
+        for _, strategy, _ in entries
+        for token in _finding_signature(str(strategy.get("query", "")), "")[1]
+    )
+    topic_coverage = min(1.0, len(content_tokens & topic_tokens) / max(min(len(topic_tokens), 12), 1))
+    query_coverage = min(1.0, len(content_tokens & query_tokens) / max(min(len(query_tokens), 16), 1))
+    purposes = {str(strategy.get("purpose", "discovery")) for _, strategy, _ in entries}
+    source_types = {finding.source_type.casefold() for finding in scored_findings}
+    primary_count = sum(
+        source_type in {"primary", "authoritative", "official record", "original study"}
+        for source_type in source_types
+    )
+    has_number = bool(re.search(r"\d", text))
+    has_date_language = bool(re.search(r"\b(?:19|20)\d{2}\b|\b(?:today|yesterday|heute|gestern)\b", text, re.I))
+    specificity = min(1.0, len(content_tokens) / 45)
+    published_dates = [parsed for finding in scored_findings if (parsed := _publication_at(finding.published_at))]
+    if published_dates:
+        newest = max(published_dates)
+        age_days = max(0.0, (observed_at - newest).total_seconds() / 86_400)
+        timeliness = _clamped_score(100 - min(age_days / max(lookback_days, 1), 1.5) * 60)
+        freshness_reason = f"newest result is {age_days:.1f} days old within a {lookback_days}-day window"
+    elif best_rank is not None:
+        timeliness = _clamped_score(45 + rank_quality * 20)
+        freshness_reason = f"no reliable publication date; search rank {best_rank} supplies limited recency evidence"
+    else:
+        timeliness = 35
+        freshness_reason = "no publication date or search rank is available"
+    maximum_prior_similarity = max(
+        (_similarity(content_tokens, previous_tokens) for _, previous_tokens in processed_signatures),
+        default=0.0,
+    )
+    result_count = len(scored_findings)
+    repeated_domain_ratio = max(0.0, (result_count - len(cluster_domains)) / max(result_count, 1))
+    domain_rarity = (
+        1.0 - min(1.0, len(cluster_domains) / max(total_unique_domains, 1))
+        if cluster_domains
+        else 0.0
+    )
+
+    positive = {
+        "audience_fit": _clamped_score(30 + topic_coverage * 35 + query_coverage * 20 + rank_quality * 15),
+        "evidence_potential": _clamped_score(
+            24 + result_count * 9 + len(cluster_domains) * 12 + primary_count * 12 + specificity * 18
+        ),
+        "novelty": _clamped_score(92 - maximum_prior_similarity * 65),
+        "timeliness": timeliness,
+        "educational_value": _clamped_score(
+            32 + specificity * 42 + (10 if has_number else 0) + min(16, len(cluster_domains) * 6)
+        ),
+        "visual_explainability": _clamped_score(
+            28 + specificity * 24 + (22 if has_number else 0) + (10 if has_date_language else 0) + min(16, len(cluster_domains) * 6)
+        ),
+        "channel_differentiation": _clamped_score(
+            30 + topic_coverage * 30 + (14 if purposes & {"primary evidence", "falsification"} else 4 if purposes else 0) + (10 if primary_count else 0) + domain_rarity * 12
+        ),
+    }
+    risk_base = {"low": 12, "medium": 25, "high": 38}.get(subject_risk.casefold(), 25)
+    penalties = {
+        "risk": _clamped_score(risk_base + (6 if published_dates and timeliness >= 85 else 0)),
+        "estimated_cost": _clamped_score(7 + result_count * 5 + specificity * 8 + primary_count * 3),
+        "duplication": _clamped_score(maximum_prior_similarity * 70 + repeated_domain_ratio * 30),
+    }
+    scored = score_opportunity(positive, penalties, weights=weights)
+    reasoning = (
+        f"Audience fit {positive['audience_fit']}: topic coverage {topic_coverage:.0%}, query coverage {query_coverage:.0%}, best search rank {best_rank if best_rank is not None else 'unavailable'}.",
+        f"Evidence potential {positive['evidence_potential']}: {result_count} result(s), {len(cluster_domains)} domain(s), {primary_count} primary/authoritative source type(s).",
+        f"Novelty {positive['novelty']}: closest prior finding token similarity {maximum_prior_similarity:.0%}.",
+        f"Timeliness {positive['timeliness']}: {freshness_reason}.",
+        f"Educational value {positive['educational_value']}: {len(content_tokens)} distinct content terms; numerical specificity {'present' if has_number else 'absent'}.",
+        f"Visual explainability {positive['visual_explainability']}: numerical signal {'present' if has_number else 'absent'}, date signal {'present' if has_date_language else 'absent'}.",
+        f"Channel differentiation {positive['channel_differentiation']}: search purposes {', '.join(sorted(purposes)) or 'unavailable'}; topic coverage {topic_coverage:.0%}; domain rarity {domain_rarity:.0%}.",
+        f"Risk penalty {penalties['risk']}: subject risk is {subject_risk}; very recent material adds review pressure when applicable.",
+        f"Cost penalty {penalties['estimated_cost']}: estimated from {result_count} source(s), content specificity and source type.",
+        f"Duplication penalty {penalties['duplication']}: prior similarity {maximum_prior_similarity:.0%}; repeated-domain ratio {repeated_domain_ratio:.0%}.",
+        f"Final weighted score {scored.total}/100. The complete component values, penalties and configured weights are stored immutably.",
+    )
+    return OpportunityScore(scored.total, scored.positive, scored.penalties, reasoning)
+
+
 @activity.defn(name="load-live-search-plan")
 async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
     settings = Settings()
@@ -75,7 +195,7 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
         subject = await connection.fetchrow(
             """SELECT id, topic, research_goal, seed_queries, related_concepts,
                       negative_keywords, languages, regions, source_requirements,
-                      domain_policy, opportunity_weights, freshness_policy
+                      domain_policy, opportunity_weights, freshness_policy, risk
                FROM subject_profiles
                WHERE id=$1 AND enabled=true AND deleted_at IS NULL""",
             UUID(str(request["subject_profile_id"])),
@@ -139,6 +259,7 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
             "domain_policy": _json(subject["domain_policy"]) or {"allow": [], "block": []},
             "opportunity_weights": _json(subject["opportunity_weights"]) or {},
             "freshness_policy": _json(subject["freshness_policy"]) or {"lookback_days": 30},
+            "risk": subject["risk"],
         }
     finally:
         await connection.close()
@@ -248,26 +369,16 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
             total_unique_domains = len({finding.canonical_url.split("/", 3)[2] for finding in new_unique})
             for cluster in clusters[:25]:
                 representative = cluster.findings[0]
-                cluster_domains = {
-                    finding.canonical_url.split("/", 3)[2] for finding in cluster.findings
-                }
-                evidence_potential = min(100, 35 + len(cluster.findings) * 15 + len(cluster_domains) * 10)
-                score = score_opportunity(
-                    {
-                        "audience_fit": 60,
-                        "evidence_potential": evidence_potential,
-                        "novelty": 55,
-                        "timeliness": 60,
-                        "educational_value": 65,
-                        "visual_explainability": 50,
-                        "channel_differentiation": 50,
-                    },
-                    {
-                        "risk": 25,
-                        "estimated_cost": min(100, 10 + len(cluster.findings) * 3),
-                        "duplication": 0,
-                    },
+                score = _score_live_cluster(
+                    cluster,
+                    provenance,
+                    processed_signatures,
+                    topic=str(request.get("topic", "")),
+                    subject_risk=str(request.get("risk", "medium")),
+                    lookback_days=max(1, int((request.get("freshness_policy") or {}).get("lookback_days", 30))),
+                    total_unique_domains=total_unique_domains,
                     weights=weights,
+                    now=now,
                 )
                 opportunity_id = uuid4()
                 await connection.execute(

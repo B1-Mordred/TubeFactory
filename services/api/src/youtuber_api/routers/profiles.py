@@ -15,6 +15,8 @@ from youtuber_api.audit import append_audit
 from youtuber_api.db import get_session
 from youtuber_api.models import ChannelProfileModel, SubjectProfileModel, UserModel
 from youtuber_api.schemas import (
+    ArchivedChannelProfileView,
+    ArchivedSubjectProfileView,
     ChannelProfileUpdate,
     ChannelProfileView,
     ChannelProfileWrite,
@@ -78,6 +80,26 @@ async def list_channels(
             .order_by(ChannelProfileModel.name)
         )
     )
+
+
+@router.get("/channel-profiles/archived", response_model=list[ArchivedChannelProfileView])
+async def list_archived_channels(
+    _: Viewer, session: Annotated[AsyncSession, Depends(get_session)]
+) -> list[ArchivedChannelProfileView]:
+    profiles = list(
+        await session.scalars(
+            select(ChannelProfileModel)
+            .where(ChannelProfileModel.deleted_at.is_not(None))
+            .order_by(ChannelProfileModel.deleted_at.desc(), ChannelProfileModel.name)
+        )
+    )
+    return [
+        ArchivedChannelProfileView(
+            **ChannelProfileView.model_validate(profile).model_dump(),
+            archived_at=profile.deleted_at,
+        )
+        for profile in profiles
+    ]
 
 
 @router.post("/channel-profiles", response_model=ChannelProfileView, status_code=201)
@@ -165,6 +187,34 @@ async def archive_channel(
     return ProfileArchiveView(id=profile.id, version=profile.version, archived_at=archived_at)
 
 
+@router.post("/channel-profiles/{profile_id}/restore", response_model=ChannelProfileView)
+async def restore_channel(
+    profile_id: UUID,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    expected_version: Annotated[int, Query(ge=1)],
+) -> ChannelProfileModel:
+    profile = await session.get(ChannelProfileModel, profile_id, with_for_update=True)
+    if profile is None or profile.deleted_at is None:
+        raise HTTPException(status_code=404, detail="Archived channel profile not found")
+    if profile.version != expected_version:
+        raise HTTPException(status_code=409, detail="Profile changed; reload before restoring")
+    restored_at = datetime.now(timezone.utc)
+    profile.enabled = False
+    profile.deleted_at = None
+    profile.updated_at = restored_at
+    profile.version += 1
+    return await _commit_profile(
+        session=session,
+        request=request,
+        actor=actor,
+        profile=profile,
+        action="channel_profile.restored",
+        context={"restored_at": restored_at.isoformat(), "enabled_after_restore": False},
+    )
+
+
 @router.get("/subject-profiles", response_model=list[SubjectProfileView])
 async def list_subjects(
     _: Viewer, session: Annotated[AsyncSession, Depends(get_session)]
@@ -176,6 +226,26 @@ async def list_subjects(
             .order_by(SubjectProfileModel.name)
         )
     )
+
+
+@router.get("/subject-profiles/archived", response_model=list[ArchivedSubjectProfileView])
+async def list_archived_subjects(
+    _: Viewer, session: Annotated[AsyncSession, Depends(get_session)]
+) -> list[ArchivedSubjectProfileView]:
+    profiles = list(
+        await session.scalars(
+            select(SubjectProfileModel)
+            .where(SubjectProfileModel.deleted_at.is_not(None))
+            .order_by(SubjectProfileModel.deleted_at.desc(), SubjectProfileModel.name)
+        )
+    )
+    return [
+        ArchivedSubjectProfileView(
+            **SubjectProfileView.model_validate(profile).model_dump(),
+            archived_at=profile.deleted_at,
+        )
+        for profile in profiles
+    ]
 
 
 @router.post("/subject-profiles", response_model=SubjectProfileView, status_code=201)
@@ -261,6 +331,41 @@ async def archive_subject(
         },
     )
     return ProfileArchiveView(id=profile.id, version=profile.version, archived_at=archived_at)
+
+
+@router.post("/subject-profiles/{profile_id}/restore", response_model=SubjectProfileView)
+async def restore_subject(
+    profile_id: UUID,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    expected_version: Annotated[int, Query(ge=1)],
+) -> SubjectProfileModel:
+    profile = await session.get(SubjectProfileModel, profile_id, with_for_update=True)
+    if profile is None or profile.deleted_at is None:
+        raise HTTPException(status_code=404, detail="Archived subject profile not found")
+    if profile.version != expected_version:
+        raise HTTPException(status_code=409, detail="Profile changed; reload before restoring")
+    channel = await session.get(ChannelProfileModel, profile.channel_profile_id, with_for_update=True)
+    if channel is None or channel.deleted_at is not None:
+        raise HTTPException(status_code=409, detail="Restore the subject's channel first")
+    restored_at = datetime.now(timezone.utc)
+    profile.enabled = False
+    profile.deleted_at = None
+    profile.updated_at = restored_at
+    profile.version += 1
+    return await _commit_profile(
+        session=session,
+        request=request,
+        actor=actor,
+        profile=profile,
+        action="subject_profile.restored",
+        context={
+            "restored_at": restored_at.isoformat(),
+            "enabled_after_restore": False,
+            "schedule_kept_paused": True,
+        },
+    )
 
 
 @router.post("/subject-profiles/{profile_id}/test-search-plan", response_model=SearchPlanView)
