@@ -54,7 +54,10 @@ type ChannelProfile = {
 };
 type SubjectProfile = {
   id: string; channel_profile_id: string; name: string; enabled: boolean; topic: string; research_goal: string;
-  seed_queries: string[]; risk: "low" | "medium" | "high"; version: number;
+  excluded_angles: string[]; seed_queries: string[]; related_concepts: string[]; negative_keywords: string[]; languages: string[]; regions: string[];
+  domain_policy: Record<string, unknown>; source_requirements: Record<string, unknown>; freshness_policy: Record<string, unknown>;
+  format_policy: Record<string, unknown>; editorial_profile: Record<string, unknown>; risk: "low" | "medium" | "high";
+  budget: Record<string, unknown>; opportunity_weights: Record<string, number>; approval_profile: Record<string, unknown>; version: number;
   schedule: { cron: string | null; timezone: string }; created_at?: string; updated_at?: string;
   [key: string]: unknown;
 };
@@ -219,17 +222,19 @@ type HelpTask = {
 const helpTasks: HelpTask[] = [
   {
     id: "create-channel-subject",
-    title: "Create a channel and its first subject",
-    summary: "Define the channel identity, audience and a scheduled research subject.",
+    title: "Create, edit or archive channels and subjects",
+    summary: "Manage channel identity, research subjects, schedules and recoverable archival.",
     category: "Channels & subjects",
     page: "profiles",
-    keywords: ["setup", "onboarding", "channel", "subject", "schedule", "cron", "audience", "brand"],
+    keywords: ["setup", "onboarding", "channel", "subject", "schedule", "cron", "audience", "brand", "edit", "delete", "archive"],
     steps: [
       "Open Channels & subjects and create the channel profile with its language, audience and editorial rules.",
       "Select the new channel from Channel workspace so later work is scoped correctly.",
       "Create a subject with a specific topic, research goal and seed queries.",
       "Review the generated search plan, including falsification queries and regional settings.",
       "Enable the subject, then add or resume its schedule only after the search plan is correct.",
+      "Use Edit on an existing card to change its complete versioned profile; advanced policies are preserved unless you change them.",
+      "Use Archive to remove a profile from active lists while retaining workflows and audit history. Archive or reassign a channel's subjects first.",
     ],
   },
   {
@@ -789,11 +794,144 @@ function AuditPanel() {
   return <><div className="page-heading"><div><p className="eyebrow">Append-only history</p><h1>Audit log</h1></div><span className="chip">Showing {Math.min(visibleCount, events.length)} of {events.length}</span></div><section className="panel"><div className="audit-list">{events.slice(0, visibleCount).map(event => <article className="audit-row" key={event.id}><time>{new Date(event.occurred_at).toLocaleString()}</time><div><strong>{event.action}</strong><p>{event.target_type ? `${event.target_type} · ${event.target_id}` : "System event"}</p></div><code>{event.correlation_id.slice(0, 12)}</code></article>)}{!events.length && <p className="empty">{message || "No events recorded."}</p>}</div>{visibleCount < events.length && <button className="secondary" onClick={() => setVisibleCount(count => Math.min(count + 25, events.length))}>Show 25 more ({events.length - visibleCount} remaining)</button>}</section></>;
 }
 
-function ProfilesPanel({ csrf, role, activeChannelId }: { csrf: string; role: Role; activeChannelId: string }) {
+type EditableProfile = { kind: "channel"; profile: ChannelProfile } | { kind: "subject"; profile: SubjectProfile };
+type ArchiveProfile = EditableProfile;
+
+function linesFromForm(data: FormData, name: string): string[] {
+  return String(data.get(name) || "").split("\n").map(value => value.trim()).filter(Boolean);
+}
+
+function commaListFromForm(data: FormData, name: string): string[] {
+  return String(data.get(name) || "").split(",").map(value => value.trim()).filter(Boolean);
+}
+
+function recordNumber(record: Record<string, unknown>, name: string, fallback: number): number {
+  const value = Number(record[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function recordStrings(record: Record<string, unknown>, name: string): string[] {
+  const value = record[name];
+  return Array.isArray(value) ? value.map(item => String(item)) : [];
+}
+
+function jsonObjectFromForm(data: FormData, name: string): Record<string, unknown> {
+  const value = JSON.parse(String(data.get(name) || "{}")) as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${readableDetailName(name)} must be a JSON object.`);
+  return value as Record<string, unknown>;
+}
+
+function ProfileEditDialog({ target, channels, onClose, onSaveChannel, onSaveSubject }: {
+  target: EditableProfile;
+  channels: ChannelProfile[];
+  onClose: () => void;
+  onSaveChannel: (profile: ChannelProfile, payload: Record<string, unknown>) => Promise<void>;
+  onSaveSubject: (profile: SubjectProfile, payload: Record<string, unknown>) => Promise<void>;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const profile = target.profile;
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog.showModal();
+    return () => { if (dialog.open) dialog.close(); previouslyFocused?.focus(); };
+  }, []);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError(""); const data = new FormData(event.currentTarget);
+    try {
+      if (target.kind === "channel") {
+        await onSaveChannel(target.profile, {
+          slug: data.get("slug"), name: data.get("name"), enabled: target.profile.enabled,
+          identity: { ...target.profile.identity, description: data.get("description") },
+          languages: commaListFromForm(data, "languages"), audience: jsonObjectFromForm(data, "audience"),
+          editorial_rules: jsonObjectFromForm(data, "editorial_rules"), brand_kit: jsonObjectFromForm(data, "brand_kit"),
+          default_render_settings: jsonObjectFromForm(data, "default_render_settings"),
+          default_publish_settings: jsonObjectFromForm(data, "default_publish_settings"),
+        });
+      } else {
+        const subject = target.profile;
+        await onSaveSubject(subject, {
+          channel_profile_id: data.get("channel_profile_id"), name: data.get("name"), enabled: subject.enabled,
+          topic: data.get("topic"), research_goal: data.get("research_goal"), excluded_angles: linesFromForm(data, "excluded_angles"),
+          seed_queries: linesFromForm(data, "seed_queries"), related_concepts: linesFromForm(data, "related_concepts"),
+          negative_keywords: linesFromForm(data, "negative_keywords"), languages: commaListFromForm(data, "languages"), regions: commaListFromForm(data, "regions"),
+          domain_policy: { ...subject.domain_policy, allow: linesFromForm(data, "allowed_domains"), block: linesFromForm(data, "blocked_domains") },
+          source_requirements: { ...subject.source_requirements, minimum_independent: Number(data.get("minimum_independent")), minimum_primary: Number(data.get("minimum_primary")) },
+          schedule: { cron: String(data.get("cron") || "").trim() || null, timezone: String(data.get("timezone") || "UTC").trim() },
+          freshness_policy: { ...subject.freshness_policy, lookback_days: Number(data.get("lookback_days")), maximum_source_age_days: Number(data.get("maximum_source_age_days")) },
+          format_policy: { ...subject.format_policy, target: data.get("format_target"), duration_seconds: Number(data.get("duration_seconds")) },
+          editorial_profile: { ...subject.editorial_profile, tone: data.get("tone") }, risk: data.get("risk"),
+          budget: { ...subject.budget, tokens: Number(data.get("tokens")), gpu_seconds: Number(data.get("gpu_seconds")), currency_minor: Number(data.get("currency_minor")) },
+          opportunity_weights: jsonObjectFromForm(data, "opportunity_weights"),
+          approval_profile: {
+            ...subject.approval_profile, mode: data.get("operating_mode"), sensitive_topics: commaListFromForm(data, "sensitive_topics"),
+            evidence_density_minimum: Number(data.get("evidence_density_minimum")), repeated_scene_limit: Number(data.get("repeated_scene_limit")),
+          },
+        });
+      }
+      onClose();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "Profile could not be saved"); }
+    finally { setBusy(false); }
+  }
+
+  return <dialog ref={dialogRef} className="profile-dialog" aria-labelledby="profile-edit-title" onCancel={event => { event.preventDefault(); if (!busy) onClose(); }}>
+    <div className="profile-dialog-shell"><header className="profile-dialog-header"><div><p className="eyebrow">Versioned profile</p><h2 id="profile-edit-title">Edit {profile.name}</h2><p>Saving creates version {profile.version + 1}. Existing workflows and audit history remain linked.</p></div><button type="button" className="help-close" aria-label="Close profile editor" disabled={busy} onClick={onClose}>×</button></header>
+      <form className="profile-edit-form" onSubmit={save}>{error && <div className="notice error">{error}</div>}
+        {target.kind === "channel" ? <>
+          <div className="form-pair"><label>Channel name<input name="name" defaultValue={target.profile.name} minLength={2} required /></label><label>Slug<input name="slug" defaultValue={target.profile.slug} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" required /></label></div>
+          <label>Languages, comma separated<input name="languages" defaultValue={target.profile.languages.join(", ")} required /></label>
+          <label>Description<textarea name="description" rows={4} defaultValue={String(target.profile.identity.description || "")} /></label>
+          <details className="profile-advanced"><summary>Advanced channel policies</summary><p className="muted">Edit valid JSON objects. Unchanged values are preserved exactly.</p><label>Audience JSON<textarea name="audience" rows={5} defaultValue={JSON.stringify(target.profile.audience, null, 2)} spellCheck={false} /></label><label>Editorial rules JSON<textarea name="editorial_rules" rows={5} defaultValue={JSON.stringify(target.profile.editorial_rules, null, 2)} spellCheck={false} /></label><label>Brand kit JSON<textarea name="brand_kit" rows={5} defaultValue={JSON.stringify(target.profile.brand_kit, null, 2)} spellCheck={false} /></label><label>Default render settings JSON<textarea name="default_render_settings" rows={5} defaultValue={JSON.stringify(target.profile.default_render_settings, null, 2)} spellCheck={false} /></label><label>Default publish settings JSON<textarea name="default_publish_settings" rows={5} defaultValue={JSON.stringify(target.profile.default_publish_settings, null, 2)} spellCheck={false} /></label></details>
+        </> : <>
+          <div className="form-pair"><label>Profile name<input name="name" defaultValue={target.profile.name} minLength={2} required /></label><label>Channel<select name="channel_profile_id" defaultValue={target.profile.channel_profile_id} required>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></label></div>
+          <label>Topic<textarea name="topic" rows={3} defaultValue={target.profile.topic} minLength={2} required /></label><label>Research goal<textarea name="research_goal" rows={4} defaultValue={target.profile.research_goal} minLength={2} required /></label>
+          <div className="form-pair"><label>Seed queries, one per line<textarea name="seed_queries" rows={5} defaultValue={target.profile.seed_queries.join("\n")} required /></label><label>Excluded terms, one per line<textarea name="negative_keywords" rows={5} defaultValue={target.profile.negative_keywords.join("\n")} /></label></div>
+          <div className="form-pair"><label>Excluded angles, one per line<textarea name="excluded_angles" rows={3} defaultValue={target.profile.excluded_angles.join("\n")} /></label><label>Related concepts, one per line<textarea name="related_concepts" rows={3} defaultValue={target.profile.related_concepts.join("\n")} /></label></div>
+          <div className="form-pair"><label>Languages, comma separated<input name="languages" defaultValue={target.profile.languages.join(", ")} required /></label><label>Regions, comma separated<input name="regions" defaultValue={target.profile.regions.join(", ")} /></label></div>
+          <div className="form-pair"><label>Risk<select name="risk" defaultValue={target.profile.risk}><option>low</option><option>medium</option><option>high</option></select></label><label>Operating profile<select name="operating_mode" defaultValue={String(target.profile.approval_profile.mode || "assisted")}><option value="assisted">Assisted</option><option value="supervised">Supervised</option><option value="trusted">Trusted</option></select></label></div>
+          <label>Sensitive categories, comma separated<input name="sensitive_topics" defaultValue={recordStrings(target.profile.approval_profile, "sensitive_topics").join(", ")} /></label>
+          <div className="form-pair"><label>Minimum factual claims / 100 words<input name="evidence_density_minimum" type="number" min="0" max="100" step="0.1" defaultValue={recordNumber(target.profile.approval_profile, "evidence_density_minimum", 1)} /></label><label>Repeated-scene limit<input name="repeated_scene_limit" type="number" min="0" max="100" defaultValue={recordNumber(target.profile.approval_profile, "repeated_scene_limit", 1)} /></label></div>
+          <div className="form-pair"><label>Temporal cron<input name="cron" defaultValue={target.profile.schedule.cron || ""} placeholder="0 6 * * *" /></label><label>IANA timezone<input name="timezone" defaultValue={target.profile.schedule.timezone || "UTC"} required /></label></div>
+          <details className="profile-advanced"><summary>Advanced research policies</summary><div className="form-pair"><label>Allowed domains, one per line<textarea name="allowed_domains" rows={3} defaultValue={recordStrings(target.profile.domain_policy, "allow").join("\n")} /></label><label>Blocked domains, one per line<textarea name="blocked_domains" rows={3} defaultValue={recordStrings(target.profile.domain_policy, "block").join("\n")} /></label></div><div className="form-pair"><label>Minimum independent sources<input name="minimum_independent" type="number" min="0" defaultValue={recordNumber(target.profile.source_requirements, "minimum_independent", 2)} /></label><label>Minimum primary sources<input name="minimum_primary" type="number" min="0" defaultValue={recordNumber(target.profile.source_requirements, "minimum_primary", 1)} /></label></div><div className="form-pair"><label>Recent article window (days)<input name="lookback_days" type="number" min="1" max="365" defaultValue={recordNumber(target.profile.freshness_policy, "lookback_days", 7)} /></label><label>Maximum source age (days)<input name="maximum_source_age_days" type="number" min="1" defaultValue={recordNumber(target.profile.freshness_policy, "maximum_source_age_days", 3650)} /></label></div><div className="form-pair"><label>Format target<input name="format_target" defaultValue={String(target.profile.format_policy.target || "standard")} /></label><label>Target duration (seconds)<input name="duration_seconds" type="number" min="1" defaultValue={recordNumber(target.profile.format_policy, "duration_seconds", 600)} /></label></div><label>Editorial tone<input name="tone" defaultValue={String(target.profile.editorial_profile.tone || "calm")} /></label><div className="form-pair three"><label>Token budget<input name="tokens" type="number" min="0" defaultValue={recordNumber(target.profile.budget, "tokens", 0)} /></label><label>GPU seconds<input name="gpu_seconds" type="number" min="0" defaultValue={recordNumber(target.profile.budget, "gpu_seconds", 0)} /></label><label>Currency minor units<input name="currency_minor" type="number" min="0" defaultValue={recordNumber(target.profile.budget, "currency_minor", 0)} /></label></div><label>Opportunity weights JSON<textarea name="opportunity_weights" rows={5} defaultValue={JSON.stringify(target.profile.opportunity_weights, null, 2)} spellCheck={false} /></label></details>
+        </>}
+        <footer className="profile-dialog-actions"><button type="button" className="secondary" disabled={busy} onClick={onClose}>Cancel</button><button className="primary" disabled={busy}>{busy ? "Saving…" : "Save new version"}</button></footer>
+      </form>
+    </div>
+  </dialog>;
+}
+
+function ArchiveProfileDialog({ target, blockingSubjects, onClose, onArchive }: { target: ArchiveProfile; blockingSubjects: SubjectProfile[]; onClose: () => void; onArchive: (target: ArchiveProfile) => Promise<void> }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog.showModal();
+    return () => { if (dialog.open) dialog.close(); previouslyFocused?.focus(); };
+  }, []);
+  async function archive() {
+    setBusy(true); setError("");
+    try { await onArchive(target); onClose(); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : "Profile could not be archived"); }
+    finally { setBusy(false); }
+  }
+  const blocked = target.kind === "channel" && blockingSubjects.length > 0;
+  return <dialog ref={dialogRef} className="archive-dialog" aria-labelledby="profile-archive-title" onCancel={event => { event.preventDefault(); if (!busy) onClose(); }}><div className="archive-dialog-shell"><p className="eyebrow">Recoverable removal</p><h2 id="profile-archive-title">Archive {target.profile.name}?</h2>{target.kind === "subject" ? <p>The subject disappears from active lists and its Temporal schedule is paused first. Findings, workflows and audit history remain intact.</p> : blocked ? <><div className="notice error">Archive or reassign these subjects first:</div><ul>{blockingSubjects.map(subject => <li key={subject.id}>{subject.name}</li>)}</ul></> : <p>The channel disappears from active lists. Its workflows, evidence and audit history remain intact.</p>}{error && <div className="notice error">{error}</div>}<div className="profile-dialog-actions"><button type="button" className="secondary" disabled={busy} onClick={onClose}>Cancel</button><button type="button" className="secondary danger" disabled={busy || blocked} onClick={archive}>{busy ? "Archiving…" : `Archive ${target.kind}`}</button></div></div></dialog>;
+}
+
+function ProfilesPanel({ csrf, role, activeChannelId, onChannelsChanged }: { csrf: string; role: Role; activeChannelId: string; onChannelsChanged: () => Promise<void> }) {
   const [channels, setChannels] = useState<ChannelProfile[]>([]);
   const [subjects, setSubjects] = useState<SubjectProfile[]>([]);
   const [selectedChannel, setSelectedChannel] = useState("");
   const [plan, setPlan] = useState<SearchPlan | null>(null);
+  const [editingProfile, setEditingProfile] = useState<EditableProfile | null>(null);
+  const [archiveProfile, setArchiveProfile] = useState<ArchiveProfile | null>(null);
   const [scheduleStates, setScheduleStates] = useState<Record<string, SubjectSchedule>>({});
   const [message, setMessage] = useState("");
   const refresh = useCallback(async () => {
@@ -817,7 +955,7 @@ function ProfilesPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
         audience: {}, editorial_rules: { evidence_first: true }, brand_kit: {}, default_render_settings: {},
         default_publish_settings: { privacy: "private", automatic_publication: false },
       }) }, csrf);
-      form.reset(); setMessage("Disabled channel profile created. Review it before enabling."); await refresh();
+      form.reset(); setMessage("Disabled channel profile created. Review it before enabling."); await Promise.all([refresh(), onChannelsChanged()]);
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Channel creation failed"); }
   }
 
@@ -852,7 +990,7 @@ function ProfilesPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
     const { id: _id, version, created_at: _created, updated_at: _updated, ...writeFields } = channel;
     try {
       await api(`/api/v1/channel-profiles/${channel.id}`, { method: "PUT", body: JSON.stringify({ ...writeFields, enabled, expected_version: version }) }, csrf);
-      setMessage(`Channel ${enabled ? "enabled" : "disabled"}.`); await refresh();
+      setMessage(`Channel ${enabled ? "enabled" : "disabled"}.`); await Promise.all([refresh(), onChannelsChanged()]);
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Channel update failed"); }
   }
 
@@ -862,6 +1000,23 @@ function ProfilesPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
       await api(`/api/v1/subject-profiles/${subject.id}`, { method: "PUT", body: JSON.stringify({ ...writeFields, enabled, expected_version: version }) }, csrf);
       setMessage(`Subject ${enabled ? "enabled" : "disabled"}. Reconcile its Temporal schedule to apply the change.`); await refresh();
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Subject update failed"); }
+  }
+
+  async function updateChannel(channel: ChannelProfile, payload: Record<string, unknown>) {
+    await api(`/api/v1/channel-profiles/${channel.id}`, { method: "PUT", body: JSON.stringify({ ...payload, expected_version: channel.version }) }, csrf);
+    setMessage(`Channel saved as version ${channel.version + 1}.`); await Promise.all([refresh(), onChannelsChanged()]);
+  }
+
+  async function updateSubject(subject: SubjectProfile, payload: Record<string, unknown>) {
+    await api(`/api/v1/subject-profiles/${subject.id}`, { method: "PUT", body: JSON.stringify({ ...payload, expected_version: subject.version }) }, csrf);
+    setMessage(`Subject saved as version ${subject.version + 1}. Apply its schedule if the cron, timezone or enabled state changed.`); await refresh();
+  }
+
+  async function archiveSelected(target: ArchiveProfile) {
+    await api(`/api/v1/${target.kind === "channel" ? "channel" : "subject"}-profiles/${target.profile.id}?expected_version=${target.profile.version}`, { method: "DELETE" }, csrf);
+    setMessage(`${target.kind === "channel" ? "Channel" : "Subject"} archived. Linked history remains available in audit and workflow records.`);
+    if (target.kind === "channel") await Promise.all([refresh(), onChannelsChanged()]);
+    else await refresh();
   }
 
   async function reconcileSchedule(subject: SubjectProfile) {
@@ -878,14 +1033,16 @@ function ProfilesPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
     {message && <div className="notice">{message}</div>}
     <div className="profile-grid">
       <section className="panel"><div className="panel-title"><div><p className="eyebrow">Editorial identities</p><h2>Channel profiles</h2></div><span className="chip">{channels.length}</span></div>
-        <div className="card-list">{channels.map(channel => <article className="profile-card" key={channel.id}><div><strong>{channel.name}</strong><small>{channel.languages.join(" · ")} · v{channel.version}</small></div><div className="actions"><span className={`status ${channel.enabled ? "good" : ""}`}>{channel.enabled ? "Enabled" : "Disabled"}</span>{(role === "admin" || role === "editor") && <button className="secondary compact" onClick={() => setChannelEnabled(channel, !channel.enabled)}>{channel.enabled ? "Disable" : "Enable"}</button>}</div></article>)}{!channels.length && <p className="empty">Create a disabled editorial identity to begin.</p>}</div>
+        <div className="card-list">{channels.map(channel => <article className="profile-card" key={channel.id}><div><strong>{channel.name}</strong><small>{channel.languages.join(" · ")} · v{channel.version}</small></div><div className="actions"><span className={`status ${channel.enabled ? "good" : ""}`}>{channel.enabled ? "Enabled" : "Disabled"}</span>{(role === "admin" || role === "editor") && <><button className="secondary compact control-help" data-usage="Edit the complete versioned channel profile without changing linked history." onClick={() => setEditingProfile({ kind: "channel", profile: channel })}>Edit</button><button className="secondary compact" onClick={() => setChannelEnabled(channel, !channel.enabled)}>{channel.enabled ? "Disable" : "Enable"}</button><button className="secondary compact danger control-help" data-usage="Archive this channel after its subjects are archived or moved. History is retained." onClick={() => setArchiveProfile({ kind: "channel", profile: channel })}>Archive</button></>}</div></article>)}{!channels.length && <p className="empty">Create a disabled editorial identity to begin.</p>}</div>
         {(role === "admin" || role === "editor") && <form onSubmit={createChannel}><label>Channel name<input name="name" required /></label><label>Slug<input name="slug" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" required /></label><label>Languages<input name="languages" defaultValue="en" required /></label><label>Description<textarea name="description" rows={3} /></label><button className="primary">Create disabled channel</button></form>}
       </section>
       <section className="panel"><div className="panel-title"><div><p className="eyebrow">Scheduled monitoring</p><h2>Subject profiles</h2></div><span className="chip">{scopedSubjects.length}</span></div>
-        <div className="card-list">{scopedSubjects.map(subject => <article className="profile-card subject" key={subject.id}><div><strong>{subject.name}</strong><small>{channelNames.get(subject.channel_profile_id) || "Unknown channel"} · {subject.risk} risk · {subject.seed_queries.length} seed quer{subject.seed_queries.length === 1 ? "y" : "ies"}</small><small>{subject.schedule.cron || "Manual only"}{scheduleStates[subject.id] ? ` · ${scheduleStates[subject.id].exists ? scheduleStates[subject.id].paused ? "schedule paused" : "schedule active" : "schedule absent"}` : ""}</small></div><div className="actions">{(role === "admin" || role === "editor") && <><button className="secondary compact" onClick={() => testPlan(subject.id)}>Test plan</button><button className="secondary compact" onClick={() => setSubjectEnabled(subject, !subject.enabled)}>{subject.enabled ? "Disable" : "Enable"}</button></>}{(role === "admin" || role === "operator") && <button className="secondary compact" onClick={() => reconcileSchedule(subject)}>Apply schedule</button>}</div></article>)}{!scopedSubjects.length && <p className="empty">No subjects belong to this channel yet.</p>}</div>
+        <div className="card-list">{scopedSubjects.map(subject => <article className="profile-card subject" key={subject.id}><div><strong>{subject.name}</strong><small>{channelNames.get(subject.channel_profile_id) || "Unknown channel"} · {subject.risk} risk · {subject.seed_queries.length} seed quer{subject.seed_queries.length === 1 ? "y" : "ies"}</small><small>{subject.schedule.cron || "Manual only"}{scheduleStates[subject.id] ? ` · ${scheduleStates[subject.id].exists ? scheduleStates[subject.id].paused ? "schedule paused" : "schedule active" : "schedule absent"}` : ""}</small></div><div className="actions">{(role === "admin" || role === "editor") && <><button className="secondary compact control-help" data-usage="Edit this subject's queries, policies, channel and schedule as a new version." onClick={() => setEditingProfile({ kind: "subject", profile: subject })}>Edit</button><button className="secondary compact" onClick={() => testPlan(subject.id)}>Test plan</button><button className="secondary compact" onClick={() => setSubjectEnabled(subject, !subject.enabled)}>{subject.enabled ? "Disable" : "Enable"}</button><button className="secondary compact danger control-help" data-usage="Pause the schedule and archive this subject while retaining findings and audit history." onClick={() => setArchiveProfile({ kind: "subject", profile: subject })}>Archive</button></>}{(role === "admin" || role === "operator") && <button className="secondary compact" onClick={() => reconcileSchedule(subject)}>Apply schedule</button>}</div></article>)}{!scopedSubjects.length && <p className="empty">No subjects belong to this channel yet.</p>}</div>
         {(role === "admin" || role === "editor") && <form onSubmit={createSubject}><label>Channel<select name="channel_profile_id" value={selectedChannel} onChange={event => setSelectedChannel(event.target.value)} required><option value="">Select a channel</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></label><label>Profile name<input name="name" required /></label><label>Topic<input name="topic" required /></label><label>Research goal<textarea name="research_goal" rows={3} required /></label><label>Seed queries, one per line<textarea name="seed_queries" rows={3} required /></label><label>Excluded terms, one per line<textarea name="negative_keywords" rows={2} placeholder="Satire&#10;Kommentar" /></label><div className="form-pair"><label>Language<input name="language" defaultValue="en" required /></label><label>Risk<select name="risk" defaultValue="medium"><option>low</option><option>medium</option><option>high</option></select></label></div><div className="form-pair"><label>Operating profile<select name="operating_mode" defaultValue="assisted"><option value="assisted">Assisted</option><option value="supervised">Supervised</option><option value="trusted">Trusted</option></select></label><label>Sensitive categories, comma separated<input name="sensitive_topics" placeholder="health, politics" /></label></div><div className="form-pair"><label>Minimum factual claims / 100 words<input name="evidence_density_minimum" type="number" min="0" max="100" step="0.1" defaultValue="1" /></label><label>Repeated-scene limit<input name="repeated_scene_limit" type="number" min="0" max="100" defaultValue="1" /></label></div><small className="muted">Sensitive categories: identifiable_accusation, health, legal, finance, politics, breaking_news, misinformation_fact_checking.</small><div className="form-pair"><label>Recent article window (days)<input name="lookback_days" type="number" min="1" max="365" defaultValue="7" required /></label><label>IANA timezone<input name="timezone" defaultValue="UTC" required /></label></div><label>Temporal cron<input name="cron" placeholder="0 6 * * *" /></label><button className="primary" disabled={!channels.length}>Create disabled subject</button></form>}
       </section>
     </div>
+    {editingProfile && <ProfileEditDialog target={editingProfile} channels={channels} onClose={() => setEditingProfile(null)} onSaveChannel={updateChannel} onSaveSubject={updateSubject} />}
+    {archiveProfile && <ArchiveProfileDialog target={archiveProfile} blockingSubjects={archiveProfile.kind === "channel" ? subjects.filter(subject => subject.channel_profile_id === archiveProfile.profile.id) : []} onClose={() => setArchiveProfile(null)} onArchive={archiveSelected} />}
     {plan && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Validated search plan</p><h2>{plan.subject_topic}</h2></div><button className="secondary compact" onClick={() => setPlan(null)}>Close</button></div><div className="strategy-list">{plan.strategies.map((strategy, index) => <article key={`${strategy.purpose}-${index}`}><span className="chip">{strategy.purpose}</span><code>{strategy.query}</code><small>{strategy.language}{strategy.region ? ` · ${strategy.region}` : ""}</small></article>)}</div><div className="notice"><strong>Falsification branch:</strong> {plan.falsification_queries.join("; ")}</div></section>}
   </>;
 }
@@ -1757,5 +1914,14 @@ export default function Home() {
   const activeChannel = channels.find(item => item.id === activeChannelId) || null;
   function chooseChannel(value: string) { setActiveChannelId(value); window.localStorage.setItem("tubefactory.channel", value); }
   function choosePage(value: string) { if (!PAGE_IDS.has(value)) return; setPage(value); const url = new URL(window.location.href); if (value === "dashboard") url.searchParams.delete("page"); else url.searchParams.set("page", value); window.history.pushState(null, "", url); }
-  return <><div className="app-shell"><aside><div className="brand"><div className="brand-mark">TF</div><div><strong>TubeFactory</strong><small>Editorial control plane</small></div><UsageTip text="Search longer procedures by task, or hover and focus controls for concise guidance." onClick={() => setHelpOpen(true)} /></div><label className="channel-switcher">Channel workspace<select aria-label="Channel workspace" value={activeChannelId} onChange={event => chooseChannel(event.target.value)}><option value="">All channels</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select><small>{activeChannel ? `${activeChannel.enabled ? "Enabled" : "Disabled"} · ${activeChannel.languages.join(", ")}` : `${channels.length} channels in portfolio`}</small></label><nav aria-label="Main navigation">{navGroups.map(group => { const visible = group.items.filter(item => !item.roles || item.roles.includes(session.user.role)); return visible.length ? <div className="nav-group" key={group.label}><span>{group.label}</span>{visible.map(item => <button key={item.id} className={page === item.id ? "active nav-help" : "nav-help"} data-usage={item.help} aria-label={item.label + ". " + item.help} onClick={() => choosePage(item.id)}>{item.label}</button>)}</div> : null; })}</nav><div className="profile"><span className="avatar">{session.user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.display_name}</strong><small>{session.user.role}</small></span><button className="sign-out" onClick={async () => { await api("/api/v1/auth/logout", { method: "POST" }, session.csrf_token); setSession(null); }}>Sign out</button></div></aside><main className="workspace"><div className="scope-bar"><div><span className="eyebrow">Current workspace</span><strong>{activeChannel?.name || "All channels"}</strong></div><span>{activeChannel ? "Every channel-aware queue is filtered to this channel." : "Portfolio view across every channel."}</span></div>{page === "dashboard" && <Dashboard capabilities={capabilities} activeChannelId={activeChannelId} />}{page === "profiles" && <ProfilesPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "research" && <ResearchPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "editorial" && <EditorialPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "media" && <MediaPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "publishing" && <PublishingPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "operations" && <OperationsPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "identity" && <IdentityPanel session={session} onSession={setSession} />}{page === "providers" && <ProviderPanel csrf={session.csrf_token} />}{page === "workflows" && <WorkflowPanel csrf={session.csrf_token} activeChannelId={activeChannelId} onOpenPage={choosePage} />}{page === "configuration" && <ConfigPanel csrf={session.csrf_token} />}{page === "users" && <UsersPanel csrf={session.csrf_token} />}{page === "audit" && <AuditPanel />}</main></div><HelpPanel open={helpOpen} onClose={() => setHelpOpen(false)} currentPage={page} role={session.user.role} onOpenPage={choosePage} /></>;
+  async function refreshChannelChoices() {
+    const nextChannels = await api<ChannelProfile[]>("/api/v1/channel-profiles");
+    setChannels(nextChannels);
+    setActiveChannelId(current => {
+      if (!current || nextChannels.some(channel => channel.id === current)) return current;
+      window.localStorage.setItem("tubefactory.channel", "");
+      return "";
+    });
+  }
+  return <><div className="app-shell"><aside><div className="brand"><div className="brand-mark">TF</div><div><strong>TubeFactory</strong><small>Editorial control plane</small></div><UsageTip text="Search longer procedures by task, or hover and focus controls for concise guidance." onClick={() => setHelpOpen(true)} /></div><label className="channel-switcher">Channel workspace<select aria-label="Channel workspace" value={activeChannelId} onChange={event => chooseChannel(event.target.value)}><option value="">All channels</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select><small>{activeChannel ? `${activeChannel.enabled ? "Enabled" : "Disabled"} · ${activeChannel.languages.join(", ")}` : `${channels.length} channels in portfolio`}</small></label><nav aria-label="Main navigation">{navGroups.map(group => { const visible = group.items.filter(item => !item.roles || item.roles.includes(session.user.role)); return visible.length ? <div className="nav-group" key={group.label}><span>{group.label}</span>{visible.map(item => <button key={item.id} className={page === item.id ? "active nav-help" : "nav-help"} data-usage={item.help} aria-label={item.label + ". " + item.help} onClick={() => choosePage(item.id)}>{item.label}</button>)}</div> : null; })}</nav><div className="profile"><span className="avatar">{session.user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.display_name}</strong><small>{session.user.role}</small></span><button className="sign-out" onClick={async () => { await api("/api/v1/auth/logout", { method: "POST" }, session.csrf_token); setSession(null); }}>Sign out</button></div></aside><main className="workspace"><div className="scope-bar"><div><span className="eyebrow">Current workspace</span><strong>{activeChannel?.name || "All channels"}</strong></div><span>{activeChannel ? "Every channel-aware queue is filtered to this channel." : "Portfolio view across every channel."}</span></div>{page === "dashboard" && <Dashboard capabilities={capabilities} activeChannelId={activeChannelId} />}{page === "profiles" && <ProfilesPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} onChannelsChanged={refreshChannelChoices} />}{page === "research" && <ResearchPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "editorial" && <EditorialPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "media" && <MediaPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "publishing" && <PublishingPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "operations" && <OperationsPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "identity" && <IdentityPanel session={session} onSession={setSession} />}{page === "providers" && <ProviderPanel csrf={session.csrf_token} />}{page === "workflows" && <WorkflowPanel csrf={session.csrf_token} activeChannelId={activeChannelId} onOpenPage={choosePage} />}{page === "configuration" && <ConfigPanel csrf={session.csrf_token} />}{page === "users" && <UsersPanel csrf={session.csrf_token} />}{page === "audit" && <AuditPanel />}</main></div><HelpPanel open={helpOpen} onClose={() => setHelpOpen(false)} currentPage={page} role={session.user.role} onOpenPage={choosePage} /></>;
 }

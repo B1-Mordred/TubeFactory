@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Annotated, TypeVar
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from youtuber_api.schemas import (
     ChannelProfileUpdate,
     ChannelProfileView,
     ChannelProfileWrite,
+    ProfileArchiveView,
     SearchPlanView,
     SubjectScheduleView,
     SubjectProfileUpdate,
@@ -41,6 +42,7 @@ async def _commit_profile(
     actor: UserModel,
     profile: ProfileModel,
     action: str,
+    context: dict[str, object] | None = None,
 ) -> ProfileModel:
     try:
         await session.flush()
@@ -54,7 +56,12 @@ async def _commit_profile(
         target_type=profile.__tablename__.removesuffix("s"),
         target_id=str(profile.id),
         correlation_id=request.state.correlation_id,
-        context={"version": profile.version, "enabled": profile.enabled},
+        context={
+            "version": profile.version,
+            "enabled": profile.enabled,
+            "archived_at": profile.deleted_at.isoformat() if profile.deleted_at else None,
+            **(context or {}),
+        },
     )
     await session.commit()
     return profile
@@ -112,6 +119,52 @@ async def update_channel(
     )
 
 
+@router.delete("/channel-profiles/{profile_id}", response_model=ProfileArchiveView)
+async def archive_channel(
+    profile_id: UUID,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    expected_version: Annotated[int, Query(ge=1)],
+) -> ProfileArchiveView:
+    profile = await session.get(ChannelProfileModel, profile_id, with_for_update=True)
+    if profile is None or profile.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Channel profile not found")
+    if profile.version != expected_version:
+        raise HTTPException(status_code=409, detail="Profile changed; reload before archiving")
+    active_subjects = list(
+        await session.scalars(
+            select(SubjectProfileModel)
+            .where(
+                SubjectProfileModel.channel_profile_id == profile.id,
+                SubjectProfileModel.deleted_at.is_(None),
+            )
+            .order_by(SubjectProfileModel.name)
+        )
+    )
+    if active_subjects:
+        names = ", ".join(subject.name for subject in active_subjects[:5])
+        suffix = "" if len(active_subjects) <= 5 else f" and {len(active_subjects) - 5} more"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Archive or reassign the channel's subject profiles first: {names}{suffix}",
+        )
+    archived_at = datetime.now(timezone.utc)
+    profile.enabled = False
+    profile.deleted_at = archived_at
+    profile.updated_at = archived_at
+    profile.version += 1
+    await _commit_profile(
+        session=session,
+        request=request,
+        actor=actor,
+        profile=profile,
+        action="channel_profile.archived",
+        context={"active_subject_count": 0},
+    )
+    return ProfileArchiveView(id=profile.id, version=profile.version, archived_at=archived_at)
+
+
 @router.get("/subject-profiles", response_model=list[SubjectProfileView])
 async def list_subjects(
     _: Viewer, session: Annotated[AsyncSession, Depends(get_session)]
@@ -158,6 +211,9 @@ async def update_subject(
         raise HTTPException(status_code=404, detail="Subject profile not found")
     if profile.version != payload.expected_version:
         raise HTTPException(status_code=409, detail="Profile changed; reload before saving")
+    channel = await session.get(ChannelProfileModel, payload.channel_profile_id)
+    if channel is None or channel.deleted_at is not None:
+        raise HTTPException(status_code=422, detail="Channel profile does not exist")
     for name, value in payload.model_dump(exclude={"expected_version"}).items():
         setattr(profile, name, value)
     profile.version += 1
@@ -165,6 +221,46 @@ async def update_subject(
     return await _commit_profile(
         session=session, request=request, actor=actor, profile=profile, action="subject_profile.updated"
     )
+
+
+@router.delete("/subject-profiles/{profile_id}", response_model=ProfileArchiveView)
+async def archive_subject(
+    profile_id: UUID,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    expected_version: Annotated[int, Query(ge=1)],
+) -> ProfileArchiveView:
+    profile = await session.get(SubjectProfileModel, profile_id, with_for_update=True)
+    if profile is None or profile.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Subject profile not found")
+    if profile.version != expected_version:
+        raise HTTPException(status_code=409, detail="Profile changed; reload before archiving")
+    policy = profile.schedule or {"cron": None, "timezone": "UTC"}
+    schedule_state = await SubjectScheduleGateway(request.app.state.temporal_client).reconcile(
+        subject_profile_id=profile.id,
+        cron=policy.get("cron"),
+        timezone_name=policy.get("timezone", "UTC"),
+        enabled=False,
+    )
+    archived_at = datetime.now(timezone.utc)
+    profile.enabled = False
+    profile.deleted_at = archived_at
+    profile.updated_at = archived_at
+    profile.version += 1
+    await _commit_profile(
+        session=session,
+        request=request,
+        actor=actor,
+        profile=profile,
+        action="subject_profile.archived",
+        context={
+            "schedule_id": schedule_state["schedule_id"],
+            "schedule_exists": schedule_state["exists"],
+            "schedule_paused": schedule_state["paused"],
+        },
+    )
+    return ProfileArchiveView(id=profile.id, version=profile.version, archived_at=archived_at)
 
 
 @router.post("/subject-profiles/{profile_id}/test-search-plan", response_model=SearchPlanView)

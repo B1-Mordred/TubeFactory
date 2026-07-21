@@ -18,6 +18,7 @@ The authoritative product requirements are the user-supplied mission brief. `doc
 - [x] 2026-07-21: Increment 4 publishing mock/dry-run acceptance gate passed; real network use remains credential-gated.
 - [x] 2026-07-21: Increment 5 optimization and hardening acceptance gate passed.
 - [x] 2026-07-21: Final reproducible deployment, migration, regression, security, observability and recovery audit passed; real Google action remains operator-credential-gated.
+- [x] 2026-07-21: Complete channel/subject lifecycle management passed: prefilled version-checked edits, audited soft deletion, schedule cleanup, dependency protection, responsive operator controls, and live validation.
 
 ## Milestones
 
@@ -59,6 +60,7 @@ PostgreSQL is authoritative for metadata and workflow-facing state; immutable la
 - 2026-07-20: Treat optional-profile capability as unavailable until its real behavior and tests exist; never return fake success.
 - 2026-07-21: Keep Google credentials and plaintext refresh tokens inside a dedicated publisher egress gateway; return only ciphertext to the API and never place secrets in Temporal history.
 - 2026-07-21: Give dry-run and real uploads distinct stable release keys so a safe rehearsal never consumes or aliases the real external side effect.
+- 2026-07-21: Expose user-requested profile deletion as recoverable archival. Preserve linked workflows, evidence and audit history; archive subjects only after stopping their schedule, and block channel archival while active subjects remain.
 
 ## Discoveries
 
@@ -141,3 +143,11 @@ Compose stop/start must preserve named volumes. Migrations are forward-only and 
 - Security audit proves one host port, internal private networks, read-only/capability-dropped application services and dedicated identity/provider/publishing egress membership.
 - The final 26-image checksummed CycloneDX SBOM is `/srv/youtuber-backups/sbom-final-20260721T0818`; its 26-entry manifest SHA-256 is `0a0de726474b163584cfb9077c544683fc83b4c09690c4d194c8d6361589b5be`.
 - The post-`0018` backup/restore artifact is `/srv/youtuber-backups/final-20260721T0822`; the disposable drill restored 75 tables, 148 audit events, eight source snapshots and 185 objects, removed its temporary targets and did not modify production. Real YouTube OAuth/upload was not invoked without operator-owned credentials.
+
+2026-07-21 channel and subject lifecycle evidence:
+
+- Every active channel and subject card exposes an accessible Edit action with a prefilled complete profile editor. Saves use the existing optimistic version check, preserve linked history and immediately refresh both the card list and channel workspace selector.
+- Archive is an audited, version-checked soft deletion. Channel archival is blocked while active subjects remain; subject archival first reconciles its Temporal schedule to disabled/paused and records the resulting schedule state in the audit context.
+- API regression passed with 93 tests. The Next.js TypeScript check and optimized production build passed, and the rebuilt API and web images are deployed.
+- A disposable live channel was edited from version 1 to 2. Its disposable subject was edited from version 1 to 2, enabled, reconciled to an active `0 4 * * *` schedule, then archived; PostgreSQL confirmed `schedule_paused=true`, `enabled=false`, `deleted_at` set and version 4. The channel was then archived at version 3, disappeared from the workspace selector, and the selected scope safely reset to All channels.
+- Desktop and 390-pixel browser checks confirmed the prefilled editors and dependency-aware archive dialog. The browser console reported zero errors and zero warnings; all 25 deployed services were running without unhealthy or starting containers.

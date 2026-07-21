@@ -3,6 +3,9 @@ from youtuber_api.main import app
 
 def test_application_routes_can_be_constructed() -> None:
     paths = {route.path for route in app.routes}
+    methods_by_path: dict[str, set[str]] = {}
+    for route in app.routes:
+        methods_by_path.setdefault(route.path, set()).update(getattr(route, "methods", set()) or set())
     assert "/api/health/ready" in paths
     assert "/api/v1/auth/logout" in paths
     assert "/api/v1/auth/totp/enroll" in paths
@@ -14,7 +17,11 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/auth/oidc/callback" in paths
     assert "/api/v1/system/durability-probes" in paths
     assert "/api/v1/channel-profiles" in paths
+    assert "PUT" in methods_by_path["/api/v1/channel-profiles/{profile_id}"]
+    assert "DELETE" in methods_by_path["/api/v1/channel-profiles/{profile_id}"]
     assert "/api/v1/subject-profiles" in paths
+    assert "PUT" in methods_by_path["/api/v1/subject-profiles/{profile_id}"]
+    assert "DELETE" in methods_by_path["/api/v1/subject-profiles/{profile_id}"]
     assert "/api/v1/subject-profiles/{profile_id}/test-search-plan" in paths
     assert "/api/v1/subject-profiles/{profile_id}/schedule" in paths
     assert "/api/v1/subject-profiles/{profile_id}/schedule/reconcile" in paths

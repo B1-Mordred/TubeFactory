@@ -523,6 +523,12 @@ class ChannelProfileView(ChannelProfileWrite):
     updated_at: datetime
 
 
+class ProfileArchiveView(BaseModel):
+    id: UUID
+    version: int
+    archived_at: datetime
+
+
 class SubjectSchedulePolicy(StrictRequestModel):
     cron: str | None = Field(default=None, min_length=1, max_length=200)
     timezone: str = Field(default="UTC", min_length=1, max_length=100)
