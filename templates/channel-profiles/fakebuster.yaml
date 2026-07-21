@@ -1,0 +1,33 @@
+schema_version: "1.0"
+kind: ChannelProfile
+metadata:
+  slug: fakebuster
+  name: FakeBuster
+spec:
+  enabled: false
+  identity:
+    description: Calm, evidence-first analysis of questionable public claims.
+    example_only: true
+  languages: [de, en]
+  audience:
+    description: General audiences seeking careful media-literacy explanations.
+  editorial_rules:
+    tone: calm
+    sensationalism: prohibited
+    counterevidence_search: mandatory
+    visible_on_screen_citations: mandatory
+    public_evidence_dossier: required
+    synthetic_media_disclosure: required
+    high_risk_human_approval: required
+  brand_kit:
+    primary_color: "#17324d"
+    accent_color: "#63c7b2"
+    typography: system-sans
+  default_render_settings:
+    aspect_ratio: "16:9"
+    resolution: "1920x1080"
+    citation_style: lower-third
+  default_publish_settings:
+    privacy: private
+    automatic_publication: false
+    synthetic_media_disclosure: true

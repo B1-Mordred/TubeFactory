@@ -1,0 +1,31 @@
+[Unit]
+Description=TubeFactory DHCP-aware mDNS identity
+Documentation=file:///srv/TubeFactory/docs/operator-guide.md
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+User=avahi
+Group=avahi
+Environment=LAN_INTERFACE=enp4s0
+Environment=LAN_HOSTNAME=evidence-studio.local
+Environment="LAN_SERVICE_NAME=TubeFactory"
+Environment=LAN_HTTP_PORT=8090
+ExecStart=/srv/TubeFactory/scripts/publish-lan-name.sh
+Restart=always
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

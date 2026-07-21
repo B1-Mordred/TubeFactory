@@ -1,0 +1,44 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [{"expr": "sum(rate(youtuber_http_requests_total[5m]))", "refId": "A"}],
+      "title": "API request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "targets": [{"expr": "sum(rate(youtuber_http_request_duration_seconds_sum[5m])) / clamp_min(sum(rate(youtuber_http_request_duration_seconds_count[5m])), 0.000001)", "refId": "A"}],
+      "title": "API mean latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 8},
+      "id": 3,
+      "targets": [{"expr": "{job=\"youtuber-containers\"}", "refId": "A"}],
+      "title": "Container logs",
+      "type": "logs"
+    }
+  ],
+  "schemaVersion": 41,
+  "tags": ["youtuber", "operations"],
+  "templating": {
+    "list": [
+      {"name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": {}},
+      {"name": "DS_LOKI", "type": "datasource", "query": "loki", "current": {}}
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Editorial Production Platform",
+  "uid": "youtuber-platform-v1",
+  "version": 1
+}

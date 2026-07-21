@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tubefactory-workflow-worker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic-settings==2.10.1",
+  "temporalio==1.15.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "../../packages/core/tests"]

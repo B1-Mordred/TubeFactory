@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evidence-studio.local/contracts/voice-response.schema.json",
+  "title": "Provider-neutral Voice Response",
+  "type": "object",
+  "required": ["segments", "duration_seconds", "sample_rate", "engine", "model_version", "warnings"],
+  "properties": {
+    "segments": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["order", "content_hash", "duration_seconds"], "properties": {"order": {"type": "integer", "minimum": 1}, "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "duration_seconds": {"type": "number", "exclusiveMinimum": 0}}, "additionalProperties": true}},
+    "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "sample_rate": {"type": "integer", "minimum": 8000, "maximum": 192000},
+    "engine": {"type": "string"},
+    "model_version": {"type": "string"},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

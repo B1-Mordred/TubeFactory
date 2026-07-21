@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tubefactory-publisher-worker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "asyncpg==0.30.0",
+  "cryptography==45.0.5",
+  "editorial-production-core==0.1.0",
+  "fastapi==0.116.1",
+  "httpx==0.28.1",
+  "minio==7.2.15",
+  "pydantic==2.11.7",
+  "temporalio==1.15.0",
+  "uvicorn[standard]==0.35.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.1", "pytest-asyncio==1.0.0", "respx==0.22.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,6 @@
+frontend.enableUpdateWorkflowExecution:
+  - value: true
+frontend.enableUpdateWorkflowExecutionAsyncAccepted:
+  - value: true
+history.persistenceMaxQPS:
+  - value: 3000

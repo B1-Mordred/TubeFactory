@@ -1,0 +1,7 @@
+.:53 {
+    errors
+    health 0.0.0.0:8080
+    ready 0.0.0.0:8181
+    cache 30
+    forward . /etc/resolv.conf
+}

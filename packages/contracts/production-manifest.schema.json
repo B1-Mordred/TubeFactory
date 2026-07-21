@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evidence-studio.local/contracts/production-manifest.schema.json",
+  "title": "Immutable Production Manifest",
+  "type": "object",
+  "required": ["schema_version", "production_id", "storyboard_version_id", "storyboard_hash", "render_tier", "scenes", "narration", "captions", "chapters", "sources", "assets", "render"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "production_id": {"type": "string", "format": "uuid"},
+    "storyboard_version_id": {"type": "string", "format": "uuid"},
+    "storyboard_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "render_tier": {"enum": ["preview", "full"]},
+    "scenes": {"type": "array"},
+    "narration": {"type": "array"},
+    "captions": {"type": "array"},
+    "chapters": {"type": "array"},
+    "sources": {"type": "array"},
+    "assets": {"type": "array"},
+    "render": {"type": "object"}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,18 @@
+{
+  "name": "tubefactory-render-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.495",
+    "@remotion/cli": "4.0.495",
+    "@remotion/renderer": "4.0.495",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "remotion": "4.0.495"
+  }
+}

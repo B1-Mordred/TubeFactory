@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evidence-studio.local/schemas/scene-spec.schema.json",
+  "title": "SceneSpec",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scene_id",
+    "order",
+    "purpose",
+    "narration_segment_ids",
+    "claim_ids",
+    "duration",
+    "visual_type",
+    "visual_brief",
+    "on_screen_text",
+    "citation_style",
+    "source_ids",
+    "asset_requests",
+    "transition",
+    "music_sfx_policy",
+    "synthetic_media_flag",
+    "accessibility_notes"
+  ],
+  "properties": {
+    "scene_id": {"type": "string", "format": "uuid"},
+    "order": {"type": "integer", "minimum": 1},
+    "purpose": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "narration_segment_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "format": "uuid"}
+    },
+    "claim_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "format": "uuid"}
+    },
+    "duration": {"type": "number", "minimum": 0.5, "maximum": 900},
+    "visual_type": {
+      "enum": [
+        "title_card",
+        "citation_card",
+        "text",
+        "diagram",
+        "timeline",
+        "chart",
+        "source_screenshot",
+        "licensed_media",
+        "comfyui_image",
+        "comfyui_video",
+        "waveform",
+        "branded_transition"
+      ]
+    },
+    "visual_brief": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "on_screen_text": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "maxLength": 500}
+    },
+    "citation_style": {"type": "string", "minLength": 1, "maxLength": 500},
+    "source_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "format": "uuid"}
+    },
+    "asset_requests": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["purpose", "media_type", "brief"],
+        "properties": {
+          "purpose": {"type": "string", "minLength": 1, "maxLength": 500},
+          "media_type": {"enum": ["owned", "licensed", "generated_image", "generated_video"]},
+          "brief": {"type": "string", "minLength": 1, "maxLength": 4000}
+        }
+      }
+    },
+    "transition": {"type": "string", "minLength": 1, "maxLength": 200},
+    "music_sfx_policy": {"type": "string", "minLength": 1, "maxLength": 1000},
+    "synthetic_media_flag": {"type": "boolean"},
+    "accessibility_notes": {"type": "string", "maxLength": 2000}
+  }
+}

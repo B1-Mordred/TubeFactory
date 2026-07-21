@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evidence-studio.local/contracts/voice-request.schema.json",
+  "title": "Provider-neutral Voice Request",
+  "type": "object",
+  "required": ["text", "language", "voice_profile_version_id", "engine", "delivery", "speed", "pronunciation", "output", "sampling", "consent"],
+  "properties": {
+    "text": {"type": "string", "minLength": 1, "maxLength": 20000},
+    "language": {"type": "string", "minLength": 2, "maxLength": 40},
+    "voice_profile_version_id": {"type": "string", "format": "uuid"},
+    "engine": {"type": "string", "minLength": 1},
+    "delivery": {"type": "object"},
+    "speed": {"type": "number", "minimum": 0.5, "maximum": 2},
+    "pronunciation": {"type": "object"},
+    "output": {"type": "object", "required": ["format", "sample_rate"], "properties": {"format": {"enum": ["wav", "flac"]}, "sample_rate": {"type": "integer", "minimum": 8000, "maximum": 192000}}, "additionalProperties": false},
+    "sampling": {"type": "object"},
+    "consent": {"type": "object", "required": ["basis"], "properties": {"basis": {"type": "string", "minLength": 1}}, "additionalProperties": true}
+  },
+  "additionalProperties": false
+}

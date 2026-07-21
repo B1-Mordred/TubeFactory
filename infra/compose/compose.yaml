@@ -1,0 +1,978 @@
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  caddy:
+    <<: *service-defaults
+    image: caddy:2.10.0-alpine
+    profiles: [core]
+    environment:
+      APP_SITE_ADDRESS: ${APP_SITE_ADDRESS:-http://localhost}
+    ports:
+      - target: 80
+        published: ${HTTP_PORT:-8090}
+        protocol: tcp
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+      - application
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:2019/config/]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  web:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+    profiles: [core]
+    environment:
+      NODE_ENV: production
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - application
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  api:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/api/Dockerfile
+    profiles: [core]
+    environment:
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      DATABASE_HOST: postgres
+      DATABASE_NAME: youtuber
+      DATABASE_USER: youtuber
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY_FILE: /run/secrets/minio_access_key
+      MINIO_SECRET_KEY_FILE: /run/secrets/minio_secret_key
+      MINIO_BUCKET: production-artifacts
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: editorial-production
+      TEMPORAL_PUBLISHING_TASK_QUEUE: youtube-publishing
+      PUBLICATION_ENCRYPTION_KEY_FILE: /run/secrets/publication_encryption_key
+      IDENTITY_ENCRYPTION_KEY_FILE: /run/secrets/identity_encryption_key
+      YOUTUBE_OAUTH_CLIENT_ID_FILE: /run/secrets/youtube_oauth_client_id
+      PUBLISHER_GATEWAY_ENDPOINT: http://publisher-worker:8084
+      PUBLISHER_GATEWAY_TOKEN_FILE: /run/secrets/publisher_gateway_token
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_SERVICE_NAME: youtuber-api
+      ALLOWED_HOSTS: '${ALLOWED_HOSTS:-["localhost","127.0.0.1"]}'
+    secrets:
+      - postgres_password
+      - jwt_secret
+      - minio_access_key
+      - minio_secret_key
+      - publication_encryption_key
+      - identity_encryption_key
+      - youtube_oauth_client_id
+      - publisher_gateway_token
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks:
+      - application
+      - data
+      - identity-egress
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  workflow-worker:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/workflow-worker/Dockerfile
+    profiles: [core]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: editorial-production
+      HEALTH_PORT: 8081
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks:
+      - application
+    depends_on:
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  editorial-worker:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/editorial-worker/Dockerfile
+    profiles: [core, gpu]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      EDITORIAL_TASK_QUEUE: editorial-production-v2
+      HEALTH_PORT: 8083
+      DATABASE_HOST: postgres
+      DATABASE_NAME: youtuber
+      DATABASE_USER: youtuber
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      PROVIDER_SECRET_DIRECTORY: /run/secrets/providers
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY_FILE: /run/secrets/minio_access_key
+      MINIO_SECRET_KEY_FILE: /run/secrets/minio_secret_key
+      MINIO_BUCKET: production-artifacts
+      RENDER_ENDPOINT: http://render-service:8091
+      COMFYUI_ENDPOINT: ${COMFYUI_ENDPOINT:-http://comfyui:8188}
+    extra_hosts:
+      - "ai.b1.germering=${AI_SERVER_IPV4:-192.168.2.100}"
+    secrets:
+      - postgres_password
+      - minio_access_key
+      - minio_secret_key
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks:
+      - application
+      - data
+      - provider-egress
+      - gpu
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      render-service:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  render-service:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/render-service/Dockerfile
+    profiles: [core]
+    environment:
+      RENDER_PORT: 8091
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+    networks:
+      - application
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8091/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  publisher-worker:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/publisher-worker/Dockerfile
+    profiles: [publishing]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      PUBLISHING_TASK_QUEUE: youtube-publishing
+      HEALTH_PORT: 8084
+      DATABASE_HOST: postgres
+      DATABASE_NAME: youtuber
+      DATABASE_USER: youtuber
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY_FILE: /run/secrets/minio_access_key
+      MINIO_SECRET_KEY_FILE: /run/secrets/minio_secret_key
+      MINIO_BUCKET: production-artifacts
+      PUBLICATION_ENCRYPTION_KEY_FILE: /run/secrets/publication_encryption_key
+      YOUTUBE_OAUTH_CLIENT_ID_FILE: /run/secrets/youtube_oauth_client_id
+      YOUTUBE_OAUTH_CLIENT_SECRET_FILE: /run/secrets/youtube_oauth_client_secret
+      PUBLISHER_GATEWAY_TOKEN_FILE: /run/secrets/publisher_gateway_token
+    secrets:
+      - postgres_password
+      - minio_access_key
+      - minio_secret_key
+      - publication_encryption_key
+      - youtube_oauth_client_id
+      - youtube_oauth_client_secret
+      - publisher_gateway_token
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    networks:
+      - application
+      - data
+      - publishing-egress
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8084/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  research-worker:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/research-worker/Dockerfile
+    profiles: [research]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      RESEARCH_TASK_QUEUE: editorial-research
+      HEALTH_PORT: 8082
+      DATABASE_HOST: postgres
+      DATABASE_NAME: youtuber
+      DATABASE_USER: youtuber
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY_FILE: /run/secrets/minio_access_key
+      MINIO_SECRET_KEY_FILE: /run/secrets/minio_secret_key
+      MINIO_BUCKET: production-artifacts
+      SEARXNG_ENDPOINT: http://searxng:8080
+      FIRECRAWL_ENDPOINT: http://firecrawl-api:3002
+      ACQUISITION_USER_AGENT: ${ACQUISITION_USER_AGENT:-EvidenceStudioResearch/0.1 (+self-hosted editorial research)}
+      ACQUISITION_MAX_BYTES: ${ACQUISITION_MAX_BYTES:-10000000}
+      ACQUISITION_MIN_DOMAIN_INTERVAL_SECONDS: ${ACQUISITION_MIN_DOMAIN_INTERVAL_SECONDS:-1.0}
+    secrets:
+      - postgres_password
+      - minio_access_key
+      - minio_secret_key
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks:
+      - application
+      - data
+      - research-egress
+      - firecrawl-client
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  searxng:
+    <<: *service-defaults
+    image: searxng/searxng:2025.8.1-3d96414
+    profiles: [research]
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ../searxng/settings.yml:/etc/searxng/settings.yml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /var/cache/searxng:size=128m,uid=977,gid=977
+    networks:
+      - research-egress
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  firecrawl-egress-proxy:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/egress-proxy/Dockerfile
+    profiles: [research]
+    environment:
+      PROXY_PORT: 3128
+      MAX_CONNECTIONS: 64
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    networks:
+      - firecrawl-backend
+      - research-egress
+    healthcheck:
+      test: [CMD, python, -c, "import socket; socket.create_connection(('127.0.0.1',3128),2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  firecrawl-dns:
+    <<: *service-defaults
+    image: coredns/coredns@sha256:5fe4ce2f40fba78ebd7941f205d5ba21058e6aebff00878325f3f2645d9d465c
+    profiles: [research]
+    command: [-conf, /etc/coredns/Corefile]
+    volumes:
+      - ../coredns/Corefile:/etc/coredns/Corefile:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    networks:
+      firecrawl-backend:
+        ipv4_address: 172.30.50.53
+      research-egress: {}
+    healthcheck:
+      test: [CMD, /coredns, -version]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  firecrawl-playwright:
+    <<: *service-defaults
+    image: ghcr.io/firecrawl/playwright-service@sha256:48ac2b8210d93dca44577406a52d92cced676750ce20d0f7cef444249f7e1804
+    profiles: [research]
+    user: "1000:1000"
+    command: [node, dist/api.js]
+    environment:
+      PORT: 3000
+      PROXY_SERVER: http://firecrawl-egress-proxy:3128
+      ALLOW_LOCAL_WEBHOOKS: "false"
+      BLOCK_MEDIA: "true"
+      MAX_CONCURRENT_PAGES: 4
+    dns: [172.30.50.53]
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /home/node:size=64m,uid=1000,gid=1000,mode=0700
+    networks:
+      - firecrawl-backend
+    depends_on:
+      firecrawl-egress-proxy:
+        condition: service_healthy
+      firecrawl-dns:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  firecrawl-api:
+    <<: *service-defaults
+    image: ghcr.io/firecrawl/firecrawl@sha256:ec9201a81f59d13f5d306af4188c84ac4741a4672a2290ffd7b961f0a3d3e219
+    profiles: [research]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        export POSTGRES_PASSWORD="$$(cat /run/secrets/firecrawl_postgres_password)"
+        export BULL_AUTH_KEY="$$(cat /run/secrets/firecrawl_bull_key)"
+        exec node dist/src/harness.js --start-docker
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3002
+      INTERNAL_PORT: 3002
+      EXTRACT_WORKER_PORT: 3004
+      WORKER_PORT: 3005
+      ENV: local
+      USE_DB_AUTHENTICATION: "false"
+      REDIS_URL: redis://firecrawl-redis:6379
+      REDIS_RATE_LIMIT_URL: redis://firecrawl-redis:6379
+      PLAYWRIGHT_MICROSERVICE_URL: http://firecrawl-playwright:3000/scrape
+      POSTGRES_USER: firecrawl
+      POSTGRES_DB: postgres
+      POSTGRES_HOST: firecrawl-postgres
+      POSTGRES_PORT: 5432
+      NUQ_RABBITMQ_URL: amqp://firecrawl-rabbitmq:5672
+      NUM_WORKERS_PER_QUEUE: 2
+      CRAWL_CONCURRENT_REQUESTS: 4
+      MAX_CONCURRENT_JOBS: 2
+      BROWSER_POOL_SIZE: 2
+      SEARXNG_ENDPOINT: http://searxng:8080
+      LOGGING_LEVEL: info
+    dns: [172.30.50.53]
+    secrets:
+      - firecrawl_postgres_password
+      - firecrawl_bull_key
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    networks:
+      - firecrawl-client
+      - firecrawl-backend
+    depends_on:
+      firecrawl-redis:
+        condition: service_healthy
+      firecrawl-rabbitmq:
+        condition: service_healthy
+      firecrawl-postgres:
+        condition: service_healthy
+      firecrawl-playwright:
+        condition: service_healthy
+      firecrawl-dns:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3002/v0/health/readiness').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 8s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 6G
+
+  firecrawl-redis:
+    <<: *service-defaults
+    image: redis@sha256:cd5f3ac681c77791c6a8eaa62de876ad2be043ee5a428afb7c0095aa08246277
+    profiles: [research]
+    command: [redis-server, --bind, 0.0.0.0, --save, "", --appendonly, "no"]
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /data:size=256m,mode=1777
+    networks:
+      - firecrawl-backend
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  firecrawl-rabbitmq:
+    <<: *service-defaults
+    image: rabbitmq@sha256:9cfb7e92ae7d296aec4d1ae799e431209f7ed57d55f9c929d95667d0ccf1c920
+    profiles: [research]
+    user: "999:999"
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs:
+      - /var/lib/rabbitmq:size=512m,mode=1777
+      - /var/log/rabbitmq:size=64m,mode=1777
+    networks:
+      - firecrawl-backend
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, check_running]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  firecrawl-postgres:
+    <<: *service-defaults
+    image: ghcr.io/firecrawl/nuq-postgres@sha256:4ca6718b2cef40404b046db5cd37ae45db3e44d1a5750c80522f3587a5b193d5
+    profiles: [research]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: firecrawl
+      POSTGRES_PASSWORD_FILE: /run/secrets/firecrawl_postgres_password
+    secrets:
+      - firecrawl_postgres_password
+    volumes:
+      - firecrawl_postgres_data:/var/lib/postgresql/data
+    networks:
+      - firecrawl-backend
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U firecrawl -d postgres]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+
+  temporal:
+    <<: *service-defaults
+    image: temporalio/auto-setup:1.27.2
+    profiles: [core]
+    environment:
+      BIND_ON_IP: 0.0.0.0
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: youtuber
+      POSTGRES_SEEDS: postgres
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        export POSTGRES_PWD="$$(cat /run/secrets/postgres_password)"
+        exec /etc/temporal/entrypoint.sh autosetup
+    secrets:
+      - postgres_password
+    volumes:
+      - ./temporal-dynamicconfig.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
+    networks:
+      - application
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, "tctl --address temporal:7233 cluster health 2>/dev/null | grep -q SERVING"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  temporal-ui:
+    <<: *service-defaults
+    image: temporalio/ui:2.39.0
+    profiles: [core]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8090
+    networks:
+      - application
+    depends_on:
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  prometheus:
+    <<: *service-defaults
+    image: prom/prometheus:v3.5.0
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    networks:
+      - application
+      - observability
+    healthcheck:
+      test: [CMD, /bin/prometheus, --version]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  otel-collector:
+    <<: *service-defaults
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    profiles: [observability]
+    command: [--config=/etc/otelcol-contrib/config.yaml]
+    volumes:
+      - ../observability/otel-collector.yml:/etc/otelcol-contrib/config.yaml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - application
+      - observability
+    healthcheck:
+      test: [CMD, /otelcol-contrib, --version]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  loki:
+    <<: *service-defaults
+    image: grafana/loki:3.5.1
+    profiles: [observability]
+    command: [-config.file=/etc/loki/local-config.yaml]
+    volumes:
+      - ../observability/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - observability
+    healthcheck:
+      test: [CMD, /usr/bin/loki, -version]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  promtail:
+    <<: *service-defaults
+    image: grafana/promtail:3.5.1
+    profiles: [observability]
+    command: [-config.file=/etc/promtail/config.yml]
+    volumes:
+      - ../observability/promtail.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - promtail_positions:/tmp
+    read_only: true
+    networks:
+      - observability
+    depends_on:
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, /usr/bin/promtail, -version]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  grafana:
+    <<: *service-defaults
+    image: grafana/grafana:12.0.2
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:8090/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../observability/grafana-provisioning:/etc/grafana/provisioning:ro
+      - ../observability/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - application
+      - observability
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, wget -q -O /dev/null http://127.0.0.1:3000/api/health]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  backup-tool:
+    <<: *service-defaults
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    profiles: [operations]
+    restart: "no"
+    entrypoint: [/bin/sh]
+    command: [-c, "exit 0"]
+    secrets:
+      - minio_access_key
+      - minio_secret_key
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  postgres:
+    <<: *service-defaults
+    image: pgvector/pgvector:0.8.0-pg16
+    profiles: [core]
+    environment:
+      POSTGRES_DB: youtuber
+      POSTGRES_USER: youtuber
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --data-checksums
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U youtuber -d youtuber"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  minio:
+    <<: *service-defaults
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    profiles: [core]
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_secret_key
+    secrets:
+      - minio_access_key
+      - minio_secret_key
+    volumes:
+      - minio_data:/data
+    networks:
+      - data
+    healthcheck:
+      test: [CMD, mc, ready, local]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+networks:
+  edge:
+    name: youtuber-edge
+  application:
+    name: youtuber-application
+    internal: true
+  data:
+    name: youtuber-data
+    internal: true
+  research-egress:
+    name: youtuber-research-egress
+  provider-egress:
+    name: youtuber-provider-egress
+  publishing-egress:
+    name: youtuber-publishing-egress
+  identity-egress:
+    name: youtuber-identity-egress
+  firecrawl-client:
+    name: youtuber-firecrawl-client
+    internal: true
+  firecrawl-backend:
+    name: youtuber-firecrawl-backend
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24
+  gpu:
+    name: youtuber-gpu
+    internal: true
+  observability:
+    name: youtuber-observability
+    internal: true
+
+volumes:
+  postgres_data:
+  minio_data:
+  caddy_data:
+  caddy_config:
+  firecrawl_postgres_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  promtail_positions:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.dev
+  jwt_secret:
+    file: ./secrets/jwt_secret.dev
+  minio_access_key:
+    file: ./secrets/minio_access_key.dev
+  minio_secret_key:
+    file: ./secrets/minio_secret_key.dev
+  firecrawl_postgres_password:
+    file: ./secrets/firecrawl_postgres_password.dev
+  firecrawl_bull_key:
+    file: ./secrets/firecrawl_bull_key.dev
+  publication_encryption_key:
+    file: ./secrets/publication_encryption_key.dev
+  identity_encryption_key:
+    file: ./secrets/identity_encryption_key.dev
+  youtube_oauth_client_id:
+    file: ./secrets/youtube_oauth_client_id.dev
+  youtube_oauth_client_secret:
+    file: ./secrets/youtube_oauth_client_secret.dev
+  publisher_gateway_token:
+    file: ./secrets/publisher_gateway_token.dev
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password.dev

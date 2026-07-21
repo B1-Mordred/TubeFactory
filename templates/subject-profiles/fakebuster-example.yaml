@@ -1,0 +1,39 @@
+schema_version: "1.0"
+kind: SubjectProfile
+metadata:
+  name: FakeBuster example claims monitor
+spec:
+  enabled: false
+  channel_slug: fakebuster
+  topic: Public claims with significant reach and checkable factual foundations
+  research_goal: Establish what reliable primary and independent evidence supports or contradicts the claim.
+  excluded_angles: [partisan horse-race framing, personal harassment]
+  seed_queries: [viral claim evidence, fact check primary source]
+  related_concepts: [misinformation, source criticism, media literacy]
+  negative_keywords: [merchandise, reaction]
+  languages: [de, en]
+  regions: [DE, EU]
+  domain_policy: {allow: [], block: []}
+  source_requirements:
+    minimum_independent: 2
+    minimum_primary: 1
+    expected_primary_types: [official record, original study, primary dataset]
+  schedule: {cron: "0 */6 * * *", timezone: UTC}
+  freshness_policy: {lookback_days: 14, maximum_source_age_days: 3650}
+  format_policy: {target: standard, duration_seconds: 600}
+  editorial_profile: {tone: calm, content_warnings: true}
+  risk: high
+  budget: {tokens: 100000, gpu_seconds: 1800, currency_minor: 0}
+  opportunity_weights:
+    audience_fit: 1.0
+    evidence_potential: 1.5
+    novelty: 0.8
+    timeliness: 1.0
+    educational_value: 1.4
+    visual_explainability: 0.7
+    channel_differentiation: 0.8
+  approval_profile:
+    opportunity: reviewer
+    dossier: reviewer
+    script: reviewer
+    publication: reviewer

@@ -1,0 +1,2 @@
+include:
+  - path: infra/compose/compose.yaml
