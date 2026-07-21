@@ -113,8 +113,8 @@ async function api<T>(path: string, options: RequestInit = {}, csrf = ""): Promi
   return response.json() as Promise<T>;
 }
 
-function UsageTip({ text }: { text: string }) {
-  return <button type="button" className="usage-tip" data-usage={text} aria-label={`Usage help: ${text}`}>?</button>;
+function UsageTip({ text, onClick }: { text: string; onClick: () => void }) {
+  return <button type="button" className="usage-tip help-launcher" data-usage={text} aria-label={`Open task help. ${text}`} aria-haspopup="dialog" aria-controls="task-help-panel" onClick={onClick}>Help</button>;
 }
 
 const fieldUsageHints: Array<[string, string]> = [
@@ -202,6 +202,235 @@ function useContextualUsageHints(renderKey: string) {
     observer.observe(root, { childList: true, subtree: true });
     return () => { observer.disconnect(); window.cancelAnimationFrame(frame); };
   }, [renderKey]);
+}
+
+type HelpTask = {
+  id: string;
+  title: string;
+  summary: string;
+  category: string;
+  page: string;
+  roles?: Role[];
+  keywords: string[];
+  steps: string[];
+};
+
+const helpTasks: HelpTask[] = [
+  {
+    id: "create-channel-subject",
+    title: "Create a channel and its first subject",
+    summary: "Define the channel identity, audience and a scheduled research subject.",
+    category: "Channels & subjects",
+    page: "profiles",
+    keywords: ["setup", "onboarding", "channel", "subject", "schedule", "cron", "audience", "brand"],
+    steps: [
+      "Open Channels & subjects and create the channel profile with its language, audience and editorial rules.",
+      "Select the new channel from Channel workspace so later work is scoped correctly.",
+      "Create a subject with a specific topic, research goal and seed queries.",
+      "Review the generated search plan, including falsification queries and regional settings.",
+      "Enable the subject, then add or resume its schedule only after the search plan is correct.",
+    ],
+  },
+  {
+    id: "discover-shortlist",
+    title: "Discover and shortlist a video opportunity",
+    summary: "Run discovery, compare evidence potential and record an editorial decision.",
+    category: "Research & evidence",
+    page: "research",
+    keywords: ["idea", "discovery", "opportunity", "shortlist", "defer", "reject", "research"],
+    steps: [
+      "Choose the intended channel and enabled subject before starting discovery.",
+      "Run live discovery and follow its durable progress in Workflow activity.",
+      "Review each opportunity's sources, novelty, timeliness, audience fit and estimated cost.",
+      "Explain why the video deserves to exist and enter a concrete decision reason.",
+      "Shortlist, defer or reject the opportunity; the decision and reason are retained in audit history.",
+    ],
+  },
+  {
+    id: "approve-dossier",
+    title: "Review and approve a research dossier",
+    summary: "Verify claims against immutable source snapshots before editorial work begins.",
+    category: "Research & evidence",
+    page: "research",
+    keywords: ["dossier", "claim", "source", "evidence", "approve", "contradiction", "snapshot"],
+    steps: [
+      "Open a shortlisted opportunity and start or refresh its research dossier.",
+      "Inspect every central claim, exact evidence passage and immutable source snapshot.",
+      "Confirm that supporting sources are independent and review contradictory or limiting evidence.",
+      "Resolve blockers, unsafe overstatements and unanswered questions rather than hiding them.",
+      "Approve the exact dossier version only when its completion rules are met; otherwise reject it with a specific reason.",
+    ],
+  },
+  {
+    id: "script-storyboard",
+    title: "Turn approved research into a script and storyboard",
+    summary: "Generate cited narration, verify coverage and plan evidence-linked scenes.",
+    category: "Scripts & storyboards",
+    page: "editorial",
+    keywords: ["script", "storyboard", "scene", "narration", "citation", "coverage", "lock"],
+    steps: [
+      "Select an approved dossier and generate a script draft.",
+      "Review each segment's claim links, exact evidence and citation display.",
+      "Fix verification issues and confirm that every factual statement has adequate coverage.",
+      "Lock accepted script segments so later regeneration cannot silently replace them.",
+      "Generate the storyboard, review each scene's purpose and source links, then lock accepted scenes.",
+    ],
+  },
+  {
+    id: "produce-review-media",
+    title: "Produce and approve final media",
+    summary: "Render from a locked storyboard, inspect quality findings and approve an exact output.",
+    category: "Media & final review",
+    page: "media",
+    keywords: ["media", "render", "video", "voice", "narration", "quality", "qa", "caption", "approve"],
+    steps: [
+      "Choose the approved storyboard version, render tier, voice profile and active workflow registry entry.",
+      "Start media production and monitor the durable workflow rather than submitting it again.",
+      "Review the rendered video, narration auditions, captions, timing and source manifest.",
+      "Inspect every quality finding; regenerate a bounded scene or narration segment when appropriate.",
+      "Approve the exact render and manifest hashes only after all blocking findings are resolved.",
+    ],
+  },
+  {
+    id: "publish-video",
+    title: "Upload and release a video safely",
+    summary: "Prepare immutable metadata, upload privately and approve public release separately.",
+    category: "Publishing & calendar",
+    page: "publishing",
+    keywords: ["youtube", "publish", "upload", "release", "metadata", "schedule", "private", "public"],
+    steps: [
+      "Confirm the intended channel workspace and its enabled YouTube connection.",
+      "Select an approved render and create a versioned metadata record for title, description, chapters and disclosures.",
+      "Review the render and metadata hashes before starting an upload.",
+      "Upload in dry-run or private mode first and wait for processing, captions and thumbnail checks to finish.",
+      "Use the separate release approval only after reviewing the exact uploaded asset, metadata version and schedule.",
+    ],
+  },
+  {
+    id: "recover-workflow",
+    title: "Investigate or recover a failed workflow",
+    summary: "Find the durable operation, diagnose its last state and retry without losing lineage.",
+    category: "Workflow activity",
+    page: "workflows",
+    roles: ["admin", "operator"],
+    keywords: ["failure", "failed", "retry", "stuck", "workflow", "recover", "error", "status"],
+    steps: [
+      "Open Workflow activity and filter to Needs attention in the correct channel.",
+      "Find the workflow by task type, subject, channel or workflow ID.",
+      "Open its stage and read the latest recorded failure instead of starting duplicate work.",
+      "Correct the reported dependency, policy or input problem at that stage.",
+      "Retry from the provided action; verify that the new workflow preserves its parent and correlation lineage.",
+    ],
+  },
+  {
+    id: "configure-model",
+    title: "Configure a model for a task",
+    summary: "Register a provider, version its prompt and activate a reviewed assignment.",
+    category: "Providers & prompts",
+    page: "providers",
+    roles: ["admin"],
+    keywords: ["ai", "model", "provider", "prompt", "assignment", "fallback", "budget", "secret"],
+    steps: [
+      "Register the provider endpoint and secret, then confirm its health before enabling it.",
+      "Register the model with accurate context, output, capability and data-policy limits.",
+      "Create or review the versioned prompt template and its input and response schemas.",
+      "Create a task assignment with a primary model, ordered fallbacks and explicit budget policy.",
+      "Activate the reviewed assignment version and confirm its audit entry before using it in production work.",
+    ],
+  },
+  {
+    id: "manage-user-access",
+    title: "Create or change a user's access",
+    summary: "Provision a local account and apply the least-privileged role needed for its work.",
+    category: "Users",
+    page: "users",
+    roles: ["admin"],
+    keywords: ["user", "account", "role", "permission", "password", "disable", "access"],
+    steps: [
+      "Open Users and confirm that an existing account does not already represent the person.",
+      "Create the local username, display name and an initial password of at least eight characters.",
+      "Assign the least-privileged role that covers the person's actual responsibilities.",
+      "Ask the user to sign in and replace the initial password from Authentication.",
+      "Disable the account promptly when access is no longer required; retain its audit history.",
+    ],
+  },
+  {
+    id: "secure-account",
+    title: "Change your password or enable MFA",
+    summary: "Strengthen a local account and store recovery codes safely.",
+    category: "Authentication",
+    page: "identity",
+    keywords: ["security", "password", "mfa", "totp", "authenticator", "recovery", "code"],
+    steps: [
+      "Open Authentication and confirm whether the account is local or managed by an identity provider.",
+      "For a local account, enter the current password and choose a new password with at least eight characters.",
+      "To enable MFA, scan the setup code with an authenticator and confirm a current one-time code.",
+      "Store the generated recovery codes in a secure location separate from this device.",
+      "Test the new sign-in method before ending the current session.",
+    ],
+  },
+  {
+    id: "record-correction",
+    title: "Record a source change or correction",
+    summary: "Capture changed evidence and trace its effect on scripts and publications.",
+    category: "Analytics & operations",
+    page: "operations",
+    roles: ["admin"],
+    keywords: ["correction", "retraction", "source", "impact", "publication", "evidence", "change"],
+    steps: [
+      "Open Analytics & operations and identify the changed source, script or publication.",
+      "Choose the change kind and severity based on the evidence, not the desired outcome.",
+      "Describe what changed and include enough detail for another reviewer to reproduce the finding.",
+      "Record the correction case to generate its deterministic impact map.",
+      "Review every affected claim, timecode and publication, then complete the required release action.",
+    ],
+  },
+];
+
+function HelpPanel({ open, onClose, currentPage, role, onOpenPage }: { open: boolean; onClose: () => void; currentPage: string; role: Role; onOpenPage: (page: string) => void }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (open && !dialog.open) {
+      dialog.showModal();
+      window.requestAnimationFrame(() => searchRef.current?.focus());
+    } else if (!open && dialog.open) dialog.close();
+    if (!open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [open]);
+  const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  const results = helpTasks
+    .filter(task => !task.roles || task.roles.includes(role))
+    .filter(task => {
+      if (!words.length) return true;
+      const searchable = [task.title, task.summary, task.category, ...task.keywords, ...task.steps].join(" ").toLowerCase();
+      return words.every(word => searchable.includes(word));
+    })
+    .sort((left, right) => Number(right.page === currentPage) - Number(left.page === currentPage) || left.title.localeCompare(right.title));
+  const openTaskPage = (task: HelpTask) => { onOpenPage(task.page); onClose(); };
+  return <dialog ref={dialogRef} id="task-help-panel" className="help-panel" aria-labelledby="task-help-title" onCancel={event => { event.preventDefault(); onClose(); }} onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="help-panel-shell">
+      <header className="help-panel-header"><div><p className="eyebrow">Task-based guidance</p><h2 id="task-help-title">How can we help?</h2><p>Search for a goal, then follow the procedure in order.</p></div><button type="button" className="help-close" data-usage="Close task help" aria-label="Close task help" onClick={onClose}>×</button></header>
+      <label className="help-search" data-usage="Search task procedures"><span>Search procedures</span><input ref={searchRef} type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Try “publish”, “failed workflow” or “password”" aria-description="Search task titles, summaries, keywords and individual steps." /></label>
+      <div className="help-result-summary" role="status" aria-live="polite"><strong>{results.length}</strong> {results.length === 1 ? "procedure" : "procedures"}{query.trim() ? ` matching “${query.trim()}”` : " available for your role"}</div>
+      <div className="help-task-list">
+        {results.map(task => <details className="help-task" key={task.id}>
+          <summary><span><small>{task.category}{task.page === currentPage ? " · Current stage" : ""}</small><strong>{task.title}</strong><em>{task.summary}</em></span></summary>
+          <div className="help-task-body"><ol>{task.steps.map((step, stepIndex) => <li key={`${task.id}-${stepIndex}`}>{step}</li>)}</ol><button type="button" className="secondary compact" data-usage={`Open ${task.category}`} onClick={() => openTaskPage(task)}>Open {task.category}</button></div>
+        </details>)}
+        {!results.length && <div className="help-empty"><strong>No matching procedure</strong><p>Try a broader task word such as “research”, “publish”, “user” or “workflow”.</p><button type="button" className="secondary compact" data-usage="Clear help search" onClick={() => { setQuery(""); searchRef.current?.focus(); }}>Clear search</button></div>}
+      </div>
+    </div>
+  </dialog>;
 }
 
 function randomUuid(): string {
@@ -1370,7 +1599,7 @@ function WorkflowPanel({ csrf, activeChannelId, onOpenPage }: { csrf: string; ac
 
 export default function Home() {
   const [loading, setLoading] = useState(true); const [bootstrap, setBootstrap] = useState(false); const [session, setSession] = useState<Session | null>(null); const [capabilities, setCapabilities] = useState<Capabilities | null>(null); const [page, setPage] = useState("dashboard");
-  const [channels, setChannels] = useState<ChannelProfile[]>([]); const [activeChannelId, setActiveChannelId] = useState("");
+  const [channels, setChannels] = useState<ChannelProfile[]>([]); const [activeChannelId, setActiveChannelId] = useState(""); const [helpOpen, setHelpOpen] = useState(false);
   useContextualUsageHints(`${page}:${loading}:${session?.user.id || "anonymous"}`);
   useEffect(() => { Promise.all([api<{ required: boolean }>("/api/v1/auth/bootstrap-status"), api<Session>("/api/v1/auth/session").catch(() => null)]).then(([status, current]) => { setBootstrap(status.required); setSession(current); }).finally(() => setLoading(false)); }, []);
   useEffect(() => { if (session) Promise.all([api<Capabilities>("/api/v1/system/capabilities"), api<ChannelProfile[]>("/api/v1/channel-profiles")]).then(([nextCapabilities, nextChannels]) => { setCapabilities(nextCapabilities); setChannels(nextChannels); const stored = window.localStorage.getItem("tubefactory.channel") || window.localStorage.getItem("evidence-studio.channel") || ""; if (stored) window.localStorage.setItem("tubefactory.channel", stored); setActiveChannelId(nextChannels.some(item => item.id === stored) ? stored : ""); }); }, [session]);
@@ -1403,5 +1632,5 @@ export default function Home() {
   const activeChannel = channels.find(item => item.id === activeChannelId) || null;
   function chooseChannel(value: string) { setActiveChannelId(value); window.localStorage.setItem("tubefactory.channel", value); }
   function choosePage(value: string) { if (!PAGE_IDS.has(value)) return; setPage(value); const url = new URL(window.location.href); if (value === "dashboard") url.searchParams.delete("page"); else url.searchParams.set("page", value); window.history.pushState(null, "", url); }
-  return <div className="app-shell"><aside><div className="brand"><div className="brand-mark">TF</div><div><strong>TubeFactory</strong><small>Editorial control plane</small></div><UsageTip text="Choose a channel first, then open a stage. Hover or focus any navigation item for a one-sentence guide." /></div><label className="channel-switcher">Channel workspace<select aria-label="Channel workspace" value={activeChannelId} onChange={event => chooseChannel(event.target.value)}><option value="">All channels</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select><small>{activeChannel ? `${activeChannel.enabled ? "Enabled" : "Disabled"} · ${activeChannel.languages.join(", ")}` : `${channels.length} channels in portfolio`}</small></label><nav aria-label="Main navigation">{navGroups.map(group => { const visible = group.items.filter(item => !item.roles || item.roles.includes(session.user.role)); return visible.length ? <div className="nav-group" key={group.label}><span>{group.label}</span>{visible.map(item => <button key={item.id} className={page === item.id ? "active nav-help" : "nav-help"} data-usage={item.help} aria-label={item.label + ". " + item.help} onClick={() => choosePage(item.id)}>{item.label}</button>)}</div> : null; })}</nav><div className="profile"><span className="avatar">{session.user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.display_name}</strong><small>{session.user.role}</small></span><button className="sign-out" onClick={async () => { await api("/api/v1/auth/logout", { method: "POST" }, session.csrf_token); setSession(null); }}>Sign out</button></div></aside><main className="workspace"><div className="scope-bar"><div><span className="eyebrow">Current workspace</span><strong>{activeChannel?.name || "All channels"}</strong></div><span>{activeChannel ? "Every channel-aware queue is filtered to this channel." : "Portfolio view across every channel."}</span></div>{page === "dashboard" && <Dashboard capabilities={capabilities} activeChannelId={activeChannelId} />}{page === "profiles" && <ProfilesPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "research" && <ResearchPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "editorial" && <EditorialPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "media" && <MediaPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "publishing" && <PublishingPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "operations" && <OperationsPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "identity" && <IdentityPanel session={session} onSession={setSession} />}{page === "providers" && <ProviderPanel csrf={session.csrf_token} />}{page === "workflows" && <WorkflowPanel csrf={session.csrf_token} activeChannelId={activeChannelId} onOpenPage={choosePage} />}{page === "configuration" && <ConfigPanel csrf={session.csrf_token} />}{page === "users" && <UsersPanel csrf={session.csrf_token} />}{page === "audit" && <AuditPanel />}</main></div>;
+  return <><div className="app-shell"><aside><div className="brand"><div className="brand-mark">TF</div><div><strong>TubeFactory</strong><small>Editorial control plane</small></div><UsageTip text="Search longer procedures by task, or hover and focus controls for concise guidance." onClick={() => setHelpOpen(true)} /></div><label className="channel-switcher">Channel workspace<select aria-label="Channel workspace" value={activeChannelId} onChange={event => chooseChannel(event.target.value)}><option value="">All channels</option>{channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select><small>{activeChannel ? `${activeChannel.enabled ? "Enabled" : "Disabled"} · ${activeChannel.languages.join(", ")}` : `${channels.length} channels in portfolio`}</small></label><nav aria-label="Main navigation">{navGroups.map(group => { const visible = group.items.filter(item => !item.roles || item.roles.includes(session.user.role)); return visible.length ? <div className="nav-group" key={group.label}><span>{group.label}</span>{visible.map(item => <button key={item.id} className={page === item.id ? "active nav-help" : "nav-help"} data-usage={item.help} aria-label={item.label + ". " + item.help} onClick={() => choosePage(item.id)}>{item.label}</button>)}</div> : null; })}</nav><div className="profile"><span className="avatar">{session.user.display_name.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.display_name}</strong><small>{session.user.role}</small></span><button className="sign-out" onClick={async () => { await api("/api/v1/auth/logout", { method: "POST" }, session.csrf_token); setSession(null); }}>Sign out</button></div></aside><main className="workspace"><div className="scope-bar"><div><span className="eyebrow">Current workspace</span><strong>{activeChannel?.name || "All channels"}</strong></div><span>{activeChannel ? "Every channel-aware queue is filtered to this channel." : "Portfolio view across every channel."}</span></div>{page === "dashboard" && <Dashboard capabilities={capabilities} activeChannelId={activeChannelId} />}{page === "profiles" && <ProfilesPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "research" && <ResearchPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "editorial" && <EditorialPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "media" && <MediaPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "publishing" && <PublishingPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "operations" && <OperationsPanel csrf={session.csrf_token} role={session.user.role} activeChannelId={activeChannelId} />}{page === "identity" && <IdentityPanel session={session} onSession={setSession} />}{page === "providers" && <ProviderPanel csrf={session.csrf_token} />}{page === "workflows" && <WorkflowPanel csrf={session.csrf_token} activeChannelId={activeChannelId} onOpenPage={choosePage} />}{page === "configuration" && <ConfigPanel csrf={session.csrf_token} />}{page === "users" && <UsersPanel csrf={session.csrf_token} />}{page === "audit" && <AuditPanel />}</main></div><HelpPanel open={helpOpen} onClose={() => setHelpOpen(false)} currentPage={page} role={session.user.role} onOpenPage={choosePage} /></>;
 }
