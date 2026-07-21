@@ -60,7 +60,7 @@ type SubjectProfile = {
 };
 type SubjectSchedule = { schedule_id: string; exists: boolean; paused: boolean; cron: string | null; timezone: string; action_count: number; next_action_times: string[] };
 type SearchPlan = { subject_topic: string; strategies: { purpose: string; query: string; language: string; region: string | null }[]; falsification_queries: string[] };
-type Opportunity = { id: string; version: number; subject_profile_id: string; title: string; summary: string; editorial_rationale: string; policy_snapshot: { mode?: string; required_human_gates?: string[]; [key: string]: unknown }; decision: string; score: number | null; score_components: Record<string, number>; score_penalties: Record<string, number>; score_reasoning: string[]; grouping_reason: string[]; source_count: number; snapshot_count: number; research_state: string | null; created_at: string };
+type Opportunity = { id: string; version: number; subject_profile_id: string; title: string; summary: string; editorial_rationale: string; estimated_cost: Record<string, unknown>; policy_snapshot: { mode?: string; required_human_gates?: string[]; [key: string]: unknown }; decision: string; score: number | null; score_components: Record<string, number>; score_penalties: Record<string, number>; score_reasoning: string[]; grouping_reason: string[]; source_count: number; snapshot_count: number; research_state: string | null; created_at: string };
 type Dossier = { id: string; opportunity_id: string; dossier_version: number; version: number; status: string; executive_summary: string; completion_evaluation: { complete?: boolean; blockers?: string[]; [key: string]: unknown }; created_at: string };
 type DossierDetail = Dossier & { safe_conclusions: string[]; prohibited_overstatements: string[]; unresolved_questions: string[]; claims: { id: string; normalized_statement: string; claim_type: string; confidence: number; status: string; risk: string; central: boolean; version: number; evidence: { relationship: string; exact_text: string; source_independent: boolean; direct_evidence: boolean; primary_source: boolean; source: { title: string; canonical_url: string; publisher: string | null }; snapshot: { content_hash: string; retrieved_at: string } }[] }[] };
 type SourceBrowserItem = { id: string; canonical_url: string; title: string; author: string | null; publisher: string | null; source_type: string; publication_at: string | null; event_at: string | null; domain: string; snapshots: { id: string; snapshot_number: number; content_hash: string; mime_type: string; byte_size: number; retrieved_at: string; extraction_metadata: Record<string, unknown>; injection_markers: string[]; semantic_chunk_count: number }[]; relationships: { id: string; source_document_id: string; related_source_document_id: string; relationship: string; reason: string; confidence: number }[] };
@@ -242,9 +242,10 @@ const helpTasks: HelpTask[] = [
     steps: [
       "Choose the intended channel and enabled subject before starting discovery.",
       "Run live discovery and follow its durable progress in Workflow activity.",
-      "Review each opportunity's sources, novelty, timeliness, audience fit and estimated cost.",
-      "Explain why the video deserves to exist and enter a concrete decision reason.",
-      "Shortlist, defer or reject the opportunity; the decision and reason are retained in audit history.",
+      "Select Review finding on an opportunity to open its complete, non-mutating review view.",
+      "Inspect the original sources, score breakdown, grouping reasons, policy gates and estimated cost.",
+      "Explain why the video deserves to exist and enter a concrete decision reason in the review view.",
+      "Shortlist, defer or reject only after review; the decision and reason are retained in audit history.",
     ],
   },
   {
@@ -457,6 +458,120 @@ function safeExternalUrl(value: string): string | null {
 function ExternalSourceLink({ url, title }: { url: string; title: string }) {
   const safeUrl = safeExternalUrl(url);
   return safeUrl ? <a href={safeUrl} target="_blank" rel="noopener noreferrer">{title}</a> : <span>{title}</span>;
+}
+
+function readableDetailName(value: string): string {
+  return value.replaceAll("_", " ").replace(/\b\w/g, letter => letter.toUpperCase());
+}
+
+function readableDetailValue(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "Not recorded";
+  if (Array.isArray(value)) return value.length ? value.map(readableDetailValue).join(", ") : "None";
+  if (typeof value === "object") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return String(value);
+}
+
+function DetailRecord({ values, empty = "Nothing recorded" }: { values: Record<string, unknown>; empty?: string }) {
+  const entries = Object.entries(values);
+  if (!entries.length) return <p className="muted">{empty}</p>;
+  return <dl className="finding-record">{entries.map(([name, value]) => <div key={name}><dt>{readableDetailName(name)}</dt><dd>{readableDetailValue(value)}</dd></div>)}</dl>;
+}
+
+function OpportunityReviewDialog({
+  opportunity, role, decisionReason, rationale, onDecisionReasonChange, onRationaleChange, onClose, onDecision, onAcquire, onBuildDossier,
+}: {
+  opportunity: Opportunity;
+  role: Role;
+  decisionReason: string;
+  rationale: string;
+  onDecisionReasonChange: (value: string) => void;
+  onRationaleChange: (value: string) => void;
+  onClose: () => void;
+  onDecision: (item: Opportunity, decision: "approved" | "rejected" | "deferred") => void;
+  onAcquire: (item: Opportunity) => void;
+  onBuildDossier: (item: Opportunity) => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [sources, setSources] = useState<SourceBrowserItem[]>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(true);
+  const [sourceMessage, setSourceMessage] = useState("");
+  const [preview, setPreview] = useState<SourcePreview | null>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog.showModal();
+    return () => { if (dialog.open) dialog.close(); previouslyFocused?.focus(); };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSourcesLoading(true);
+    setSourceMessage("");
+    api<SourceBrowserItem[]>(`/api/v1/research/sources?opportunity_id=${encodeURIComponent(opportunity.id)}`)
+      .then(next => { if (!cancelled) setSources(next); })
+      .catch(caught => { if (!cancelled) setSourceMessage(caught instanceof Error ? caught.message : "Sources could not be loaded"); })
+      .finally(() => { if (!cancelled) setSourcesLoading(false); });
+    return () => { cancelled = true; };
+  }, [opportunity.id]);
+
+  async function showPreview(sourceId: string) {
+    setSourceMessage("");
+    try { setPreview(await api<SourcePreview>(`/api/v1/research/sources/${sourceId}/preview`)); }
+    catch (caught) { setSourceMessage(caught instanceof Error ? caught.message : "Source preview failed"); }
+  }
+
+  const canReview = (role === "admin" || role === "reviewer") && (opportunity.decision === "pending" || opportunity.decision === "deferred");
+  const canOperate = role === "admin" || role === "operator";
+  const effectiveRationale = opportunity.editorial_rationale || rationale;
+  const decisionDisabled = decisionReason.trim().length < 3;
+  const shortlistDisabled = decisionDisabled || effectiveRationale.trim().length < 20;
+
+  return <dialog
+    ref={dialogRef}
+    id="opportunity-review-dialog"
+    className="finding-dialog"
+    aria-labelledby="opportunity-review-title"
+    onCancel={event => { event.preventDefault(); onClose(); }}
+    onClick={event => { if (event.target === dialogRef.current) onClose(); }}
+  >
+    <div className="finding-dialog-shell">
+      <header className="finding-dialog-header">
+        <div><p className="eyebrow">Full finding review</p><h2 id="opportunity-review-title">{opportunity.title}</h2><div className="finding-header-meta"><span className={`status ${opportunity.decision === "approved" ? "good" : opportunity.decision === "rejected" ? "bad" : "waiting"}`}>{opportunity.decision}</span><span>Created {new Date(opportunity.created_at).toLocaleString()}</span><code>{opportunity.id}</code></div></div>
+        <button type="button" className="help-close" aria-label="Close finding review" onClick={onClose}>×</button>
+      </header>
+      <div className="finding-dialog-content">
+        <main className="finding-detail-main">
+          <section className="finding-section"><p className="eyebrow">Finding</p><h3>Complete summary</h3><p className="finding-summary">{opportunity.summary}</p><h3>Why this video deserves to exist</h3><p>{opportunity.editorial_rationale || "No editorial rationale has been recorded yet."}</p></section>
+
+          <section className="finding-section">
+            <div className="panel-title"><div><p className="eyebrow">Original material</p><h3>Sources</h3></div><span className="chip">{sources.length || opportunity.source_count}</span></div>
+            {sourceMessage && <div className="notice error">{sourceMessage}</div>}
+            {sourcesLoading && <p className="muted">Loading source records…</p>}
+            {!sourcesLoading && !sources.length && <p className="empty">No source records are attached to this finding.</p>}
+            <div className="finding-source-list">{sources.map(source => <article className="finding-source" key={source.id}><div><ExternalSourceLink url={source.canonical_url} title={source.title} /><small>{source.publisher || source.domain} · {readableDetailName(source.source_type)}{source.publication_at ? ` · ${new Date(source.publication_at).toLocaleDateString()}` : ""}</small><small>{source.author ? `By ${source.author} · ` : ""}{source.snapshots.length} immutable snapshot{source.snapshots.length === 1 ? "" : "s"}</small></div><div className="actions"><ExternalSourceLink url={source.canonical_url} title="Open original ↗" /><button type="button" className="secondary compact" disabled={!source.snapshots.length} title={source.snapshots.length ? "Read the normalized immutable snapshot" : "A text preview becomes available after source acquisition"} onClick={() => showPreview(source.id)}>Preview text</button></div></article>)}</div>
+            {!sourcesLoading && sources.length > 0 && sources.every(source => !source.snapshots.length) && <div className="notice">Full article text has not been acquired yet. Open the original source to review it now; an immutable text preview becomes available after the opportunity is shortlisted and its sources are acquired.</div>}
+            {preview && <div className="finding-preview"><div className="panel-title"><strong>Untrusted normalized source text{preview.truncated ? " · truncated" : ""}</strong><button type="button" className="secondary compact" onClick={() => setPreview(null)}>Close preview</button></div><pre>{preview.text}</pre><small>SHA-256 {preview.content_hash}</small></div>}
+          </section>
+
+          <section className="finding-section"><p className="eyebrow">Discovery trace</p><h3>Grouping and classification reasons</h3>{opportunity.grouping_reason.length ? <ul className="finding-reason-list">{opportunity.grouping_reason.map((reason, index) => <li key={`${reason}-${index}`}>{reason}</li>)}</ul> : <p className="muted">No grouping reasons were recorded.</p>}</section>
+
+          <section className="finding-section"><p className="eyebrow">Scoring trace</p><h3>Why this finding received {opportunity.score ?? "no score"}</h3><div className="finding-score-grid"><div><h4>Components</h4><DetailRecord values={opportunity.score_components} /></div><div><h4>Penalties</h4><DetailRecord values={opportunity.score_penalties} empty="No penalties applied" /></div></div>{opportunity.score_reasoning.length ? <ul className="finding-reason-list">{opportunity.score_reasoning.map((reason, index) => <li key={`${reason}-${index}`}>{reason}</li>)}</ul> : <p className="muted">No score narrative was recorded.</p>}</section>
+        </main>
+
+        <div className="finding-detail-aside">
+          <section className="finding-section"><p className="eyebrow">Workflow state</p><DetailRecord values={{ decision: opportunity.decision, research_state: opportunity.research_state, sources: opportunity.source_count, immutable_snapshots: opportunity.snapshot_count, record_version: opportunity.version }} /></section>
+          <section className="finding-section"><p className="eyebrow">Policy snapshot</p><DetailRecord values={opportunity.policy_snapshot} /></section>
+          <section className="finding-section"><p className="eyebrow">Estimated cost</p><DetailRecord values={opportunity.estimated_cost || {}} empty="No cost estimate recorded" /></section>
+          {canReview && <section className="finding-section finding-decision"><p className="eyebrow">Human decision gate</p><h3>Record a reviewed decision</h3><label>Decision reason<input value={decisionReason} minLength={3} onChange={event => onDecisionReasonChange(event.target.value)} /></label>{!opportunity.editorial_rationale && <label>Why does this video deserve to exist?<textarea rows={4} value={rationale} minLength={20} onChange={event => onRationaleChange(event.target.value)} /></label>}<p className="muted">This action is version-checked and retained in audit history.</p><div className="actions"><button type="button" className="primary compact" disabled={shortlistDisabled} onClick={() => onDecision(opportunity, "approved")}>Shortlist</button><button type="button" className="secondary compact" disabled={decisionDisabled} onClick={() => onDecision(opportunity, "deferred")}>Defer</button><button type="button" className="secondary compact danger" disabled={decisionDisabled} onClick={() => onDecision(opportunity, "rejected")}>Reject</button></div></section>}
+          {canOperate && opportunity.decision === "approved" && opportunity.source_count > 0 && opportunity.snapshot_count === 0 && <section className="finding-section"><p className="eyebrow">Next step</p><h3>Preserve the reviewed sources</h3><p className="muted">Acquire immutable snapshots before evidence analysis begins.</p><button type="button" className="primary" onClick={() => onAcquire(opportunity)}>Acquire approved sources</button></section>}
+          {canOperate && opportunity.decision === "approved" && opportunity.snapshot_count > 0 && opportunity.research_state === "RESEARCHING" && <section className="finding-section"><p className="eyebrow">Next step</p><h3>Build the evidence dossier</h3><p className="muted">Analyze only the acquired immutable snapshots.</p><button type="button" className="primary" onClick={() => onBuildDossier(opportunity)}>Build evidence dossier</button></section>}
+        </div>
+      </div>
+    </div>
+  </dialog>;
 }
 
 function SourceBrowser({ opportunityId, csrf, role }: { opportunityId: string; csrf: string; role: Role }) {
@@ -778,6 +893,7 @@ function ProfilesPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
 function ResearchPanel({ csrf, role, activeChannelId }: { csrf: string; role: Role; activeChannelId: string }) {
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [visibleOpportunityCount, setVisibleOpportunityCount] = useState(20);
+  const [selectedOpportunity, setSelectedOpportunity] = useState<Opportunity | null>(null);
   const [dossiers, setDossiers] = useState<Dossier[]>([]);
   const [detail, setDetail] = useState<DossierDetail | null>(null);
   const [subjects, setSubjects] = useState<SubjectProfile[]>([]);
@@ -813,7 +929,7 @@ function ResearchPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Research data could not be loaded"); }
   }, [activeChannelId]);
   useEffect(() => { refresh(); }, [refresh]);
-  useEffect(() => { setDetail(null); setVisibleOpportunityCount(20); }, [activeChannelId]);
+  useEffect(() => { setDetail(null); setSelectedOpportunity(null); setVisibleOpportunityCount(20); }, [activeChannelId]);
   useEffect(() => {
     if (!run) return;
     api<ResearchWorkflowLogEntry[]>(`/api/v1/research/runs/${encodeURIComponent(run.workflow_id)}/logs`)
@@ -870,7 +986,7 @@ function ResearchPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
   async function decideOpportunity(item: Opportunity, decision: "approved" | "rejected" | "deferred") {
     try {
       await api(`/api/v1/research/opportunities/${item.id}/decision`, { method: "POST", body: JSON.stringify({ decision, expected_version: item.version, reason: opportunityReason, editorial_rationale: decision === "approved" ? (item.editorial_rationale || opportunityRationale) : null }) }, csrf);
-      setMessage(`Opportunity ${decision}.`); await refresh();
+      setMessage(`Opportunity ${decision}.`); setSelectedOpportunity(null); await refresh();
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Opportunity decision failed"); }
   }
   async function createManualOpportunity(event: FormEvent<HTMLFormElement>) {
@@ -937,9 +1053,9 @@ function ResearchPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
     {message && <div className="notice">{message}</div>}
     {(role === "admin" || role === "operator") && <section className="panel run-bar"><div><h2>Durable discovery runs</h2><p className="muted">Live discovery executes the enabled subject&apos;s search plan through private SearXNG and produces pending opportunities. The fixture path remains deterministic for acceptance tests.</p></div><select value={selectedSubject} onChange={event => setSelectedSubject(event.target.value)}><option value="">Select enabled subject</option>{subjects.map(subject => <option key={subject.id} value={subject.id}>{subject.name}</option>)}</select><button className="primary" disabled={!selectedSubject} onClick={startLiveDiscovery}>Run live discovery</button><button className="secondary" disabled={!selectedSubject} onClick={startFixture}>Run fixture acceptance</button><button className="secondary" onClick={refresh}>Refresh board</button>{run && <div className="workflow-monitor"><div><span className={`status ${run.execution_status === "COMPLETED" ? "good" : "waiting"}`}>{run.state} · {run.progress}%</span><progress max="100" value={run.progress}>{run.progress}%</progress><code>{run.workflow_id}</code>{run.correlation_id && <small>Correlation: {run.correlation_id}</small>}</div><label>Control reason<input value={workflowReason} onChange={event => setWorkflowReason(event.target.value)} minLength={10} /></label><div className="actions"><button className="secondary compact" onClick={refreshRun}>Refresh status</button><button className="secondary compact danger" disabled={run.execution_status !== "RUNNING"} onClick={cancelRun}>Cancel</button><button className="secondary compact" disabled={!run.retryable} onClick={retryRun}>Retry as new run</button></div><div className="workflow-log" aria-live="polite">{workflowLogs.map(entry => <small className={entry.level || "info"} key={`${entry.at}-${entry.message}`}><time>{new Date(entry.at).toLocaleTimeString()}</time> {entry.message}</small>)}</div></div>}</section>}
     {(role === "admin" || role === "editor") && <section className="panel"><div className="panel-title"><div><p className="eyebrow">Editor-originated idea</p><h2>Manual opportunity</h2></div><span className="chip">pending by default</span></div><form onSubmit={createManualOpportunity}><label>Enabled subject<select name="subject_profile_id" required>{subjects.map(subject => <option key={subject.id} value={subject.id}>{subject.name}</option>)}</select></label><label>Title<input name="title" minLength={3} required /></label><label>Summary<textarea name="summary" rows={3} minLength={20} required /></label><label>Why does this video deserve to exist?<textarea name="editorial_rationale" rows={3} minLength={20} required /></label><label>Estimated model tokens<input name="tokens" type="number" min="0" defaultValue="0" /></label><button className="secondary" disabled={!subjects.length}>Create pending opportunity</button></form></section>}
-    {(role === "admin" || role === "reviewer") && <section className="panel review-bar"><label>Opportunity decision reason<input value={opportunityReason} onChange={event => setOpportunityReason(event.target.value)} minLength={3} /></label><label>Why does this video deserve to exist?<input value={opportunityRationale} onChange={event => setOpportunityRationale(event.target.value)} minLength={20} /></label><span className="muted">Every shortlist, rejection, or deferral is policy-bound, version-checked and audited.</span></section>}
-    <div className="research-grid"><section className="panel"><div className="panel-title"><div><p className="eyebrow">Opportunity board</p><h2>Scored findings</h2></div><span className="chip">Showing {Math.min(visibleOpportunityCount, scopedOpportunities.length)} of {scopedOpportunities.length}</span></div><div className="card-list">{scopedOpportunities.slice(0, visibleOpportunityCount).map(item => <article className="opportunity-card" key={item.id}><div className="score-ring">{item.score ?? "—"}</div><div><strong>{item.title}</strong><p>{item.summary}</p><small><strong>Why it deserves to exist:</strong> {item.editorial_rationale || "Required before shortlisting"}</small><div className="score-pills">{item.grouping_reason.filter(reason => reason.startsWith("classification: ")).map(reason => <span key={reason}>{reason.slice("classification: ".length)}</span>)}<span>{item.policy_snapshot.mode || "assisted"} policy</span><span>{item.source_count} source{item.source_count === 1 ? "" : "s"}</span><span>{item.snapshot_count} immutable snapshot{item.snapshot_count === 1 ? "" : "s"}</span>{item.research_state && <span>{item.research_state.replaceAll("_", " ").toLowerCase()}</span>}{Object.entries(item.score_components).slice(0, 3).map(([name, value]) => <span key={name}>{name.replaceAll("_", " ")} {value}</span>)}</div><div className="actions">{(role === "admin" || role === "reviewer") && (item.decision === "pending" || item.decision === "deferred") && <><button className="secondary compact" onClick={() => decideOpportunity(item, "approved")}>Shortlist</button><button className="secondary compact" onClick={() => decideOpportunity(item, "deferred")}>Defer</button><button className="secondary compact danger" onClick={() => decideOpportunity(item, "rejected")}>Reject</button></>}{(role === "admin" || role === "operator") && item.decision === "approved" && item.source_count > 0 && item.snapshot_count === 0 && <button className="primary compact" onClick={() => startAcquisition(item)}>Acquire approved sources</button>}{(role === "admin" || role === "operator") && item.decision === "approved" && item.snapshot_count > 0 && item.research_state === "RESEARCHING" && <button className="primary compact" onClick={() => startDossier(item)}>Build evidence dossier</button>}</div></div><span className={`status ${item.decision === "approved" ? "good" : "waiting"}`}>{item.decision}</span></article>)}{!scopedOpportunities.length && <p className="empty">No opportunities have been produced for this channel.</p>}</div>{visibleOpportunityCount < scopedOpportunities.length && <button className="secondary" onClick={() => setVisibleOpportunityCount(count => Math.min(count + 20, scopedOpportunities.length))}>Show 20 more ({scopedOpportunities.length - visibleOpportunityCount} remaining)</button>}</section>
+    <div className="research-grid"><section className="panel"><div className="panel-title"><div><p className="eyebrow">Opportunity board</p><h2>Scored findings</h2></div><span className="chip">Showing {Math.min(visibleOpportunityCount, scopedOpportunities.length)} of {scopedOpportunities.length}</span></div><div className="card-list">{scopedOpportunities.slice(0, visibleOpportunityCount).map(item => <article className="opportunity-card" key={item.id}><div className="score-ring">{item.score ?? "—"}</div><div className="opportunity-card-body"><strong>{item.title}</strong><p>{item.summary}</p><small><strong>Why it deserves to exist:</strong> {item.editorial_rationale || "Required before shortlisting"}</small><div className="score-pills">{item.grouping_reason.filter(reason => reason.startsWith("classification: ")).map(reason => <span key={reason}>{reason.slice("classification: ".length)}</span>)}<span>{item.policy_snapshot.mode || "assisted"} policy</span><span>{item.source_count} source{item.source_count === 1 ? "" : "s"}</span><span>{item.snapshot_count} immutable snapshot{item.snapshot_count === 1 ? "" : "s"}</span>{item.research_state && <span>{item.research_state.replaceAll("_", " ").toLowerCase()}</span>}{Object.entries(item.score_components).slice(0, 3).map(([name, value]) => <span key={name}>{name.replaceAll("_", " ")} {value}</span>)}</div><div className="actions"><button type="button" className="secondary compact control-help" data-usage="Open the complete finding, original sources, score trace, policy gates and review controls without changing its status." aria-haspopup="dialog" aria-controls="opportunity-review-dialog" onClick={() => setSelectedOpportunity(item)}>Review finding</button></div></div><span className={`status ${item.decision === "approved" ? "good" : item.decision === "rejected" ? "bad" : "waiting"}`}>{item.decision}</span></article>)}{!scopedOpportunities.length && <p className="empty">No opportunities have been produced for this channel.</p>}</div>{visibleOpportunityCount < scopedOpportunities.length && <button className="secondary" onClick={() => setVisibleOpportunityCount(count => Math.min(count + 20, scopedOpportunities.length))}>Show 20 more ({scopedOpportunities.length - visibleOpportunityCount} remaining)</button>}</section>
       <section className="panel"><div className="panel-title"><div><p className="eyebrow">Review queue</p><h2>Research dossiers</h2></div><span className="chip">{scopedDossiers.length}</span></div><div className="card-list">{scopedDossiers.map(item => <button className="dossier-card" key={item.id} onClick={() => openDossier(item.id)}><span><strong>{item.executive_summary}</strong><small>Version {item.dossier_version} · {item.status}</small></span><span className={`status ${item.completion_evaluation.complete ? "good" : "waiting"}`}>{item.completion_evaluation.complete ? "Rules met" : "Blocked"}</span></button>)}{!scopedDossiers.length && <p className="empty">No dossier is ready for review for this channel.</p>}</div></section></div>
+    {selectedOpportunity && <OpportunityReviewDialog opportunity={selectedOpportunity} role={role} decisionReason={opportunityReason} rationale={opportunityRationale} onDecisionReasonChange={setOpportunityReason} onRationaleChange={setOpportunityRationale} onClose={() => setSelectedOpportunity(null)} onDecision={decideOpportunity} onAcquire={startAcquisition} onBuildDossier={startDossier} />}
     {detail && <section className="panel dossier-detail"><div className="panel-title"><div><p className="eyebrow">Claim ledger</p><h2>{detail.executive_summary}</h2></div><button className="secondary compact" onClick={() => setDetail(null)}>Close</button></div>{(role === "admin" || role === "reviewer") && <div className="review-bar"><label>Review comment<input value={reviewComment} onChange={event => setReviewComment(event.target.value)} minLength={3} /></label>{!detail.completion_evaluation.complete && <label>Reasoned completion override<input value={overrideReason} onChange={event => setOverrideReason(event.target.value)} minLength={20} /></label>}<button className="primary" onClick={() => reviewDossier("approved")}>Approve dossier</button><button className="secondary danger" onClick={() => reviewDossier("rejected")}>Reject dossier</button></div>}<SourceBrowser opportunityId={detail.opportunity_id} csrf={csrf} role={role} /><div className="conclusion-grid"><div><strong>Safe conclusions</strong>{detail.safe_conclusions.map(value => <p key={value}>{value}</p>)}</div><div><strong>Prohibited overstatements</strong>{detail.prohibited_overstatements.map(value => <p key={value}>{value}</p>)}</div></div><div className="claim-list">{detail.claims.map(claim => <article key={claim.id}><header><div><span className="chip">{claim.claim_type} · {claim.risk} risk</span><h3>{claim.normalized_statement}</h3></div><div className="claim-status"><span className={`status ${claim.status === "supported" || claim.status === "approved" ? "good" : "waiting"}`}>{claim.status} · {claim.confidence}%</span>{(role === "admin" || role === "reviewer") && <div><button className="secondary compact" onClick={() => reviewClaim(claim.id, claim.version, "approved")}>Approve</button><button className="secondary compact danger" onClick={() => reviewClaim(claim.id, claim.version, "rejected")}>Reject</button></div>}</div></header><div className="evidence-list">{claim.evidence.map((evidence, index) => <div key={`${evidence.snapshot.content_hash}-${index}`}><span className={`relation ${evidence.relationship}`}>{evidence.relationship}</span><blockquote>{evidence.exact_text}</blockquote><ExternalSourceLink url={evidence.source.canonical_url} title={evidence.source.title} /><code title={evidence.snapshot.content_hash}>{evidence.snapshot.content_hash.slice(0, 16)}…</code></div>)}</div></article>)}</div></section>}
   </>;
 }
