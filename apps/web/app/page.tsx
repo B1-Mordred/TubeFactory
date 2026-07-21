@@ -117,6 +117,93 @@ function UsageTip({ text }: { text: string }) {
   return <button type="button" className="usage-tip" data-usage={text} aria-label={`Usage help: ${text}`}>?</button>;
 }
 
+const fieldUsageHints: Array<[string, string]> = [
+  ["channel workspace", "Choose one channel to scope channel-aware queues, or choose All channels for the portfolio view."],
+  ["username", "Enter your local operator username."],
+  ["password", "Enter the account password; local passwords must contain at least eight characters."],
+  ["show password", "Toggle whether the password is visible on this device."],
+  ["authenticator or recovery code", "Enter a current authenticator code or one unused recovery code when multi-factor authentication is enabled."],
+  ["enabled subject", "Choose the enabled subject that owns this work in the current channel."],
+  ["opportunity decision reason", "Record why you are shortlisting, deferring or rejecting; the reason is retained in audit history."],
+  ["why does this video deserve to exist", "Explain the audience need and evidence gap this video will address."],
+  ["estimated model tokens", "Estimate model usage so budget policy can prevent unexpected spending."],
+  ["find workflow", "Filter workflow history by type, subject, channel or workflow ID."],
+  ["schedule time", "Choose the intended publication time in your browser's local timezone."],
+  ["artifact sha-256", "Enter the artifact's 64-character SHA-256 digest when one is available."],
+  ["evidence json", "Describe the operational result as valid JSON; this record becomes immutable."],
+  ["current password", "Confirm your current password before changing a security-sensitive setting."],
+  ["new password", "Choose a new password containing at least eight characters."],
+];
+
+function normalizedUsageText(value: string): string {
+  return value.replace(/\s+/g, " ").replace(/\s*\([^)]*\)\s*$/g, "").trim();
+}
+
+function usageForField(label: string, control: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement): string {
+  const key = label.toLowerCase().replace(/[?:]+$/g, "").trim();
+  const curated = fieldUsageHints.find(([prefix]) => key.startsWith(prefix));
+  if (curated) return curated[1];
+  const subject = key || control.getAttribute("placeholder")?.toLowerCase() || "this value";
+  if (control instanceof HTMLSelectElement) return `Choose ${subject}; available options reflect the current workspace and record state.`;
+  if (control instanceof HTMLTextAreaElement) return `Describe ${subject}; keep the explanation specific enough for later review.`;
+  if (control.type === "checkbox") return `Toggle ${subject}; the change is applied only when you submit or activate this form.`;
+  if (control.type === "number") return `Enter ${subject} as a number; configured limits are enforced before submission.`;
+  if (control.type === "url") return `Enter a complete URL for ${subject}, including https://.`;
+  if (control.type === "datetime-local" || control.type === "date") return `Choose ${subject} using your browser's local date and time controls.`;
+  if (control.type === "search") return `Type to filter by ${subject}; the underlying records are not changed.`;
+  if (control.type === "password") return `Enter ${subject}; the value remains masked unless you explicitly reveal it.`;
+  return `Enter ${subject}; review the value before continuing.`;
+}
+
+function usageForAction(label: string): string {
+  const action = label.toLowerCase();
+  if (action === "sign out") return "End your current TubeFactory session on this device.";
+  if (/^refresh|^reconcile/.test(action)) return "Reload the latest recorded state without creating a duplicate workflow.";
+  if (/^approve/.test(action)) return "Record approval for the exact version shown; verify its evidence and hashes first.";
+  if (/^reject|^defer/.test(action)) return "Record this decision with the reason currently entered on the page.";
+  if (/^shortlist/.test(action)) return "Move this opportunity forward using the recorded editorial reason and policy checks.";
+  if (/^run|^start|^generate|^regenerate|^retry|^queue|^ingest/.test(action)) return "Start a durable background operation; progress and failures remain visible in Workflow activity.";
+  if (/^create|^save|^update|^activate|^enable|^connect|^register|^store|^set/.test(action)) return "Apply the values shown to a versioned or audited record; review the form first.";
+  if (/^disable|^remove|^delete|^force/.test(action)) return "Change availability or policy state; verify the selected target before continuing.";
+  if (/^show|^open|^view/.test(action)) return "Open or reveal the related detail without changing the underlying record.";
+  return `Use “${label}” to continue this step.`;
+}
+
+function useContextualUsageHints(renderKey: string) {
+  useEffect(() => {
+    const root = document.body;
+    let frame = 0;
+    const annotate = () => {
+      root.querySelectorAll<HTMLLabelElement>("label").forEach(label => {
+        const linked = label.htmlFor ? document.getElementById(label.htmlFor) : null;
+        const control = (linked || label.querySelector("input, select, textarea")) as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null;
+        if (!control || label.dataset.usage) return;
+        const copy = label.cloneNode(true) as HTMLLabelElement;
+        copy.querySelectorAll("input, select, textarea, small").forEach(node => node.remove());
+        const name = normalizedUsageText(control.getAttribute("aria-label") || copy.textContent || control.getAttribute("placeholder") || "");
+        const hint = usageForField(name, control);
+        label.classList.add("field-help");
+        label.dataset.usage = hint;
+        control.setAttribute("aria-description", hint);
+      });
+      root.querySelectorAll<HTMLElement>("button:not(.usage-tip):not(.nav-help), a[href]").forEach(control => {
+        if (control.dataset.usage) return;
+        const label = normalizedUsageText(control.textContent || control.getAttribute("aria-label") || "");
+        if (!label || label.length > 80) return;
+        const hint = usageForAction(label);
+        control.classList.add("control-help");
+        control.dataset.usage = hint;
+        control.setAttribute("aria-description", hint);
+      });
+    };
+    const schedule = () => { window.cancelAnimationFrame(frame); frame = window.requestAnimationFrame(annotate); };
+    annotate();
+    const observer = new MutationObserver(schedule);
+    observer.observe(root, { childList: true, subtree: true });
+    return () => { observer.disconnect(); window.cancelAnimationFrame(frame); };
+  }, [renderKey]);
+}
+
 function randomUuid(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
   const bytes = new Uint8Array(16);
@@ -1284,6 +1371,7 @@ function WorkflowPanel({ csrf, activeChannelId, onOpenPage }: { csrf: string; ac
 export default function Home() {
   const [loading, setLoading] = useState(true); const [bootstrap, setBootstrap] = useState(false); const [session, setSession] = useState<Session | null>(null); const [capabilities, setCapabilities] = useState<Capabilities | null>(null); const [page, setPage] = useState("dashboard");
   const [channels, setChannels] = useState<ChannelProfile[]>([]); const [activeChannelId, setActiveChannelId] = useState("");
+  useContextualUsageHints(`${page}:${loading}:${session?.user.id || "anonymous"}`);
   useEffect(() => { Promise.all([api<{ required: boolean }>("/api/v1/auth/bootstrap-status"), api<Session>("/api/v1/auth/session").catch(() => null)]).then(([status, current]) => { setBootstrap(status.required); setSession(current); }).finally(() => setLoading(false)); }, []);
   useEffect(() => { if (session) Promise.all([api<Capabilities>("/api/v1/system/capabilities"), api<ChannelProfile[]>("/api/v1/channel-profiles")]).then(([nextCapabilities, nextChannels]) => { setCapabilities(nextCapabilities); setChannels(nextChannels); const stored = window.localStorage.getItem("tubefactory.channel") || window.localStorage.getItem("evidence-studio.channel") || ""; if (stored) window.localStorage.setItem("tubefactory.channel", stored); setActiveChannelId(nextChannels.some(item => item.id === stored) ? stored : ""); }); }, [session]);
   useEffect(() => { const syncPage = () => { const requested = new URL(window.location.href).searchParams.get("page") || "dashboard"; setPage(PAGE_IDS.has(requested) ? requested : "dashboard"); }; syncPage(); window.addEventListener("popstate", syncPage); return () => window.removeEventListener("popstate", syncPage); }, []);
