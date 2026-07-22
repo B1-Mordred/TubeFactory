@@ -17,4 +17,5 @@ build/
 infra/compose/secrets/*.local
 !infra/compose/secrets/*.dev
 *.log
+*.tsbuildinfo
 .DS_Store

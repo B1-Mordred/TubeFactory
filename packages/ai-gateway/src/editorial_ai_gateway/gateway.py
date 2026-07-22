@@ -97,6 +97,14 @@ class DriverResult:
     raw_response_bytes: int = 0
 
 
+class ModelOutputError(ValueError):
+    """A provider response that can be shown back to the same model for repair."""
+
+    def __init__(self, message: str, raw_output: Any = None) -> None:
+        super().__init__(message)
+        self.raw_output = raw_output
+
+
 class AIDriver(Protocol):
     async def generate(
         self,
@@ -308,7 +316,10 @@ class AIGateway:
         validator = Draft202012Validator(request.response_schema)
         errors = sorted(validator.iter_errors(result.output), key=lambda error: list(error.path))
         if errors:
-            raise ValueError(f"model output failed response schema: {errors[0].message}")
+            raise ModelOutputError(
+                f"model output failed response schema: {errors[0].message}",
+                result.output,
+            )
         response_json = _canonical_json(result.output)
         return GatewayResponse(
             output=result.output,
@@ -366,7 +377,11 @@ class JSONHTTPDriver:
         remaining = (deadline.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0:
             raise TimeoutError("model request deadline elapsed")
-        timeout = aiohttp.ClientTimeout(total=min(remaining, 120), connect=10, sock_read=90)
+        # Local inference can legitimately take several minutes for the first
+        # token or a schema-constrained response.  The caller already supplies
+        # the bounded task deadline, so do not replace it with a shorter,
+        # hidden HTTP read timeout.
+        timeout = _deadline_http_timeout(remaining)
         async with aiohttp.ClientSession(
             timeout=timeout,
             cookie_jar=aiohttp.DummyCookieJar(),
@@ -376,13 +391,112 @@ class JSONHTTPDriver:
             async with session.post(endpoint, json=body, allow_redirects=False) as response:
                 if response.status != 200:
                     raise ValueError(f"model provider returned HTTP {response.status}")
-                raw = await response.content.read(maximum_bytes + 1)
-                if len(raw) > maximum_bytes:
-                    raise ValueError("model provider response exceeds the byte limit")
+                raw = await read_bounded_http_body(response.content, maximum_bytes)
         try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError("model provider returned invalid JSON") from exc
+            value = _decode_json_http_response(raw)
+        except ValueError as exc:
+            raise ModelOutputError(
+                f"model provider returned invalid JSON ({len(raw)} bytes)",
+                raw.decode("utf-8", errors="replace"),
+            ) from exc
         if not isinstance(value, dict):
             raise ValueError("model provider response root must be an object")
         return value
+
+
+async def read_bounded_http_body(content: Any, maximum_bytes: int) -> bytes:
+    """Read an aiohttp body through EOF without losing its hard byte ceiling."""
+
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in content.iter_chunked(min(65_536, maximum_bytes + 1)):
+        size += len(chunk)
+        if size > maximum_bytes:
+            raise ValueError("HTTP response exceeds the byte limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_json_http_response(raw: bytes) -> dict[str, Any]:
+    """Accept JSON plus common mislabelled OpenAI SSE/NDJSON proxy responses."""
+
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("provider response is empty")
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+    # Some local OpenAI-compatible proxies occasionally place literal control
+    # characters inside message.content instead of JSON-escaping them.  The
+    # standard decoder can safely accept those characters with strict=False;
+    # schema validation still applies to the decoded provider response and its
+    # embedded model output.  Incomplete/truncated JSON remains invalid.
+    try:
+        value = json.loads(text, strict=False)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+
+    documents: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        candidate = line.strip()
+        if candidate.startswith("data:"):
+            candidate = candidate[5:].strip()
+        if not candidate or candidate == "[DONE]":
+            continue
+        try:
+            item = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            documents.append(item)
+    if documents:
+        content_parts: list[str] = []
+        final: dict[str, Any] | None = None
+        usage: dict[str, Any] = {}
+        for item in documents:
+            final = item
+            usage = item.get("usage") or usage
+            choices = item.get("choices") or []
+            if choices:
+                choice = choices[0]
+                message = choice.get("message") or choice.get("delta") or {}
+                piece = message.get("content")
+                if isinstance(piece, str):
+                    content_parts.append(piece)
+            message = item.get("message") or {}
+            piece = message.get("content")
+            if isinstance(piece, str):
+                content_parts.append(piece)
+        if content_parts:
+            return {
+                "choices": [{"message": {"content": "".join(content_parts)}}],
+                "usage": usage,
+            }
+        if final is not None:
+            return final
+
+    decoder = json.JSONDecoder()
+    for position, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[position:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("provider response has no complete JSON document")
+
+
+def _deadline_http_timeout(remaining: float) -> aiohttp.ClientTimeout:
+    """Translate the already-bounded model deadline into HTTP timeouts."""
+    return aiohttp.ClientTimeout(
+        total=remaining,
+        connect=min(10, remaining),
+        sock_read=remaining,
+    )

@@ -7,6 +7,17 @@ from aiohttp import web
 
 from editorial_core.acquisition import UnsafeSourceAddress
 import research_worker.acquisition as acquisition_module
+from research_worker.acquisition_activities import (
+    _candidate_relevance,
+    _classify_search_candidate,
+    _doi_from_citation_url,
+    _generic_evidence_queries,
+    _linked_primary_citations,
+    _public_api_candidate,
+    _registry_query_for_citation,
+    _resolve_registry_candidate,
+    _scholarly_work_identity,
+)
 from research_worker.acquisition import (
     CachedRobotsPolicy,
     DomainPolicy,
@@ -21,6 +32,200 @@ from research_worker.acquisition import (
     validate_redirect_target,
     validate_source_target,
 )
+
+
+def test_linked_primary_citations_extracts_explicit_study_links_only() -> None:
+    html = b"""
+    <article>
+      <a href="https://www.acpjournals.org/doi/10.7326/ANNALS-25-01660">
+        Prolonged Short Sleep and Its Effect on Body Weight and Composition
+      </a>
+      <a href="/news/related-story">Related reporting</a>
+      <a href="https://www.acpjournals.org/doi/10.7326/ANNALS-25-01660?utm_source=x">
+        Duplicate citation
+      </a>
+    </article>
+    """
+
+    citations = _linked_primary_citations(html, "https://www.mdr.de/wissen/story.html")
+
+    assert citations == (
+        {
+            "url": "https://www.acpjournals.org/doi/10.7326/ANNALS-25-01660",
+            "title": "Prolonged Short Sleep and Its Effect on Body Weight and Composition",
+            "source_type": "primary",
+            "resolution_strategy": "explicit_primary_link",
+        },
+        {
+            "url": "https://doi.org/10.7326/ANNALS-25-01660",
+            "title": "Primary evidence identified by DOI 10.7326/ANNALS-25-01660",
+            "source_type": "primary",
+            "resolution_strategy": "embedded_doi",
+        },
+    )
+
+
+def test_linked_primary_citations_rejects_social_export_aliases() -> None:
+    citations = _linked_primary_citations(
+        b"""
+        <a href="https://reddit.com/submit?url=https://arxiv.org/abs/2201.05048">Share</a>
+        <a href="https://www.bibsonomy.org/BibtexHandler?url=https://arxiv.org/abs/2201.05048">Export</a>
+        <a href="https://arxiv.org/abs/2201.05048v1">Actual paper</a>
+        """,
+        "https://example.org/story",
+    )
+    assert [item["url"] for item in citations] == [
+        "https://arxiv.org/abs/2201.05048v1"
+    ]
+
+
+def test_doi_is_resolved_from_journal_and_canonical_urls() -> None:
+    assert (
+        _doi_from_citation_url(
+            "https://www.acpjournals.org/doi/10.7326/ANNALS-25-01660?source=article"
+        )
+        == "10.7326/ANNALS-25-01660"
+    )
+    assert _doi_from_citation_url("https://doi.org/10.1000/example") == "10.1000/example"
+    assert _doi_from_citation_url("https://example.org/story") is None
+
+
+@pytest.mark.asyncio
+async def test_doi_resolution_returns_crawlable_europe_pmc_record(
+    unused_tcp_port: int,
+) -> None:
+    async def search(request: web.Request) -> web.Response:
+        assert request.query["query"] == "DOI:10.1000/example"
+        return web.json_response({"hitCount": 1, "resultList": {"result": [{"id": "1"}]}})
+
+    app = web.Application()
+    app.router.add_get("/search", search)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
+    await site.start()
+    try:
+        async with aiohttp.ClientSession() as session:
+            candidate = await _resolve_registry_candidate(
+                session,
+                {
+                    "url": "https://doi.org/10.1000/example",
+                    "title": "Example primary study",
+                },
+                europe_pmc_endpoint=f"http://127.0.0.1:{unused_tcp_port}/search",
+            )
+    finally:
+        await runner.cleanup()
+
+    assert candidate == {
+        "url": (
+            f"http://127.0.0.1:{unused_tcp_port}/search?"
+            "query=DOI%3A10.1000%2Fexample&format=json&resultType=core"
+        ),
+        "title": "Europe PMC primary-study record: Example primary study",
+        "source_type": "primary",
+        "resolution_strategy": "europe_pmc_registry",
+    }
+
+
+def test_registry_and_public_api_resolvers_cover_multiple_disciplines() -> None:
+    assert _registry_query_for_citation(
+        {"url": "https://pubmed.ncbi.nlm.nih.gov/42407080/"}
+    ) == "EXT_ID:42407080"
+    assert _public_api_candidate(
+        {
+            "url": "https://clinicaltrials.gov/study/NCT02960776",
+            "title": "Trial",
+        }
+    ) == {
+        "url": "https://clinicaltrials.gov/api/v2/studies/NCT02960776",
+        "title": "ClinicalTrials.gov study record: Trial",
+        "source_type": "primary",
+        "resolution_strategy": "clinicaltrials_api",
+    }
+    assert _public_api_candidate(
+        {"url": "https://arxiv.org/abs/2607.01234", "title": "Paper"}
+    ) == {
+        "url": "https://export.arxiv.org/api/query?id_list=2607.01234",
+        "title": "arXiv primary-paper record: Paper",
+        "source_type": "primary",
+        "resolution_strategy": "arxiv_api",
+    }
+
+
+def test_generic_queries_and_classification_are_topic_agnostic() -> None:
+    queries = _generic_evidence_queries(
+        "Warum rosten Fahrräder?", "Feuchtigkeit reagiert mit Eisen und Sauerstoff."
+    )
+    assert len(queries) == 3
+    assert all("rosten Fahrräder" in query for query in queries)
+    assert all('"Warum rosten Fahrräder?"' not in query for query in queries)
+    assert any("counterevidence" in query for query in queries)
+    assert (
+        _classify_search_candidate(
+            "https://data.gov/report", "Official statistics report", "dataset"
+        )
+        == "primary"
+    )
+    assert (
+        _classify_search_candidate(
+            "https://www.example.gov/about", "Agency page", "contact information"
+        )
+        == "authoritative"
+    )
+    assert (
+        _classify_search_candidate(
+            "https://example.com/explainer", "Explainer", "A summary"
+        )
+        == "secondary"
+    )
+    relevant_score, relevant_terms = _candidate_relevance(
+        "Warum rosten Fahrräder?",
+        "Feuchtigkeit reagiert mit Eisen und Sauerstoff.",
+        "Warum Fahrräder aus Eisen rosten",
+        "Eine technische Erklärung zur Reaktion mit Feuchtigkeit.",
+    )
+    noise_score, noise_terms = _candidate_relevance(
+        "Weniger Schlaf, mehr Gewicht? Zusammenhang bei Schlafmangel",
+        "Eine Studie untersucht moderaten Schlafmangel.",
+        "weniger - Bedeutung und Synonyme",
+        "Wörterbuchdefinition",
+    )
+    assert relevant_score >= 0.18 and relevant_terms >= 2
+    assert noise_score < 0.18 or noise_terms < 2
+
+
+def test_generic_web_relevance_rejects_adjacent_generic_topic() -> None:
+    score, shared = _candidate_relevance(
+        "Herausforderungen und Chancen für die Lithiumgewinnung aus geothermalen Systemen in Deutschland",
+        "Vergleich der technischen Verfahren und des realistischen Potenzials.",
+        "Objektorientierte Graphendarstellung von Simulink-Modellen zur einfachen Analyse und Transformation",
+        "Eine Studie zu technischen Systemen in Deutschland.",
+    )
+
+    assert shared < 2 or score < 0.32
+
+
+def test_scholarly_identity_collapses_aliases_but_preserves_distinct_works() -> None:
+    assert _scholarly_work_identity("https://arxiv.org/abs/2201.05048v1") == "arxiv:2201.05048"
+    assert (
+        _scholarly_work_identity("https://doi.org/10.48550/arXiv.2201.05048")
+        == "arxiv:2201.05048"
+    )
+    assert (
+        _scholarly_work_identity(
+            "https://api.openalex.org/works/W4385709095",
+            doi="https://doi.org/10.3390/en16165899",
+        )
+        == "doi:10.3390/en16165899"
+    )
+    assert (
+        _scholarly_work_identity(
+            "https://api.openalex.org/works/W3206414838",
+            doi="10.3390/en14206805",
+        )
+        == "doi:10.3390/en14206805"
+    )
 
 
 @pytest.mark.asyncio
@@ -51,19 +256,22 @@ async def test_searxng_search_applies_configured_freshness_window(
     site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
     await site.start()
     try:
-        results = await search_searxng(
+        response = await search_searxng(
             f"http://127.0.0.1:{unused_tcp_port}",
             query="Faktencheck",
             language="de",
             policy=DomainPolicy(),
             lookback_days=7,
+            engines=("bing", "qwant news"),
         )
     finally:
         await runner.cleanup()
 
     assert observed["time_range"] == "week"
     assert observed["language"] == "de"
-    assert results[0]["published_at"] == "2026-07-21T08:00:00Z"
+    assert observed["engines"] == "bing,qwant news"
+    assert response.results[0]["published_at"] == "2026-07-21T08:00:00Z"
+    assert response.requested_engines == ("bing", "qwant news")
 
 
 @pytest.mark.asyncio
@@ -84,7 +292,7 @@ async def test_searxng_search_reads_streamed_json_to_eof(unused_tcp_port: int) -
     site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
     await site.start()
     try:
-        results = await search_searxng(
+        response = await search_searxng(
             f"http://127.0.0.1:{unused_tcp_port}",
             query="streamed",
             language="de",
@@ -93,7 +301,45 @@ async def test_searxng_search_reads_streamed_json_to_eof(unused_tcp_port: int) -
     finally:
         await runner.cleanup()
 
-    assert results[0]["title"] == "Streamed report"
+    assert response.results[0]["title"] == "Streamed report"
+
+
+@pytest.mark.asyncio
+async def test_searxng_search_preserves_unresponsive_engine_health(
+    unused_tcp_port: int,
+) -> None:
+    async def search(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "results": [],
+                "unresponsive_engines": [
+                    ["brave", "Suspended: too many requests"],
+                    ["duckduckgo", "CAPTCHA"],
+                ],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/search", search)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
+    await site.start()
+    try:
+        response = await search_searxng(
+            f"http://127.0.0.1:{unused_tcp_port}",
+            query="health",
+            language="de",
+            policy=DomainPolicy(),
+        )
+    finally:
+        await runner.cleanup()
+
+    assert response.results == ()
+    assert response.unresponsive_engines == (
+        {"engine": "brave", "reason": "Suspended: too many requests"},
+        {"engine": "duckduckgo", "reason": "CAPTCHA"},
+    )
 
 
 def test_domain_policy_supports_exact_and_subdomain_rules() -> None:

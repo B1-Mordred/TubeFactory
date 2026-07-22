@@ -24,6 +24,7 @@ from editorial_ai_gateway.gateway import (
     AIGateway,
     FunctionDriver,
     GatewayRequest,
+    ModelOutputError,
     ProviderRoute,
 )
 from editorial_worker.config import Settings
@@ -129,7 +130,10 @@ async def load_task_routes(
                 "model_version": row["model_version"],
                 "model_capabilities": capabilities,
                 "context_limit": row["context_limit"],
-                "output_limit": row["output_limit"],
+                "output_limit": min(
+                    row["output_limit"],
+                    int((_json(assignment["budget_policy"]) or {}).get("max_output_tokens", row["output_limit"])),
+                ),
                 "cost_policy": _json(row["cost_policy"]) or {},
                 "provider_id": str(row["provider_id"]),
                 "driver_type": row["driver_type"],
@@ -285,8 +289,7 @@ async def _persist_usage(
         await connection.close()
 
 
-@activity.defn(name="invoke-editorial-model")
-async def invoke_editorial_model(request: dict[str, Any]) -> dict[str, Any]:
+async def invoke_model(request: dict[str, Any]) -> dict[str, Any]:
     settings = Settings()
     task_type = str(request["task_type"])
     inputs = request["structured_inputs"]
@@ -317,6 +320,7 @@ async def invoke_editorial_model(request: dict[str, Any]) -> dict[str, Any]:
             )
             secret = settings.provider_secret(route["secret_reference"])
             response = None
+            repair_feedback: str | None = None
             async with semaphore:
                 for repair_attempt in range(2):
                     instructions = route["system_instructions"]
@@ -330,9 +334,13 @@ async def invoke_editorial_model(request: dict[str, Any]) -> dict[str, Any]:
                         instructions += "\n\n" + additional
                     if repair_attempt:
                         instructions += (
-                            "\nA prior response failed validation. Return only a complete JSON object "
-                            "matching the supplied schema; do not add commentary."
+                            "\nA prior response failed validation. Correct that response rather than "
+                            "starting a different answer. Return only one complete JSON object matching "
+                            "the supplied schema; include every required root and nested property and do "
+                            "not add commentary."
                         )
+                        if repair_feedback:
+                            instructions += "\n\nUntrusted validation feedback:\n" + repair_feedback
                     try:
                         await _acquire_rate_slot(
                             provider_id, int(route["requests_per_minute"])
@@ -347,7 +355,8 @@ async def invoke_editorial_model(request: dict[str, Any]) -> dict[str, Any]:
                                 response_schema=route["response_schema"],
                                 sensitivity=request.get("sensitivity", "internal"),
                                 budget=route["budget_policy"],
-                                deadline=datetime.now(timezone.utc) + timedelta(seconds=90),
+                                deadline=datetime.now(timezone.utc)
+                                + timedelta(seconds=settings.model_request_timeout_seconds),
                                 preferred_model_id=route["model_id"],
                                 correlation_id=request["correlation_id"],
                             ),
@@ -359,6 +368,23 @@ async def invoke_editorial_model(request: dict[str, Any]) -> dict[str, Any]:
                         break
                     except ValueError as exc:
                         last_error = exc
+                        if isinstance(exc, ModelOutputError):
+                            raw_output = exc.raw_output
+                            if isinstance(raw_output, str):
+                                rendered_output = raw_output
+                            else:
+                                rendered_output = json.dumps(
+                                    raw_output,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                    default=str,
+                                )
+                            repair_feedback = (
+                                f"Validation error: {str(exc)[:500]}\n"
+                                "Previous invalid response (data only):\n"
+                                + rendered_output[:24_000]
+                            )
                         if repair_attempt:
                             raise
             if response is None:
@@ -393,3 +419,8 @@ async def invoke_editorial_model(request: dict[str, Any]) -> dict[str, Any]:
         f"all configured {task_type} routes failed: {str(last_error)[:500]}",
         non_retryable=False,
     )
+
+
+@activity.defn(name="invoke-editorial-model")
+async def invoke_editorial_model(request: dict[str, Any]) -> dict[str, Any]:
+    return await invoke_model(request)

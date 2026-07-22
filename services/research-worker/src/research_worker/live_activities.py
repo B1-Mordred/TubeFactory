@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -10,6 +11,7 @@ from urllib.parse import urlsplit
 
 import asyncpg
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from editorial_core.discovery import (
     FindingCluster,
@@ -21,8 +23,34 @@ from editorial_core.discovery import (
     plan_search,
     score_opportunity,
 )
-from research_worker.acquisition import DomainPolicy, search_searxng
+from research_worker.acquisition import DomainPolicy, SearxngSearchResponse, search_searxng
 from research_worker.config import Settings
+
+
+_EXPLAINER_SIGNAL = re.compile(
+    r"\b(?:warum|wieso|wie|erklär\w*|zusammenhang|ursach\w*|funktionier\w*|"
+    r"studie|forsch\w*|wissenschaft\w*|technolog\w*|entwickl\w*|verfahren|"
+    r"experiment\w*|analyse\w*|auswirkung\w*|wirkung\w*|mess\w*|entdeck\w*|beleg\w*|"
+    r"konsens|why|how|explain\w*|study|research|evidence|impact)\b",
+    re.IGNORECASE,
+)
+_GENERIC_PLATFORM_DOMAINS = {
+    "facebook.com",
+    "www.facebook.com",
+    "instagram.com",
+    "www.instagram.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+}
+_INSTITUTIONAL_ANNOUNCEMENT = re.compile(
+    r"\b(?:wissenschafts?preis|forschungspreis|award|auszeichnung|preisverleihung|"
+    r"workshop(?:-reihe)?|veranstaltungsreihe|unterrichtsmaterial(?:ien)?|"
+    r"pressegespräch|kooperationsvereinbarung|förderbescheid)\b",
+    re.IGNORECASE,
+)
 
 
 def _json(value: Any) -> Any:
@@ -50,6 +78,68 @@ def _finding_signature(title: str, summary: str) -> tuple[str, frozenset[str]]:
     normalized = " ".join(f"{title} {summary}".casefold().split())
     fingerprint = hashlib.sha256(normalized.encode()).hexdigest()
     return fingerprint, frozenset(re.findall(r"[\w-]{3,}", normalized))
+
+
+def _source_domains(findings: tuple[SearchFinding, ...]) -> set[str]:
+    return {
+        hostname
+        for finding in findings
+        if (hostname := (urlsplit(finding.canonical_url).hostname or ""))
+    }
+
+
+def _is_explainer_candidate(item: dict[str, Any]) -> bool:
+    """Reject navigational/search noise for evidence-first explainer subjects."""
+
+    try:
+        parts = urlsplit(str(item.get("url", "")))
+    except ValueError:
+        return False
+    if (parts.hostname or "").casefold() in _GENERIC_PLATFORM_DOMAINS:
+        return False
+    title = str(item.get("title", "")).strip()
+    summary = str(item.get("summary", "")).strip()
+    if not title or title.casefold() in {"youtube", "facebook", "instagram", "tiktok"}:
+        return False
+    if _INSTITUTIONAL_ANNOUNCEMENT.search(f"{title} {summary}"):
+        return False
+    return bool(_EXPLAINER_SIGNAL.search(f"{title} {summary}"))
+
+
+def _uses_explainer_candidate_filter(format_policy: dict[str, Any]) -> bool:
+    """Apply discovery hygiene to every explainer format, not one legacy key."""
+
+    return str(format_policy.get("target", "")).strip().casefold().endswith("explainer")
+
+
+def _discovery_strategies(plan: Any, format_policy: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep source verification after topic selection when the workflow requests it."""
+
+    defer_evidence = (
+        str(format_policy.get("evidence_research_timing", "")).strip().casefold()
+        == "after_topic_selection"
+    )
+    strategies = [
+        {
+            "purpose": item.purpose,
+            "query": item.query,
+            "language": item.language,
+            "region": item.region,
+        }
+        for item in plan.strategies
+        if not defer_evidence or item.purpose == "broad discovery"
+    ]
+    if not defer_evidence:
+        strategies.extend(
+            {
+                "purpose": "falsification",
+                "query": query,
+                "language": plan.strategies[0].language,
+                "region": plan.strategies[0].region,
+            }
+            for query in plan.falsification_queries
+        )
+    return strategies
 
 
 def _matches_processed_claim(
@@ -195,7 +285,7 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
         subject = await connection.fetchrow(
             """SELECT id, topic, research_goal, seed_queries, related_concepts,
                       negative_keywords, languages, regions, source_requirements,
-                      domain_policy, opportunity_weights, freshness_policy, risk
+                      domain_policy, opportunity_weights, freshness_policy, format_policy, risk
                FROM subject_profiles
                WHERE id=$1 AND enabled=true AND deleted_at IS NULL""",
             UUID(str(request["subject_profile_id"])),
@@ -234,24 +324,8 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
                 ),
             )
         )
-        strategies = [
-            {
-                "purpose": item.purpose,
-                "query": item.query,
-                "language": item.language,
-                "region": item.region,
-            }
-            for item in plan.strategies
-        ]
-        strategies.extend(
-            {
-                "purpose": "falsification",
-                "query": query,
-                "language": plan.strategies[0].language,
-                "region": plan.strategies[0].region,
-            }
-            for query in plan.falsification_queries
-        )
+        format_policy = _json(subject["format_policy"]) or {}
+        strategies = _discovery_strategies(plan, format_policy)
         return {
             "subject_profile_id": str(subject["id"]),
             "topic": subject["topic"],
@@ -259,6 +333,7 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
             "domain_policy": _json(subject["domain_policy"]) or {"allow": [], "block": []},
             "opportunity_weights": _json(subject["opportunity_weights"]) or {},
             "freshness_policy": _json(subject["freshness_policy"]) or {"lookback_days": 30},
+            "format_policy": format_policy,
             "risk": subject["risk"],
         }
     finally:
@@ -269,14 +344,70 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
 async def search_live_strategy(request: dict[str, Any]) -> dict[str, Any]:
     settings = Settings()
     strategy = request["strategy"]
-    results = await search_searxng(
+    purpose = str(strategy.get("purpose", "broad discovery"))
+    engine_setting = (
+        settings.searxng_science_engines
+        if purpose in {"primary evidence", "falsification"}
+        else settings.searxng_general_engines
+    )
+    engines = tuple(item.strip() for item in engine_setting.split(",") if item.strip())
+    configured_lookback = max(
+        1, int((request.get("freshness_policy") or {}).get("lookback_days", 30))
+    )
+    recent_lookback = configured_lookback if purpose == "broad discovery" else None
+    attempts: list[SearxngSearchResponse] = []
+    first = await search_searxng(
         settings.searxng_endpoint,
         query=str(strategy["query"])[:2000],
         language=str(strategy["language"])[:20],
         policy=DomainPolicy.from_mapping(request.get("domain_policy")),
-        lookback_days=max(1, int((request.get("freshness_policy") or {}).get("lookback_days", 30))),
+        lookback_days=recent_lookback,
+        engines=engines,
     )
-    return {"strategy": strategy, "results": results}
+    attempts.append(first)
+    selected = first
+    fallback_used = False
+    if not first.results and recent_lookback is not None:
+        # A time_range is useful for the news radar but inconsistently supported by
+        # metasearch engines. Retry once without it before declaring the strategy empty.
+        await asyncio.sleep(1.5)
+        selected = await search_searxng(
+            settings.searxng_endpoint,
+            query=str(strategy["query"])[:2000],
+            language=str(strategy["language"])[:20],
+            policy=DomainPolicy.from_mapping(request.get("domain_policy")),
+            lookback_days=None,
+            engines=engines,
+        )
+        attempts.append(selected)
+        fallback_used = True
+
+    responding_engines = sorted(
+        {engine for attempt in attempts for engine in attempt.responding_engines}
+    )
+    failures = {
+        (failure["engine"], failure["reason"])
+        for attempt in attempts
+        for failure in attempt.unresponsive_engines
+    }
+    health = {
+        "status": "degraded" if failures or fallback_used else "healthy",
+        "requested_engines": list(engines),
+        "responding_engines": responding_engines,
+        "unresponsive_engines": [
+            {"engine": engine, "reason": reason} for engine, reason in sorted(failures)
+        ],
+        "freshness_mode": "recent_then_evergreen" if recent_lookback is not None else "evergreen",
+        "time_range": first.time_range,
+        "fallback_used": fallback_used,
+    }
+    if not selected.results and selected.unresponsive_engines:
+        raise ApplicationError(
+            "Metasearch sources were unavailable; an empty result would be unreliable",
+            health,
+            type="SearchBackendUnavailable",
+        )
+    return {"strategy": strategy, "results": list(selected.results), "health": health}
 
 
 @activity.defn(name="persist-live-opportunities")
@@ -292,6 +423,9 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
         for rank, item in enumerate(result_set.get("results", []), start=1)
     ]
     raw_findings = [item for item, _, _ in entries]
+    if _uses_explainer_candidate_filter(request.get("format_policy") or {}):
+        entries = [entry for entry in entries if _is_explainer_candidate(entry[0])]
+    eligible_findings = [item for item, _, _ in entries]
     findings = tuple(
         SearchFinding(
             url=str(item["url"]),
@@ -300,7 +434,7 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
             published_at=item.get("published_at"),
             source_type=str(item.get("source_type", "secondary")),
         )
-        for item in raw_findings
+        for item in eligible_findings
     )
     unique = deduplicate_findings(findings)
     provenance: dict[str, tuple[dict[str, Any], dict[str, Any], int]] = {}
@@ -343,10 +477,14 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
             weights = request.get("opportunity_weights") or {}
             previously_processed_urls = set(
                 await connection.fetchval(
-                    """SELECT coalesce(array_agg(canonical_url), ARRAY[]::text[])
-                       FROM source_documents
-                       WHERE deleted_at IS NULL AND canonical_url = ANY($1::text[])""",
+                    """SELECT coalesce(array_agg(DISTINCT sd.canonical_url), ARRAY[]::text[])
+                       FROM source_documents sd
+                       JOIN opportunity_sources os ON os.source_document_id=sd.id
+                       JOIN opportunities o ON o.id=os.opportunity_id
+                       WHERE sd.deleted_at IS NULL AND o.deleted_at IS NULL
+                         AND o.subject_profile_id=$2 AND sd.canonical_url = ANY($1::text[])""",
                     [finding.canonical_url for finding in unique],
+                    subject_id,
                 )
             )
             processed_rows = await connection.fetch(
@@ -369,6 +507,7 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
             total_unique_domains = len({finding.canonical_url.split("/", 3)[2] for finding in new_unique})
             for cluster in clusters[:25]:
                 representative = cluster.findings[0]
+                cluster_domains = _source_domains(cluster.findings)
                 score = _score_live_cluster(
                     cluster,
                     provenance,
@@ -465,15 +604,51 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
                         now,
                     )
                 opportunity_ids.append(str(opportunity_id))
+            source_health = [
+                result_set.get("health", {})
+                for result_set in result_sets
+                if isinstance(result_set.get("health"), dict)
+            ]
+            engine_failures = {
+                (str(failure.get("engine", "")), str(failure.get("reason", "")))
+                for health in source_health
+                for failure in health.get("unresponsive_engines", [])
+                if isinstance(failure, dict) and str(failure.get("engine", "")).strip()
+            }
             result = {
                 "opportunity_ids": opportunity_ids,
                 "search_strategy_count": len(result_sets),
-                "raw_result_count": len(findings),
+                "raw_result_count": len(raw_findings),
+                "eligible_result_count": len(findings),
+                "relevance_rejected_count": len(raw_findings) - len(findings),
                 "deduplicated_result_count": len(unique),
                 "duplicate_count": len(findings) - len(unique),
                 "previously_processed_count": len(unique) - len(new_unique),
                 "new_candidate_count": len(new_unique),
                 "source_domain_count": total_unique_domains,
+                "search_health": (
+                    "degraded"
+                    if any(health.get("status") == "degraded" for health in source_health)
+                    else "healthy"
+                ),
+                "responding_engines": sorted(
+                    {
+                        str(engine)
+                        for health in source_health
+                        for engine in health.get("responding_engines", [])
+                        if str(engine).strip()
+                    }
+                ),
+                "unresponsive_engines": [
+                    {"engine": engine, "reason": reason}
+                    for engine, reason in sorted(engine_failures)
+                ],
+                "degraded_strategy_count": sum(
+                    health.get("status") == "degraded" for health in source_health
+                ),
+                "fallback_strategy_count": sum(
+                    bool(health.get("fallback_used")) for health in source_health
+                ),
             }
             await connection.execute(
                 """INSERT INTO idempotency_records

@@ -4,10 +4,14 @@ import asyncio
 import hashlib
 import io
 import json
+import re
+from html import unescape
+from html.parser import HTMLParser
 from datetime import datetime, timezone
 from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import aiohttp
 import asyncpg
@@ -15,12 +19,14 @@ from minio import Minio
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from editorial_core.research import chunk_semantic_text
+from editorial_core.discovery import canonicalize_url
+from editorial_core.research import chunk_semantic_text, scholarly_work_identity
 from research_worker.acquisition import (
     DomainPolicy,
     DomainThrottle,
     RobotsDenied,
     acquire_public_source,
+    search_searxng,
 )
 from research_worker.config import Settings
 from research_worker.extraction import extract_source_document
@@ -29,6 +35,557 @@ from research_worker.firecrawl import render_public_html
 
 _settings = Settings()
 _domain_throttle = DomainThrottle(_settings.acquisition_min_domain_interval_seconds)
+
+_PRIMARY_CITATION_PATTERNS = (
+    "doi.org/",
+    "pubmed.ncbi.nlm.nih.gov/",
+    "pmc.ncbi.nlm.nih.gov/articles/",
+    "ncbi.nlm.nih.gov/pmc/articles/",
+    "clinicaltrials.gov/study/",
+    "acpjournals.org/doi/",
+    "nature.com/articles/",
+    "sciencedirect.com/science/article/",
+    "onlinelibrary.wiley.com/doi/",
+    "arxiv.org/abs/",
+    "openalex.org/works/",
+    "api.crossref.org/works/",
+    "ebi.ac.uk/europepmc/",
+)
+_DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+_PUBMED_PATTERN = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", re.IGNORECASE)
+_PMC_PATTERN = re.compile(r"(?:pmc\.ncbi\.nlm\.nih\.gov/articles/|ncbi\.nlm\.nih\.gov/pmc/articles/)(PMC\d+)", re.IGNORECASE)
+_CLINICAL_TRIAL_PATTERN = re.compile(r"clinicaltrials\.gov/study/(NCT\d+)", re.IGNORECASE)
+_ARXIV_PATTERN = re.compile(r"arxiv\.org/abs/([\w.\-/]+)", re.IGNORECASE)
+_AUTHORITATIVE_HOST_PARTS = (
+    ".gov.",
+    ".gov",
+    ".edu",
+    ".ac.",
+    ".int",
+    ".europa.eu",
+    ".bund.de",
+    ".admin.ch",
+    ".gv.at",
+)
+_PRIMARY_TITLE_TERMS = (
+    "study",
+    "studie",
+    "report",
+    "bericht",
+    "dataset",
+    "datensatz",
+    "statistics",
+    "statistik",
+    "standard",
+    "specification",
+    "documentation",
+    "dokumentation",
+    "law",
+    "gesetz",
+    "regulation",
+    "verordnung",
+)
+_RELEVANCE_STOP_WORDS = {
+    "aber",
+    "auch",
+    "bei",
+    "das",
+    "dem",
+    "den",
+    "der",
+    "die",
+    "ein",
+    "eine",
+    "einer",
+    "für",
+    "herausforderungen",
+    "chancen",
+    "deutschland",
+    "germany",
+    "mehr",
+    "mit",
+    "oder",
+    "the",
+    "und",
+    "von",
+    "was",
+    "wie",
+    "with",
+}
+_SOCIAL_OR_EXPORT_HOSTS = {
+    "bibsonomy.org",
+    "www.bibsonomy.org",
+    "reddit.com",
+    "www.reddit.com",
+    "facebook.com",
+    "www.facebook.com",
+    "twitter.com",
+    "x.com",
+}
+_REVIEW_TITLE_TERMS = {"review", "overview", "literature", "vergleich", "meta-analysis"}
+
+
+class _AnchorParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "a" or self._href is not None:
+            return
+        self._href = next(
+            (value for name, value in attrs if name.casefold() == "href"), None
+        )
+        self._text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "a" and self._href is not None:
+            self.links.append((self._href, " ".join("".join(self._text).split())))
+            self._href = None
+            self._text = []
+
+
+def _linked_primary_citations(body: bytes, base_url: str) -> tuple[dict[str, str], ...]:
+    parser = _AnchorParser()
+    parser.feed(body.decode("utf-8", "replace"))
+    citations: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for href, anchor_text in parser.links:
+        absolute = unescape(urljoin(base_url, href)).strip()
+        parsed = urlsplit(absolute)
+        hostname = (parsed.hostname or "").casefold()
+        direct_target = f"{hostname}{parsed.path}".casefold()
+        if hostname in _SOCIAL_OR_EXPORT_HOSTS or not any(
+            pattern in direct_target for pattern in _PRIMARY_CITATION_PATTERNS
+        ):
+            continue
+        try:
+            canonical = canonicalize_url(absolute)
+        except ValueError:
+            continue
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        citations.append(
+            {
+                "url": canonical,
+                "title": anchor_text[:1000]
+                or f"Primary evidence at {urlsplit(canonical).hostname}",
+                "source_type": "primary",
+                "resolution_strategy": "explicit_primary_link",
+            }
+        )
+    decoded = unescape(body.decode("utf-8", "replace"))
+    for match in _DOI_PATTERN.finditer(decoded):
+        doi = match.group(0).rstrip(".,;:)]}\"")
+        canonical = f"https://doi.org/{doi}"
+        if canonical.casefold() in {item.casefold() for item in seen}:
+            continue
+        seen.add(canonical)
+        citations.append(
+            {
+                "url": canonical,
+                "title": f"Primary evidence identified by DOI {doi}",
+                "source_type": "primary",
+                "resolution_strategy": "embedded_doi",
+            }
+        )
+    return tuple(citations[:12])
+
+
+def _doi_from_citation_url(url: str) -> str | None:
+    lowered = url.casefold()
+    marker = "/doi/"
+    if "doi.org/" in lowered:
+        marker = "doi.org/"
+    if marker not in lowered:
+        return None
+    offset = lowered.index(marker) + len(marker)
+    doi = url[offset:].split("?", 1)[0].split("#", 1)[0].strip("/ ")
+    return doi if doi.startswith("10.") and "/" in doi else None
+
+
+def _registry_query_for_citation(citation: dict[str, str]) -> str | None:
+    doi = _doi_from_citation_url(citation["url"])
+    if doi is not None:
+        return f"DOI:{doi}"
+    pubmed_match = _PUBMED_PATTERN.search(citation["url"])
+    if pubmed_match:
+        return f"EXT_ID:{pubmed_match.group(1)}"
+    return None
+
+
+async def _resolve_registry_candidate(
+    session: aiohttp.ClientSession,
+    citation: dict[str, str],
+    *,
+    europe_pmc_endpoint: str = "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+    crossref_endpoint: str = "https://api.crossref.org/works",
+) -> dict[str, str] | None:
+    """Resolve common scholarly identifiers to an acquisition-safe public record.
+
+    Europe PMC is preferred when it indexes the record because its core response
+    includes abstracts and study metadata. Crossref is the discipline-neutral DOI
+    fallback. Direct citations remain available when neither registry has a record.
+    """
+
+    registry_query = _registry_query_for_citation(citation)
+    if registry_query is None:
+        return None
+    query = urlencode({"query": registry_query, "format": "json", "resultType": "core"})
+    europe_pmc_url = f"{europe_pmc_endpoint}?{query}"
+    try:
+        async with session.get(europe_pmc_url) as response:
+            response.raise_for_status()
+            payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        payload = {}
+    if payload.get("hitCount", 0) or payload.get("resultList", {}).get("result"):
+        return {
+            "url": europe_pmc_url,
+            "title": f"Europe PMC primary-study record: {citation['title']}",
+            "source_type": "primary",
+            "resolution_strategy": "europe_pmc_registry",
+        }
+
+    doi = _doi_from_citation_url(citation["url"])
+    if doi is None:
+        return None
+    crossref_url = f"{crossref_endpoint.rstrip('/')}/{quote(doi, safe='')}"
+    try:
+        async with session.get(crossref_url) as response:
+            response.raise_for_status()
+            payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+    if not payload.get("message"):
+        return None
+    return {
+        "url": crossref_url,
+        "title": f"Crossref primary-publication record: {citation['title']}",
+        "source_type": "primary",
+        "resolution_strategy": "crossref_registry",
+    }
+
+
+def _public_api_candidate(citation: dict[str, str]) -> dict[str, str] | None:
+    """Map non-DOI registry links to their public machine-readable record."""
+
+    pmc_match = _PMC_PATTERN.search(citation["url"])
+    if pmc_match:
+        pmcid = pmc_match.group(1).upper()
+        return {
+            "url": f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML",
+            "title": f"Europe PMC full-text record: {citation['title']}",
+            "source_type": "primary",
+            "resolution_strategy": "europe_pmc_full_text",
+        }
+    trial_match = _CLINICAL_TRIAL_PATTERN.search(citation["url"])
+    if trial_match:
+        nct_id = trial_match.group(1).upper()
+        return {
+            "url": f"https://clinicaltrials.gov/api/v2/studies/{nct_id}",
+            "title": f"ClinicalTrials.gov study record: {citation['title']}",
+            "source_type": "primary",
+            "resolution_strategy": "clinicaltrials_api",
+        }
+    arxiv_match = _ARXIV_PATTERN.search(citation["url"])
+    if arxiv_match:
+        identifier = arxiv_match.group(1)
+        return {
+            "url": f"https://export.arxiv.org/api/query?{urlencode({'id_list': identifier})}",
+            "title": f"arXiv primary-paper record: {citation['title']}",
+            "source_type": "primary",
+            "resolution_strategy": "arxiv_api",
+        }
+    return None
+
+
+def _generic_evidence_queries(title: str, summary: str) -> tuple[str, ...]:
+    """Build bounded, language-tolerant evidence and falsification searches."""
+
+    title_terms = [
+        term
+        for term in re.findall(r"[\wÄÖÜäöüß-]{5,}", title, flags=re.UNICODE)
+        if term.casefold() not in _RELEVANCE_STOP_WORDS
+    ][:6]
+    summary_terms = [
+        term
+        for term in re.findall(r"[\wÄÖÜäöüß-]{5,}", summary, flags=re.UNICODE)
+        if term.casefold() not in _RELEVANCE_STOP_WORDS
+        and term.casefold() not in {item.casefold() for item in title_terms}
+    ][:4]
+    concept = " ".join(title_terms or summary_terms)[:240]
+    context = " ".join(summary_terms)[:160]
+    return (
+        f"{concept} original study report data official source Originalquelle Studie Bericht Daten",
+        f"{concept} {context} evidence documentation statistics Beleg Dokumentation Statistik",
+        f"{concept} limitations risks correction critique counterevidence Grenzen Risiken Kritik Gegenbeleg",
+    )
+
+
+def _scholarly_work_identity(url: str, *, doi: str | None = None) -> str | None:
+    return scholarly_work_identity(url, doi=doi or _doi_from_citation_url(url))
+
+
+def _openalex_abstract(work: dict[str, Any]) -> str:
+    inverted = work.get("abstract_inverted_index")
+    if not isinstance(inverted, dict):
+        return ""
+    positioned = [
+        (position, token)
+        for token, positions in inverted.items()
+        if isinstance(token, str) and isinstance(positions, list)
+        for position in positions
+        if isinstance(position, int) and position >= 0
+    ]
+    return " ".join(token for _, token in sorted(positioned))
+
+
+async def _openalex_search_candidates(
+    settings: Settings,
+    *,
+    title: str,
+    summary: str,
+    domain_policy: DomainPolicy,
+    planned_queries: tuple[str, ...] = (),
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Find distinct scholarly works through a discipline-neutral catalog."""
+
+    default_query = _generic_evidence_queries(title, summary)[0].split(" original study", 1)[0]
+    queries = tuple(dict.fromkeys((*planned_queries[:5], default_query)))
+    payloads: list[tuple[str, dict[str, Any]]] = []
+    errors: list[str] = []
+    for query in queries:
+        params = {"search": query, "per-page": "12"}
+        if settings.openalex_mailto:
+            params["mailto"] = settings.openalex_mailto
+        endpoint = settings.openalex_endpoint.rstrip("/") + "/works?" + urlencode(params)
+        try:
+            response = await acquire_public_source(
+                endpoint,
+                user_agent=settings.acquisition_user_agent,
+                policy=domain_policy,
+                throttle=_domain_throttle,
+                maximum_bytes=min(settings.acquisition_max_bytes, 2_000_000),
+            )
+            payloads.append((query, json.loads(response.body)))
+        except (ValueError, aiohttp.ClientError, asyncio.TimeoutError, RobotsDenied) as exc:
+            errors.append(str(exc)[:300])
+    candidates: list[dict[str, str]] = []
+    seen_identities: set[str] = set()
+    for query, payload in payloads:
+      for work in payload.get("results", []):
+        if not isinstance(work, dict):
+            continue
+        work_id = str(work.get("id", "")).rsplit("/", 1)[-1]
+        display_name = str(work.get("display_name", "")).strip()
+        if not re.fullmatch(r"W\d+", work_id, re.I) or not display_name:
+            continue
+        abstract = _openalex_abstract(work)
+        relevance_score, shared_title_terms = _candidate_relevance(
+            title, summary, display_name, abstract
+        )
+        query_relevance, shared_query_terms = _candidate_relevance(
+            query, "", display_name, abstract
+        )
+        if (
+            (shared_title_terms < 1 or relevance_score < 0.10)
+            and (shared_query_terms < 2 or query_relevance < 0.12)
+        ):
+            continue
+        doi = str(work.get("doi") or "") or None
+        work_identity = _scholarly_work_identity(str(work.get("id", "")), doi=doi)
+        if work_identity is None or work_identity in seen_identities:
+            continue
+        seen_identities.add(work_identity)
+        lowered_title = display_name.casefold()
+        source_type = (
+            "secondary"
+            if any(term in lowered_title for term in _REVIEW_TITLE_TERMS)
+            else "original study"
+        )
+        candidates.append(
+            {
+                "url": f"{settings.openalex_endpoint.rstrip('/')}/works/{work_id}",
+                "title": display_name[:1000],
+                "source_type": source_type,
+                "resolution_strategy": "openalex_scholarly_catalog",
+                "relevance_score": f"{max(relevance_score, query_relevance):.3f}",
+                "work_identity": work_identity,
+                "source_role": "independent_scholarly_work",
+                "catalog_query": query,
+            }
+        )
+        if len(candidates) >= 8:
+            break
+      if len(candidates) >= 8:
+          break
+    return candidates, {
+        "catalog": "openalex",
+        "queries": list(queries),
+        "result_count": sum(len(payload.get("results", [])) for _, payload in payloads),
+        "accepted_count": len(candidates),
+        "errors": errors,
+    }
+
+
+def _classify_search_candidate(url: str, title: str, summary: str) -> str:
+    lowered_url = url.casefold()
+    lowered_text = f"{title} {summary}".casefold()
+    if any(pattern in lowered_url for pattern in _PRIMARY_CITATION_PATTERNS):
+        return "primary"
+    hostname = (urlsplit(url).hostname or "").casefold()
+    authoritative = any(part in f".{hostname}" for part in _AUTHORITATIVE_HOST_PARTS)
+    primary_document = any(term in lowered_text for term in _PRIMARY_TITLE_TERMS)
+    if authoritative and primary_document:
+        return "primary"
+    if authoritative:
+        return "authoritative"
+    return "secondary"
+
+
+def _relevance_tokens(value: str) -> set[str]:
+    return {
+        token.casefold()
+        for token in re.findall(r"[\wÄÖÜäöüß-]{4,}", value, flags=re.UNICODE)
+        if token.casefold() not in _RELEVANCE_STOP_WORDS
+    }
+
+
+def _candidate_relevance(
+    opportunity_title: str,
+    opportunity_summary: str,
+    candidate_title: str,
+    candidate_summary: str,
+) -> tuple[float, int]:
+    central = _relevance_tokens(opportunity_title)
+    context = central | _relevance_tokens(opportunity_summary)
+    candidate = _relevance_tokens(f"{candidate_title} {candidate_summary}")
+    shared_central = central & candidate
+    shared_context = context & candidate
+    if not central:
+        return 0.0, 0
+    score = min(
+        1.0,
+        (len(shared_central) / len(central)) * 0.8
+        + (len(shared_context) / max(1, len(context))) * 0.2,
+    )
+    return score, len(shared_central)
+
+
+async def _generic_search_candidates(
+    settings: Settings,
+    *,
+    title: str,
+    summary: str,
+    language: str,
+    domain_policy: DomainPolicy,
+    planned_queries: tuple[str, ...] = (),
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    engines = tuple(
+        dict.fromkeys(
+            part.strip()
+            for part in (
+                settings.searxng_general_engines + "," + settings.searxng_science_engines
+            ).split(",")
+            if part.strip()
+        )
+    )
+    queries = tuple(
+        dict.fromkeys((*planned_queries[:5], *_generic_evidence_queries(title, summary)))
+    )[:6]
+    query_outcomes: list[Any] = []
+    for query in queries:
+        try:
+            query_outcomes.append(
+                await search_searxng(
+                    settings.searxng_endpoint,
+                    query=query,
+                    language=language,
+                    policy=domain_policy,
+                    maximum_results=5,
+                    engines=engines,
+                )
+            )
+        except Exception as exc:  # recorded below as bounded source-health evidence
+            query_outcomes.append(exc)
+        if query != queries[-1]:
+            await asyncio.sleep(1)
+    openalex_candidates, openalex_health = await _openalex_search_candidates(
+        settings,
+        title=title,
+        summary=summary,
+        domain_policy=domain_policy,
+        planned_queries=planned_queries,
+    )
+    candidates: list[dict[str, str]] = []
+    health: list[dict[str, Any]] = [openalex_health]
+    seen: set[str] = set()
+    seen_identities: set[str] = set()
+    for candidate in openalex_candidates:
+        seen.add(candidate["url"])
+        if candidate.get("work_identity"):
+            seen_identities.add(candidate["work_identity"])
+        candidates.append(candidate)
+    for query, outcome in zip(
+        queries, query_outcomes, strict=True
+    ):
+        if isinstance(outcome, BaseException):
+            health.append({"query": query, "error": str(outcome)[:300]})
+            continue
+        health.append(
+            {
+                "query": query,
+                "requested_engines": list(outcome.requested_engines),
+                "responding_engines": list(outcome.responding_engines),
+                "unresponsive_engines": list(outcome.unresponsive_engines),
+                "result_count": len(outcome.results),
+            }
+        )
+        for result in outcome.results:
+            url = str(result["url"])
+            if url in seen:
+                continue
+            work_identity = _scholarly_work_identity(url)
+            if work_identity and work_identity in seen_identities:
+                continue
+            seen.add(url)
+            relevance_score, shared_title_terms = _candidate_relevance(
+                title,
+                summary,
+                str(result["title"]),
+                str(result.get("summary", "")),
+            )
+            minimum_shared_terms = 1 if len(_relevance_tokens(title)) <= 3 else 2
+            if relevance_score < 0.32 or shared_title_terms < minimum_shared_terms:
+                continue
+            candidates.append(
+                {
+                    "url": url,
+                    "title": str(result["title"]),
+                    "source_type": _classify_search_candidate(
+                        url, str(result["title"]), str(result.get("summary", ""))
+                    ),
+                    "resolution_strategy": "generic_evidence_search",
+                    "relevance_score": f"{relevance_score:.3f}",
+                    "work_identity": work_identity,
+                    "source_role": "independent_web_evidence",
+                }
+            )
+            if work_identity:
+                seen_identities.add(work_identity)
+            if len(candidates) >= 12:
+                break
+        if len(candidates) >= 12:
+            break
+    return candidates, health
 
 
 def _json(value: Any) -> Any:
@@ -339,6 +896,213 @@ async def acquire_source_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 now,
             )
         return result
+    finally:
+        await connection.close()
+
+
+@activity.defn(name="discover-linked-primary-sources")
+async def discover_linked_primary_sources(request: dict[str, Any]) -> dict[str, Any]:
+    """Enrich any opportunity with linked and independently searched evidence."""
+
+    settings = Settings()
+    opportunity_id = UUID(str(request["opportunity_id"]))
+    snapshots = request.get("snapshots", [])
+    client = Minio(
+        settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        secure=False,
+    )
+    connection = await asyncpg.connect(settings.database_dsn)
+    try:
+        context = await connection.fetchrow(
+            """SELECT o.title, o.summary, s.languages, s.domain_policy
+               FROM opportunities o
+               JOIN subject_profiles s ON s.id=o.subject_profile_id
+               WHERE o.id=$1 AND o.deleted_at IS NULL AND s.deleted_at IS NULL""",
+            opportunity_id,
+        )
+        if context is None:
+            raise ApplicationError("opportunity does not exist", non_retryable=True)
+        existing_urls = set(
+            await connection.fetchval(
+                """SELECT coalesce(array_agg(sd.canonical_url), ARRAY[]::text[])
+                   FROM opportunity_sources os
+                   JOIN source_documents sd ON sd.id=os.source_document_id
+                   WHERE os.opportunity_id=$1""",
+                opportunity_id,
+            )
+        )
+        existing_identities: set[str] = set()
+        existing_rows = await connection.fetch(
+            """SELECT sd.canonical_url,sd.reputation
+               FROM opportunity_sources os
+               JOIN source_documents sd ON sd.id=os.source_document_id
+               WHERE os.opportunity_id=$1""",
+            opportunity_id,
+        )
+        for existing in existing_rows:
+            reputation = _json(existing["reputation"]) or {}
+            identity = reputation.get("work_identity") or _scholarly_work_identity(
+                str(existing["canonical_url"])
+            )
+            if identity:
+                existing_identities.add(str(identity))
+        candidates: list[dict[str, str]] = []
+        for snapshot in snapshots:
+            if str(snapshot.get("content_type", "")).split(";", 1)[0] not in {
+                "text/html",
+                "application/xhtml+xml",
+            }:
+                continue
+            raw_object_key = await connection.fetchval(
+                "SELECT raw_object_key FROM source_snapshots WHERE id=$1",
+                UUID(str(snapshot["source_snapshot_id"])),
+            )
+            if raw_object_key is None:
+                continue
+            response = await asyncio.to_thread(
+                client.get_object, settings.minio_bucket, raw_object_key
+            )
+            try:
+                body = await asyncio.to_thread(response.read)
+            finally:
+                response.close()
+                response.release_conn()
+            candidates.extend(_linked_primary_citations(body, str(snapshot["final_url"])))
+
+        languages = _json(context["languages"]) or ["all"]
+        search_plan = request.get("evidence_search_plan") or {}
+        planned_queries = tuple(
+            str(item.get("query", "")).strip()
+            for item in search_plan.get("queries", [])
+            if str(item.get("query", "")).strip()
+        )
+        searched_candidates, search_health = await _generic_search_candidates(
+            settings,
+            title=str(context["title"]),
+            summary=str(context["summary"]),
+            language=str(languages[0]),
+            domain_policy=DomainPolicy.from_mapping(_json(context["domain_policy"])),
+            planned_queries=planned_queries,
+        )
+        candidates.extend(searched_candidates)
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers={"User-Agent": settings.acquisition_user_agent},
+        ) as http_session:
+            registry_candidates = await asyncio.gather(
+                *[
+                    _resolve_registry_candidate(http_session, candidate)
+                    for candidate in candidates
+                ]
+            )
+        candidates.extend(
+            candidate for candidate in registry_candidates if candidate is not None
+        )
+        candidates.extend(
+            resolved
+            for candidate in tuple(candidates)
+            if (resolved := _public_api_candidate(candidate)) is not None
+        )
+
+        now = datetime.now(timezone.utc)
+        linked: list[dict[str, str]] = []
+        async with connection.transaction():
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"research.citation_enrichment:{opportunity_id}",
+            )
+            next_rank = int(
+                await connection.fetchval(
+                    """SELECT COALESCE(MAX(result_rank),0)+1
+                       FROM opportunity_sources WHERE opportunity_id=$1""",
+                    opportunity_id,
+                )
+            )
+            for candidate in candidates:
+                if candidate["url"] in existing_urls:
+                    continue
+                work_identity = candidate.get("work_identity") or _scholarly_work_identity(
+                    candidate["url"]
+                )
+                if work_identity and work_identity in existing_identities:
+                    continue
+                hostname = urlsplit(candidate["url"]).hostname or ""
+                source_id = await connection.fetchval(
+                    """INSERT INTO source_documents
+                    (id,version,created_at,updated_at,deleted_at,canonical_url,title,author,
+                     publisher,source_type,publication_at,event_at,reputation,domain)
+                    VALUES($1,1,$2,$2,NULL,$3,$4,NULL,$5,$6,NULL,NULL,$7::jsonb,$8)
+                    ON CONFLICT (canonical_url) DO UPDATE SET updated_at=source_documents.updated_at
+                    RETURNING id""",
+                    uuid4(),
+                    now,
+                    candidate["url"],
+                    candidate["title"],
+                    hostname,
+                    candidate.get("source_type", "secondary"),
+                    json.dumps(
+                        {
+                            "discovered_via": candidate.get(
+                                "resolution_strategy", "linked_primary_citation"
+                            ),
+                            "popularity_is_proof": False,
+                            "not_yet_acquired": True,
+                            "relevance_score": candidate.get("relevance_score"),
+                            "work_identity": work_identity,
+                            "source_role": candidate.get("source_role"),
+                        }
+                    ),
+                    hostname,
+                )
+                link_id = await connection.fetchval(
+                    """INSERT INTO opportunity_sources
+                    (id,opportunity_id,source_document_id,search_purpose,search_query,
+                     result_rank,snippet,created_at)
+                    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                    ON CONFLICT (opportunity_id,source_document_id) DO NOTHING
+                    RETURNING id""",
+                    uuid4(),
+                    opportunity_id,
+                    source_id,
+                    (
+                        "generic evidence enrichment"
+                        if candidate.get("resolution_strategy") == "generic_evidence_search"
+                        else "linked primary evidence"
+                    ),
+                    json.dumps(
+                        {
+                            "strategy": candidate.get(
+                                "resolution_strategy", "linked_primary_citation"
+                            ),
+                            "relevance_score": candidate.get("relevance_score"),
+                        }
+                    ),
+                    next_rank,
+                    candidate["title"],
+                    now,
+                )
+                if link_id is None:
+                    continue
+                existing_urls.add(candidate["url"])
+                if work_identity:
+                    existing_identities.add(work_identity)
+                linked.append(
+                    {
+                        "source_document_id": str(source_id),
+                        "url": candidate["url"],
+                        "title": candidate["title"],
+                    }
+                )
+                next_rank += 1
+        return {
+            "sources": linked,
+            "linked_source_count": len(linked),
+            "search_health": search_health,
+        }
     finally:
         await connection.close()
 

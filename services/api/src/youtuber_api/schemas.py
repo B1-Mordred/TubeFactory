@@ -10,13 +10,22 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from editorial_core.authorization import Role
+from editorial_core.branding import normalize_brand_kit
 from editorial_core.channel_workflow import channel_automation_workflow
+from editorial_core.explanation_readiness import explanation_policy
 from editorial_core.operating_policy import evaluate_operating_policy
 from editorial_core.publishing import PublishMode
 
 
 class StrictRequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticContinuation(BaseModel):
+    state: Literal["started", "completed", "awaiting_input", "not_applicable", "reconciled"]
+    action: str
+    workflow_id: str | None = None
+    message: str
 
 
 class AnalyticsSnapshotWrite(StrictRequestModel):
@@ -48,7 +57,15 @@ class BenchmarkCandidateWrite(StrictRequestModel):
 
 
 class ModelBenchmarkWrite(StrictRequestModel):
-    task_type: Literal["script_writer", "script_verifier", "storyboard"]
+    task_type: Literal[
+        "script_writer",
+        "script_verifier",
+        "storyboard",
+        "topic_qualifier",
+        "research_query_planner",
+        "evidence_synthesizer",
+        "evidence_reviewer",
+    ]
     suite_key: str = Field(min_length=3, max_length=160, pattern=r"^[a-z][a-z0-9_.-]*$")
     suite_version: str = Field(min_length=1, max_length=80)
     candidates: list[BenchmarkCandidateWrite] = Field(min_length=2, max_length=50)
@@ -229,6 +246,9 @@ class PublicationApprovalWrite(StrictRequestModel):
     expected_metadata_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     decision: Literal["approved", "rejected"]
     comment: str = Field(min_length=10, max_length=4000)
+    connection_id: UUID | None = None
+    mode: PublishMode | None = None
+    publish_at: datetime | None = None
 
 
 class PublicationApprovalView(BaseModel):
@@ -243,6 +263,7 @@ class PublicationApprovalView(BaseModel):
     actor_id: UUID
     correlation_id: str
     created_at: datetime
+    automatic_continuation: AutomaticContinuation | None = None
 
 
 class PublicationStart(StrictRequestModel):
@@ -516,6 +537,11 @@ class ChannelProfileWrite(StrictRequestModel):
         channel_automation_workflow(value)
         return value
 
+    @model_validator(mode="after")
+    def normalized_brand_kit(self) -> "ChannelProfileWrite":
+        self.brand_kit = normalize_brand_kit(self.brand_kit, channel_name=self.name)
+        return self
+
 
 class ChannelProfileUpdate(ChannelProfileWrite):
     expected_version: int = Field(ge=1)
@@ -620,6 +646,16 @@ class SubjectProfileWrite(StrictRequestModel):
             "evidence_density_minimum": float(density),
             "repeated_scene_limit": repetition,
         }
+        policy = explanation_policy(self.format_policy, self.approval_profile)
+        self.format_policy = {
+            **self.format_policy,
+            "duration_seconds": policy.target_duration_seconds,
+            "minimum_duration_seconds": policy.minimum_duration_seconds,
+            "maximum_duration_seconds": policy.maximum_duration_seconds,
+            "speaking_rate_wpm": policy.speaking_rate_wpm,
+            "max_enrichment_rounds": policy.maximum_enrichment_rounds,
+            "minimum_coverage_units": policy.minimum_coverage_units,
+        }
         return self
 
 
@@ -705,6 +741,28 @@ class OpportunityDecisionView(BaseModel):
     version: int
     decision_reason: str | None
     decided_at: datetime | None
+    automatic_continuation: AutomaticContinuation | None = None
+
+
+class ScoredOpportunityArchiveWrite(StrictRequestModel):
+    subject_profile_id: UUID
+    reason: str = Field(min_length=10, max_length=4000)
+
+
+class ScoredOpportunityArchiveView(BaseModel):
+    subject_profile_id: UUID
+    archived_count: int = Field(ge=0)
+    blocked_count: int = Field(ge=0)
+    archived_at: datetime
+
+
+class AllOpportunityArchiveWrite(StrictRequestModel):
+    reason: str = Field(min_length=10, max_length=4000)
+
+
+class AllOpportunityArchiveView(BaseModel):
+    archived_count: int = Field(ge=0)
+    archived_at: datetime
 
 
 class ResearchWorkflowView(BaseModel):
@@ -885,7 +943,23 @@ class AIUsageView(BaseModel):
     created_at: datetime
 
 
-EditorialTaskType = Literal["script_writer", "script_verifier", "storyboard"]
+EditorialTaskType = Literal[
+    "script_writer",
+    "script_verifier",
+    "storyboard",
+    "topic_qualifier",
+    "research_query_planner",
+    "evidence_synthesizer",
+    "evidence_reviewer",
+]
+
+
+class ProviderModelDiscoveryView(BaseModel):
+    provider_id: UUID
+    provider_name: str
+    driver_type: str
+    models: list[str]
+    model_count: int
 
 
 class TaskModelAssignmentWrite(StrictRequestModel):
@@ -972,6 +1046,7 @@ class OpportunityListItem(BaseModel):
     score_penalties: dict[str, float]
     score_weights: dict[str, float] = Field(default_factory=dict)
     score_reasoning: list[str]
+    ai_qualification: dict[str, Any] | None = None
     source_count: int = Field(ge=0)
     snapshot_count: int = Field(ge=0)
     research_state: str | None = None
@@ -987,6 +1062,10 @@ class OpportunityListItem(BaseModel):
         return value
 
 
+class ArchivedOpportunityListItem(OpportunityListItem):
+    archived_at: datetime
+
+
 class DossierListItem(BaseModel):
     id: UUID
     opportunity_id: UUID
@@ -996,6 +1075,7 @@ class DossierListItem(BaseModel):
     executive_summary: str
     completion_evaluation: dict[str, Any]
     created_at: datetime
+    automatic_continuation: AutomaticContinuation | None = None
 
 
 class ClaimLedgerItem(BaseModel):
@@ -1006,11 +1086,13 @@ class ClaimLedgerItem(BaseModel):
     status: str
     risk: str
     central: bool
+    coverage_unit_ids: list[str] = Field(default_factory=list)
     version: int
     evidence: list[dict[str, Any]]
 
 
 class DossierDetail(DossierListItem):
+    explanation_plan: list[dict[str, Any]] = Field(default_factory=list)
     chronology: list[dict[str, Any]]
     unresolved_questions: list[str]
     alternative_explanations: list[str]
@@ -1019,6 +1101,7 @@ class DossierDetail(DossierListItem):
     prohibited_overstatements: list[str]
     proposed_angles: list[str]
     claims: list[ClaimLedgerItem]
+    ai_evidence_assessment: dict[str, Any] | None = None
 
 
 class SourceSnapshotView(BaseModel):
@@ -1099,6 +1182,24 @@ class ScriptGenerationStart(StrictRequestModel):
     idempotency_key: str = Field(
         min_length=8, max_length=120, pattern=r"^[a-zA-Z0-9_.:-]+$"
     )
+
+
+class ExistingResearchScriptImportStart(StrictRequestModel):
+    opportunity_id: UUID
+    title: str = Field(min_length=1, max_length=300)
+    script_text: str = Field(min_length=200, max_length=50_000)
+    sensitivity: Literal["public", "internal", "sensitive", "restricted"] = "internal"
+    idempotency_key: str = Field(
+        min_length=8, max_length=120, pattern=r"^[a-zA-Z0-9_.:-]+$"
+    )
+
+    @field_validator("title", "script_text")
+    @classmethod
+    def nonempty_import_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must contain non-whitespace text")
+        return normalized
 
 
 class StoryboardGenerationStart(StrictRequestModel):
@@ -1365,6 +1466,7 @@ class MediaProductionView(BaseModel):
     qa: dict[str, Any] | None
     findings: list[QAFindingView]
     approval: dict[str, Any] | None
+    automatic_continuation: AutomaticContinuation | None = None
 
 
 class QAOverrideWrite(StrictRequestModel):
@@ -1393,6 +1495,7 @@ class ScriptSummaryView(BaseModel):
 class ScriptDetailView(ScriptSummaryView):
     verification_report: dict[str, Any]
     segments: list[dict[str, Any]]
+    automatic_continuation: AutomaticContinuation | None = None
 
 
 class StoryboardSummaryView(BaseModel):
@@ -1409,3 +1512,4 @@ class StoryboardSummaryView(BaseModel):
 class StoryboardDetailView(StoryboardSummaryView):
     script_version_id: UUID
     scenes: list[dict[str, Any]]
+    automatic_continuation: AutomaticContinuation | None = None

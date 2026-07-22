@@ -19,6 +19,9 @@ class Settings:
     temporal_namespace: str = os.getenv("TEMPORAL_NAMESPACE", "default")
     task_queue: str = os.getenv("EDITORIAL_TASK_QUEUE", "editorial-production-v2")
     health_port: int = int(os.getenv("HEALTH_PORT", "8083"))
+    model_request_timeout_seconds: int = int(
+        os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", "1800")
+    )
     database_host: str = os.getenv("DATABASE_HOST", "postgres")
     database_name: str = os.getenv("DATABASE_NAME", "youtuber")
     database_user: str = os.getenv("DATABASE_USER", "youtuber")

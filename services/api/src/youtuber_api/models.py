@@ -272,6 +272,25 @@ class OpportunityScoreModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class OpportunityAIQualificationModel(Base):
+    __tablename__ = "opportunity_ai_qualifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    opportunity_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("opportunities.id"))
+    qualification_version: Mapped[int] = mapped_column(Integer)
+    workflow_id: Mapped[str] = mapped_column(String(240))
+    model_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("models.id"))
+    prompt_template_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("prompt_templates.id"))
+    rubric_version: Mapped[str] = mapped_column(String(80))
+    dimensions: Mapped[dict[str, float]] = mapped_column(JSONB)
+    confidence: Mapped[float] = mapped_column(Float)
+    abstained: Mapped[bool] = mapped_column(Boolean)
+    rationale: Mapped[list[str]] = mapped_column(JSONB)
+    uncertainty: Mapped[list[str]] = mapped_column(JSONB)
+    resulting_score_version: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ResearchRunModel(VersionedModelMixin, Base):
     __tablename__ = "research_runs"
 
@@ -401,6 +420,7 @@ class ResearchDossierModel(VersionedModelMixin, Base):
     safe_conclusions: Mapped[list[str]] = mapped_column(JSONB)
     prohibited_overstatements: Mapped[list[str]] = mapped_column(JSONB)
     proposed_angles: Mapped[list[str]] = mapped_column(JSONB)
+    explanation_plan: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
     completion_evaluation: Mapped[dict[str, Any]] = mapped_column(JSONB)
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -416,6 +436,7 @@ class ClaimModel(VersionedModelMixin, Base):
     scope: Mapped[str] = mapped_column(Text)
     relevant_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     entities: Mapped[list[str]] = mapped_column(JSONB)
+    coverage_unit_ids: Mapped[list[str]] = mapped_column(JSONB, default=list)
     confidence: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(30))
     risk: Mapped[str] = mapped_column(String(20))
@@ -471,6 +492,26 @@ class ProviderModel(VersionedModelMixin, Base):
     requests_per_minute: Mapped[int] = mapped_column(Integer)
     health_status: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+
+
+class DossierAIAssessmentModel(Base):
+    __tablename__ = "dossier_ai_assessments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    research_dossier_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("research_dossiers.id"))
+    assessment_version: Mapped[int] = mapped_column(Integer)
+    workflow_id: Mapped[str] = mapped_column(String(240))
+    model_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("models.id"))
+    prompt_template_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("prompt_templates.id"))
+    rubric_version: Mapped[str] = mapped_column(String(80))
+    claim_assessments: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    source_assessments: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    methodological_limits: Mapped[list[str]] = mapped_column(JSONB)
+    counterevidence_gaps: Mapped[list[str]] = mapped_column(JSONB)
+    confidence: Mapped[float] = mapped_column(Float)
+    abstained: Mapped[bool] = mapped_column(Boolean)
+    uncertainty: Mapped[list[str]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class AIModelModel(VersionedModelMixin, Base):

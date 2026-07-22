@@ -34,7 +34,7 @@ from youtuber_api.models import (
 from youtuber_api.publishing_crypto import encrypt_publication_secret, secret_fingerprint
 from youtuber_api.publishing_gateway import TemporalPublishingGateway
 from youtuber_api.schemas import (
-    MockYouTubeConnectionWrite, PublicationApprovalView, PublicationApprovalWrite,
+    AutomaticContinuation, MockYouTubeConnectionWrite, PublicationApprovalView, PublicationApprovalWrite,
     PublicationScheduleWrite, PublicationStart, PublicationView,
     PublishMetadataView, PublishMetadataWrite, PublishingConfigurationView,
     PublishingConfigurationWrite, YouTubeConnectionView, YouTubeOAuthStart,
@@ -417,7 +417,23 @@ async def create_metadata(
 
 @router.get("/metadata", response_model=list[PublishMetadataView])
 async def list_metadata(_: Viewer, session: Annotated[AsyncSession, Depends(get_session)]):
-    return [_metadata_view(item) for item in await session.scalars(select(PublishMetadataVersionModel).order_by(PublishMetadataVersionModel.created_at.desc()).limit(100))]
+    statement = (
+        select(PublishMetadataVersionModel)
+        .join(ProductionRenderModel, ProductionRenderModel.id == PublishMetadataVersionModel.render_id)
+        .join(MediaProductionModel, MediaProductionModel.id == ProductionRenderModel.production_id)
+        .join(StoryboardVersionModel, StoryboardVersionModel.id == MediaProductionModel.storyboard_version_id)
+        .join(StoryboardModel, StoryboardModel.id == StoryboardVersionModel.storyboard_id)
+        .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
+        .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+        .where(
+            StoryboardModel.deleted_at.is_(None),
+            ScriptModel.deleted_at.is_(None),
+            OpportunityModel.deleted_at.is_(None),
+        )
+        .order_by(PublishMetadataVersionModel.created_at.desc())
+        .limit(100)
+    )
+    return [_metadata_view(item) for item in await session.scalars(statement)]
 
 
 @router.post("/approvals", response_model=PublicationApprovalView)
@@ -437,8 +453,98 @@ async def approve_release(
     )
     session.add(item)
     await append_audit(session, action=f"publishing.{payload.purpose}_{payload.decision}", actor_id=actor.id, target_type="publication_approval", target_id=str(item.id), correlation_id=request.state.correlation_id, context={"render_hash": render.content_hash, "metadata_hash": metadata.content_hash, **release_evidence})
+    continuation: AutomaticContinuation | None = None
+    if payload.decision == "approved" and payload.purpose == "private_upload":
+        connection = await session.get(YouTubeConnectionModel, payload.connection_id) if payload.connection_id else None
+        if connection is None:
+            channel_id = await _render_channel_id(session, render)
+            connections = list(
+                await session.scalars(
+                    select(YouTubeConnectionModel).where(
+                        YouTubeConnectionModel.channel_profile_id == channel_id,
+                        YouTubeConnectionModel.enabled.is_(True),
+                        YouTubeConnectionModel.status == "active",
+                    )
+                )
+            )
+            connection = connections[0] if len(connections) == 1 else None
+        if connection is None:
+            continuation = AutomaticContinuation(
+                state="awaiting_input",
+                action="private_upload",
+                message="Private-upload approval is recorded, but exactly one active channel connection must be selected.",
+            )
+        else:
+            selected_mode = payload.mode or PublishMode.DRY_RUN
+            publication = await start_upload(
+                PublicationStart(
+                    connection_id=connection.id,
+                    render_id=render.id,
+                    expected_render_hash=render.content_hash,
+                    metadata_version_id=metadata.id,
+                    expected_metadata_hash=metadata.content_hash,
+                    mode=selected_mode,
+                    idempotency_key=f"approval-{item.id.hex}",
+                ),
+                request,
+                actor,
+                session,
+            )
+            continuation = AutomaticContinuation(
+                state="started",
+                action="private_upload",
+                workflow_id=publication.workflow_id,
+                message=f"{selected_mode.value.replace('_', '-').title()} private upload started automatically.",
+            )
+    elif payload.decision == "approved" and payload.purpose == "public_release":
+        publication = await session.scalar(
+            select(PublicationModel)
+            .where(
+                PublicationModel.render_id == render.id,
+                PublicationModel.render_hash == render.content_hash,
+                PublicationModel.metadata_version_id == metadata.id,
+                PublicationModel.metadata_hash == metadata.content_hash,
+                PublicationModel.mode == "real",
+                PublicationModel.youtube_video_id.is_not(None),
+            )
+            .order_by(PublicationModel.created_at.desc())
+            .limit(1)
+        )
+        if publication is None or payload.publish_at is None:
+            continuation = AutomaticContinuation(
+                state="awaiting_input",
+                action="publication_schedule",
+                message=(
+                    "Public-release approval is recorded, but a completed real private upload and future publication time are required."
+                ),
+            )
+        else:
+            scheduled = await schedule_publication(
+                publication.id,
+                PublicationScheduleWrite(publish_at=payload.publish_at),
+                request,
+                actor,
+                session,
+            )
+            continuation = AutomaticContinuation(
+                state="started",
+                action="publication_schedule",
+                workflow_id=str(scheduled["workflow_id"]),
+                message="The approved public release was scheduled automatically for the selected time.",
+            )
+    if continuation:
+        await append_audit(
+            session,
+            action=f"automation.publication_{continuation.state}",
+            actor_id=actor.id,
+            target_type="publication_approval",
+            target_id=str(item.id),
+            correlation_id=request.state.correlation_id,
+            context=continuation.model_dump(mode="json"),
+        )
     await session.commit()
-    return PublicationApprovalView.model_validate(item, from_attributes=True)
+    view = PublicationApprovalView.model_validate(item, from_attributes=True)
+    return view.model_copy(update={"automatic_continuation": continuation})
 
 
 @router.post("/uploads", response_model=PublicationView, status_code=202)
@@ -499,7 +605,23 @@ async def start_upload(
 
 @router.get("/uploads", response_model=list[PublicationView])
 async def list_uploads(_: Viewer, session: Annotated[AsyncSession, Depends(get_session)]):
-    return [_publication_view(item) for item in await session.scalars(select(PublicationModel).order_by(PublicationModel.created_at.desc()).limit(100))]
+    statement = (
+        select(PublicationModel)
+        .join(ProductionRenderModel, ProductionRenderModel.id == PublicationModel.render_id)
+        .join(MediaProductionModel, MediaProductionModel.id == ProductionRenderModel.production_id)
+        .join(StoryboardVersionModel, StoryboardVersionModel.id == MediaProductionModel.storyboard_version_id)
+        .join(StoryboardModel, StoryboardModel.id == StoryboardVersionModel.storyboard_id)
+        .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
+        .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+        .where(
+            StoryboardModel.deleted_at.is_(None),
+            ScriptModel.deleted_at.is_(None),
+            OpportunityModel.deleted_at.is_(None),
+        )
+        .order_by(PublicationModel.created_at.desc())
+        .limit(100)
+    )
+    return [_publication_view(item) for item in await session.scalars(statement)]
 
 
 @router.get("/uploads/{publication_id}", response_model=PublicationView)

@@ -48,6 +48,21 @@ def test_channel_workflow_requires_every_safety_gate() -> None:
         channel_automation_workflow(rules)
 
 
+def test_automatic_source_brief_replaces_only_the_dossier_human_gate() -> None:
+    rules = valid_rules()
+    rules["automation_workflow"]["research_review"] = "automatic_source_brief"
+    rules["automation_workflow"]["human_gates"].remove("dossier_approval")
+
+    workflow = channel_automation_workflow(rules)
+
+    assert workflow is not None
+    assert workflow.research_review == "automatic_source_brief"
+
+    rules["automation_workflow"]["human_gates"].remove("script_approval")
+    with pytest.raises(ValueError, match="script_approval"):
+        channel_automation_workflow(rules)
+
+
 def test_channel_workflow_rejects_missing_or_oversized_prompts() -> None:
     rules = valid_rules()
     del rules["automation_workflow"]["prompts"]["storyboard"]

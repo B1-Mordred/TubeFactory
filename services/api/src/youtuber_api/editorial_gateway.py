@@ -9,8 +9,20 @@ from youtuber_api.research_gateway import TemporalResearchGateway
 
 
 class TemporalEditorialGateway(TemporalResearchGateway):
+    async def discover_provider_models(self, request: dict[str, Any]) -> dict[str, Any]:
+        handle = await self.client.start_workflow(
+            "provider-model-discovery",
+            request,
+            id=str(request["workflow_id"]),
+            task_queue=self.settings.temporal_editorial_task_queue,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        )
+        return await handle.result()
+
     async def start(self, workflow_type: str, request: dict[str, Any]) -> str:
         if workflow_type not in {
+            "script-import-existing-research",
             "script-generation",
             "script-regeneration",
             "script-verification",

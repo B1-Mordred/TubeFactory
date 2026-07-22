@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 
 CHANNEL_WORKFLOW_TASKS = ("script_writer", "script_verifier", "storyboard")
+RESEARCH_REVIEW_MODES = frozenset({"human_dossier", "automatic_source_brief"})
 REQUIRED_HUMAN_GATES = frozenset(
     {
         "opportunity_shortlist",
@@ -16,6 +17,7 @@ REQUIRED_HUMAN_GATES = frozenset(
         "publication_approval",
     }
 )
+AUTOMATIC_SOURCE_BRIEF_HUMAN_GATES = REQUIRED_HUMAN_GATES - {"dossier_approval"}
 _KEY = re.compile(r"^[a-z][a-z0-9_.-]{2,159}$")
 _STAGE_MODES = {"automatic", "human_gate", "assisted"}
 _SAFETY_PREFIX = (
@@ -41,6 +43,7 @@ class ChannelAutomationWorkflow:
     enabled: bool
     language: str
     summary: str
+    research_review: str
     prompts: Mapping[str, str]
     stages: tuple[ChannelWorkflowStage, ...]
     human_gates: tuple[str, ...]
@@ -89,6 +92,11 @@ def channel_automation_workflow(
         raise ValueError("automation_workflow.enabled must be a boolean")
     language = _required_text(raw.get("language"), "automation_workflow.language", minimum=2, maximum=20).lower()
     summary = _required_text(raw.get("summary"), "automation_workflow.summary", minimum=20, maximum=1000)
+    research_review = raw.get("research_review", "human_dossier")
+    if research_review not in RESEARCH_REVIEW_MODES:
+        raise ValueError(
+            "automation_workflow.research_review must be human_dossier or automatic_source_brief"
+        )
 
     raw_prompts = raw.get("prompts")
     if not isinstance(raw_prompts, Mapping) or set(raw_prompts) != set(CHANNEL_WORKFLOW_TASKS):
@@ -125,7 +133,12 @@ def channel_automation_workflow(
     if not isinstance(raw_gates, list) or not all(isinstance(value, str) for value in raw_gates):
         raise ValueError("automation_workflow.human_gates must be a list of gate names")
     human_gates = tuple(dict.fromkeys(value.strip() for value in raw_gates if value.strip()))
-    missing = REQUIRED_HUMAN_GATES - set(human_gates)
+    required_gates = (
+        AUTOMATIC_SOURCE_BRIEF_HUMAN_GATES
+        if research_review == "automatic_source_brief"
+        else REQUIRED_HUMAN_GATES
+    )
+    missing = required_gates - set(human_gates)
     if missing:
         raise ValueError("automation_workflow is missing mandatory human gates: " + ", ".join(sorted(missing)))
 
@@ -136,6 +149,7 @@ def channel_automation_workflow(
         enabled=enabled,
         language=language,
         summary=summary,
+        research_review=str(research_review),
         prompts=prompts,
         stages=tuple(stages),
         human_gates=human_gates,

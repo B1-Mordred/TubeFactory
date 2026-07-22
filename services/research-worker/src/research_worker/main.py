@@ -9,6 +9,7 @@ from research_worker.activities import run_fixture_pipeline
 from research_worker.acquisition_activities import (
     acquire_source_candidate,
     complete_source_acquisition,
+    discover_linked_primary_sources,
     load_approved_opportunity_sources,
 )
 from research_worker.config import Settings
@@ -18,7 +19,9 @@ from research_worker.live_activities import (
     search_live_strategy,
 )
 from research_worker.research_activities import (
+    evaluate_explanation_readiness_activity,
     extract_snapshot_evidence,
+    find_next_approved_research_candidate,
     index_source_snapshot,
     load_live_research_plan,
     persist_live_research_dossier,
@@ -71,10 +74,13 @@ async def run() -> None:
             persist_live_opportunities,
             load_approved_opportunity_sources,
             acquire_source_candidate,
+            discover_linked_primary_sources,
             complete_source_acquisition,
             load_live_research_plan,
             extract_snapshot_evidence,
             persist_live_research_dossier,
+            evaluate_explanation_readiness_activity,
+            find_next_approved_research_candidate,
             index_source_snapshot,
         ],
     )

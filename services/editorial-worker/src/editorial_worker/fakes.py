@@ -140,4 +140,38 @@ def fake_output(
         return fake_verifier_output(inputs, model_name)
     if task_type == "storyboard":
         return fake_storyboard_output(inputs, model_name, fixture_context)
+    if task_type == "research_query_planner":
+        title = str(inputs.get("candidate", {}).get("title", "evidence topic"))[:180]
+        units = [
+            {"id": f"unit-{index}", "question": f"Which exact evidence answers explanation step {index} for {title}?", "role": role, "essential": True}
+            for index, role in enumerate(("foundation", "mechanism", "evidence", "limits", "implications", "open_questions"), 1)
+        ]
+        return {
+            "coverage_units": units,
+            "queries": [
+                {"query": f"{title} original study data", "role": "primary", "language": "en", "coverage_unit_ids": ["unit-1", "unit-2", "unit-3"]},
+                {"query": f"{title} limitations critique", "role": "counterevidence", "language": "en", "coverage_unit_ids": ["unit-4", "unit-6"]},
+            ],
+            "confidence": 0.8,
+            "abstained": False,
+            "uncertainty": ["Deterministic fixture query plan"],
+        }
+    if task_type == "evidence_synthesizer":
+        sources = [item for item in inputs.get("sources", []) if item.get("evidence")]
+        evidence = [
+            {"evidence_id": item["evidence"][0]["evidence_id"], "relationship": "supports"}
+            for item in sources[:2]
+        ]
+        return {
+            "claims": ([{
+                "statement": "Two supplied independent fixture excerpts support this bounded review candidate.",
+                "claim_type": "fact",
+                "central": True,
+                "coverage_unit_ids": ["unit-1"],
+                "evidence": evidence,
+            }] if len(evidence) == 2 else []),
+            "confidence": 0.8 if len(evidence) == 2 else 0.2,
+            "abstained": len(evidence) != 2,
+            "uncertainty": ["Fixture synthesis requires human review"],
+        }
     raise ValueError("fake provider does not support this task")

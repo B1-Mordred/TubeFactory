@@ -1,11 +1,21 @@
 from datetime import datetime, timezone
 
-from editorial_core.discovery import FindingCluster, SearchFinding
+import pytest
+from temporalio.exceptions import ApplicationError
+
+from editorial_core.discovery import FindingCluster, SearchFinding, SubjectBrief, plan_search
+from research_worker.acquisition import SearxngSearchResponse
+import research_worker.live_activities as live_module
 from research_worker.live_activities import (
     _finding_signature,
+    _discovery_strategies,
+    _is_explainer_candidate,
     _matches_processed_claim,
     _publication_at,
     _score_live_cluster,
+    _source_domains,
+    _uses_explainer_candidate_filter,
+    search_live_strategy,
 )
 from research_worker.rescore import _is_placeholder_score
 
@@ -20,6 +30,103 @@ def test_publication_at_normalizes_searxng_timestamp() -> None:
 
 def test_publication_at_ignores_unparseable_values() -> None:
     assert _publication_at("recently") is None
+
+
+def test_source_domains_are_computed_for_persisted_cluster_trace() -> None:
+    findings = (
+        SearchFinding("https://one.example.test/report", "One", "Summary"),
+        SearchFinding("https://two.example.test/study", "Two", "Summary"),
+        SearchFinding("https://one.example.test/update", "Update", "Summary"),
+    )
+
+    assert _source_domains(findings) == {"one.example.test", "two.example.test"}
+
+
+def test_explainer_candidate_filter_rejects_navigation_noise_but_keeps_questions() -> None:
+    assert _is_explainer_candidate(
+        {
+            "url": "https://science.example.test/batteries-age",
+            "title": "Warum Batterien mit der Zeit schwächer werden",
+            "summary": "Messungen erklären die Wirkung wiederholter Ladezyklen.",
+        }
+    )
+    assert _is_explainer_candidate(
+        {
+            "url": "https://health.example.test/study",
+            "title": "Studie untersucht Zusammenhang zwischen Sitzen und Gesundheit",
+            "summary": "Forschende ordnen die Daten ein.",
+        }
+    )
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://www.youtube.com/",
+            "title": "YouTube",
+            "summary": "Share your videos with friends, family, and the world.",
+        }
+    )
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://news.example.test/",
+            "title": "Aktuelle Nachrichten aus Deutschland",
+            "summary": "Politik, Wirtschaft, Sport und Wetter im Überblick.",
+        }
+    )
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://www.facebook.com/help/login",
+            "title": "How to log in to Facebook",
+            "summary": "Account help.",
+        }
+    )
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://answers.example.test/office/save",
+            "title": "Issues with saving a document",
+            "summary": "A product support question about opening a file.",
+        }
+    )
+
+
+def test_all_explainer_targets_use_candidate_hygiene_filter() -> None:
+    assert _uses_explainer_candidate_filter({"target": "simple_explainer"})
+    assert _uses_explainer_candidate_filter({"target": "evidence_first_explainer"})
+    assert not _uses_explainer_candidate_filter({"target": "news_commentary"})
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "UMSICHT-Wissenschaftspreis 2026 verliehen",
+        "Workshop-Reihe für Zukunftsthemen",
+        "Neue Unterrichtsmaterialien bringen Forschung in Schulen",
+    ),
+)
+def test_explainer_filter_rejects_institutional_announcements(title: str) -> None:
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://research.example.test/announcement",
+            "title": title,
+            "summary": "Forschung und Technologie stehen im Mittelpunkt.",
+        }
+    )
+
+
+def test_topic_radar_defers_evidence_strategies_until_after_selection() -> None:
+    plan = plan_search(
+        SubjectBrief(
+            topic="Aktuelle Wissenschaft",
+            research_goal="Erklärbare Themen finden",
+            seed_queries=("site:science.example.test Forschung",),
+        )
+    )
+
+    deferred = _discovery_strategies(
+        plan, {"evidence_research_timing": "after_topic_selection"}
+    )
+    full = _discovery_strategies(plan, {})
+
+    assert {item["purpose"] for item in deferred} == {"broad discovery"}
+    assert {item["purpose"] for item in full} >= {"primary evidence", "falsification"}
 
 
 def test_processed_claim_matches_normalized_title_and_summary() -> None:
@@ -186,3 +293,80 @@ def test_legacy_placeholder_detection_is_narrow_and_idempotent() -> None:
     assert _is_placeholder_score(positive, penalties)
     assert not _is_placeholder_score({**positive, "audience_fit": 61}, penalties)
     assert not _is_placeholder_score(positive, {**penalties, "duplication": 1})
+
+
+@pytest.mark.asyncio
+async def test_recent_search_falls_back_to_evergreen_and_reports_health(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_search(_endpoint: str, **kwargs):
+        calls.append(kwargs)
+        if kwargs["lookback_days"] is not None:
+            return SearxngSearchResponse(
+                results=(),
+                requested_engines=tuple(kwargs["engines"]),
+                responding_engines=(),
+                unresponsive_engines=(),
+                time_range="month",
+            )
+        return SearxngSearchResponse(
+            results=(
+                {
+                    "url": "https://example.test/explainer",
+                    "title": "A useful explanation",
+                    "summary": "Evidence",
+                    "published_at": None,
+                    "source_type": "secondary",
+                },
+            ),
+            requested_engines=tuple(kwargs["engines"]),
+            responding_engines=("bing",),
+            unresponsive_engines=(),
+            time_range=None,
+        )
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(live_module, "search_searxng", fake_search)
+    monkeypatch.setattr(live_module.asyncio, "sleep", no_wait)
+    result = await search_live_strategy(
+        {
+            "strategy": {"purpose": "broad discovery", "query": "Thema", "language": "de"},
+            "freshness_policy": {"lookback_days": 21},
+            "domain_policy": {},
+        }
+    )
+
+    assert [call["lookback_days"] for call in calls] == [21, None]
+    assert result["health"]["fallback_used"] is True
+    assert result["health"]["freshness_mode"] == "recent_then_evergreen"
+    assert result["results"][0]["title"] == "A useful explanation"
+
+
+@pytest.mark.asyncio
+async def test_empty_results_with_engine_failures_raise_retryable_source_error(monkeypatch) -> None:
+    async def fake_search(_endpoint: str, **kwargs):
+        return SearxngSearchResponse(
+            results=(),
+            requested_engines=tuple(kwargs["engines"]),
+            responding_engines=(),
+            unresponsive_engines=({"engine": "bing", "reason": "too many requests"},),
+            time_range=None,
+        )
+
+    monkeypatch.setattr(live_module, "search_searxng", fake_search)
+    with pytest.raises(ApplicationError) as caught:
+        await search_live_strategy(
+            {
+                "strategy": {"purpose": "primary evidence", "query": "Thema", "language": "de"},
+                "freshness_policy": {"lookback_days": 21},
+                "domain_policy": {},
+            }
+        )
+
+    assert caught.value.type == "SearchBackendUnavailable"
+    assert caught.value.non_retryable is False
+    assert caught.value.details[0]["unresponsive_engines"] == [
+        {"engine": "bing", "reason": "too many requests"}
+    ]

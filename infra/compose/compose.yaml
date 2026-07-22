@@ -235,12 +235,15 @@ services:
     profiles: [core]
     environment:
       RENDER_PORT: 8091
+      MEDIA_ASSET_ORIGIN: http://minio:9000
+      MEDIA_ASSET_BUCKET: production-artifacts
     read_only: true
     cap_drop: [ALL]
     tmpfs:
       - /tmp:size=2g,mode=1777
     networks:
       - application
+      - data
     healthcheck:
       test: [CMD, node, -e, "fetch('http://127.0.0.1:8091/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 10s
@@ -331,6 +334,8 @@ services:
       MINIO_SECRET_KEY_FILE: /run/secrets/minio_secret_key
       MINIO_BUCKET: production-artifacts
       SEARXNG_ENDPOINT: http://searxng:8080
+      SEARXNG_GENERAL_ENGINES: ${SEARXNG_GENERAL_ENGINES:-bing,qwant news,bing news}
+      SEARXNG_SCIENCE_ENGINES: ${SEARXNG_SCIENCE_ENGINES:-bing,arxiv,pubmed}
       FIRECRAWL_ENDPOINT: http://firecrawl-api:3002
       ACQUISITION_USER_AGENT: ${ACQUISITION_USER_AGENT:-EvidenceStudioResearch/0.1 (+self-hosted editorial research)}
       ACQUISITION_MAX_BYTES: ${ACQUISITION_MAX_BYTES:-10000000}

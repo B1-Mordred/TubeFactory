@@ -5,10 +5,14 @@ import math
 import re
 from dataclasses import dataclass
 from typing import Iterable
+from urllib.parse import unquote
 
 
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
-_SENTENCE = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
+# A full stop is a boundary unless it is specifically surrounded by digits.
+# This keeps measurements such as ``1.5`` intact while still ending a sentence
+# after a year or other integer (for example, ``during 2025.``).
+_SENTENCE = re.compile(r".+?(?:[!?]+|(?<!\d)\.+|\.+(?!\d)|\n|$)")
 _YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 _NUMBER = re.compile(r"\b\d+(?:[.,]\d+)?(?:\s*%)?\b")
 _INFERENCE_MARKERS = {
@@ -31,6 +35,36 @@ _HOSTILE_MARKERS = (
     "reveal your secrets",
     "execute this command",
 )
+
+
+def scholarly_work_identity(url: str, *, doi: str | None = None) -> str | None:
+    """Normalize common DOI, arXiv, and OpenAlex aliases to one work identity."""
+
+    decoded_url = unquote(str(url)).strip()
+    normalized_doi = unquote(str(doi or "")).strip().casefold()
+    doi_match = re.search(r"doi\.org/(10\.\d{4,9}/[^\s?#]+)", decoded_url, re.I)
+    if not normalized_doi and doi_match:
+        normalized_doi = doi_match.group(1).casefold()
+    for prefix in ("https://doi.org/", "http://doi.org/"):
+        if normalized_doi.startswith(prefix):
+            normalized_doi = normalized_doi[len(prefix) :]
+            break
+    if normalized_doi:
+        arxiv_doi = re.fullmatch(r"10\.48550/arxiv\.(.+)", normalized_doi, re.I)
+        if arxiv_doi:
+            return f"arxiv:{re.sub(r'v\d+$', '', arxiv_doi.group(1).casefold())}"
+        return f"doi:{normalized_doi}"
+    arxiv_match = re.search(
+        r"(?:arxiv\.org/(?:abs|pdf)/|arxiv:)(\d{4}\.\d{4,5}(?:v\d+)?)",
+        decoded_url,
+        re.I,
+    )
+    if arxiv_match:
+        return f"arxiv:{re.sub(r'v\d+$', '', arxiv_match.group(1).casefold())}"
+    openalex_match = re.search(r"(?:openalex\.org/works/|openalex\.org/)(W\d+)", decoded_url, re.I)
+    if openalex_match:
+        return f"openalex:{openalex_match.group(1).casefold()}"
+    return None
 _STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
     "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "this", "to",

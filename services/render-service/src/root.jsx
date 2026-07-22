@@ -8,7 +8,7 @@ const defaults = {
   fps: 24,
   durationSeconds: 1,
   scenes: [],
-  brand: {name: 'TubeFactory', primary: '#6ee7ff', background: '#08111f'},
+  brand: {name: 'TubeFactory', logoText: 'TF', primary: '#174C3C', accent: '#D6A43A', background: '#F6F3EA', surface: '#FFFFFF', text: '#18201D', mutedText: '#56615C', headingFont: 'serif', bodyFont: 'sans', cornerStyle: 'soft', motionStyle: 'calm', imageTreatment: 'editorial'},
 };
 
 export const RemotionRoot = () => (

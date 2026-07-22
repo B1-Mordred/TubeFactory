@@ -35,6 +35,26 @@ def test_json_is_canonical_and_depth_bounded() -> None:
         extract_source_document(deeply_nested, "application/json", "https://example.org")
 
 
+def test_json_flattens_embedded_display_markup() -> None:
+    result = extract_source_document(
+        b'{"abstract":"<h4>Participants</h4>Adults in the study."}',
+        "application/json",
+        "https://example.org/record",
+    )
+    assert "Participants Adults in the study." in result.text
+    assert "<h4>" not in result.text
+
+
+def test_openalex_json_reconstructs_abstract_for_exact_evidence() -> None:
+    result = extract_source_document(
+        b'{"id":"https://openalex.org/W1","abstract_inverted_index":{"Lithium":[0],"from":[1],"brines.":[2]}}',
+        "application/json",
+        "https://api.openalex.org/works/W1",
+    )
+    assert '"abstract_reconstructed": "Lithium from brines."' in result.text
+    assert '"abstract_inverted_index"' in result.text
+
+
 def test_xml_rejects_entities_and_extracts_structured_text() -> None:
     result = extract_source_document(
         b"<report><title>Result</title><value unit='percent'>17</value></report>",

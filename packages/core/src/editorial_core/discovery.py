@@ -71,10 +71,17 @@ def plan_search(subject: SubjectBrief) -> SearchPlan:
         SearchStrategy("broad discovery", f"{query} {negative}".strip(), language, region)
         for query in seeds
     ]
+    focus_query = seeds[0]
+    if language.casefold().startswith("de"):
+        primary_terms = "(Studie OR Bericht OR Datensatz OR Forschungsbericht)"
+        falsification_terms = "(Kritik OR Korrektur OR widerlegt OR zurückgezogen OR Gegenbeleg)"
+    else:
+        primary_terms = "(report OR dataset OR filing OR study)"
+        falsification_terms = "(false OR correction OR retracted OR criticism OR counterevidence)"
     strategies.append(
         SearchStrategy(
             "primary evidence",
-            f'"{subject.topic}" (report OR dataset OR filing OR study) {negative}'.strip(),
+            f"{focus_query} {primary_terms} {negative}".strip(),
             language,
             region,
         )
@@ -82,13 +89,13 @@ def plan_search(subject: SubjectBrief) -> SearchPlan:
     strategies.append(
         SearchStrategy(
             "related concepts",
-            " ".join((subject.topic, *subject.related_concepts, negative)).strip(),
+            " ".join((focus_query, *subject.related_concepts, negative)).strip(),
             language,
             region,
         )
     )
     falsification = (
-        f'"{subject.topic}" (false OR correction OR retracted OR criticism OR counterevidence)',
+        f"{focus_query} {falsification_terms}",
     )
     return SearchPlan(
         subject_topic=subject.topic,

@@ -5,7 +5,6 @@ import hashlib
 import json
 import re
 import math
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -23,22 +22,86 @@ from editorial_core.discovery import (
     RiskLevel,
     evaluate_research_completion,
 )
+from editorial_core.audit import AuditRecord
+from editorial_core.explanation_readiness import (
+    evaluate_explanation_readiness,
+    explanation_policy,
+    meta_claim_reason,
+)
 from editorial_core.research import (
     chunk_semantic_text,
     classify_claim,
     cluster_evidence_statements,
     evidence_relation,
     extract_evidence_sentences,
+    scholarly_work_identity,
 )
 from research_worker.config import Settings
 
 
 _PRIMARY_TYPES = {"primary", "official", "official record", "original study", "authoritative"}
+_NON_PRIMARY_DOMAINS = {
+    "reddit.com",
+    "www.reddit.com",
+    "bibsonomy.org",
+    "www.bibsonomy.org",
+    "facebook.com",
+    "x.com",
+    "twitter.com",
+}
 _YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 
 
 def _json(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
+
+
+async def _append_audit(
+    connection: asyncpg.Connection,
+    *,
+    action: str,
+    correlation_id: str,
+    actor_id: UUID | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    context: dict[str, Any] | None = None,
+) -> None:
+    """Append to the shared tamper-evident audit chain inside the caller transaction."""
+
+    await connection.execute("SELECT pg_advisory_xact_lock(hashtext('audit_event_chain'))")
+    previous = await connection.fetchval(
+        "SELECT event_hash FROM audit_events ORDER BY occurred_at DESC,id DESC LIMIT 1"
+    )
+    event_id = uuid4()
+    occurred_at = datetime.now(timezone.utc)
+    safe_context = context or {}
+    record = AuditRecord(
+        event_id=event_id,
+        occurred_at=occurred_at,
+        action=action,
+        actor_id=actor_id,
+        target_type=target_type,
+        target_id=target_id,
+        correlation_id=correlation_id,
+        context=safe_context,
+        previous_hash=previous,
+    )
+    await connection.execute(
+        """INSERT INTO audit_events
+           (id,occurred_at,actor_id,action,target_type,target_id,correlation_id,context,
+            previous_hash,event_hash)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)""",
+        event_id,
+        occurred_at,
+        actor_id,
+        action,
+        target_type,
+        target_id,
+        correlation_id,
+        json.dumps(safe_context),
+        previous,
+        record.digest(),
+    )
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -51,9 +114,31 @@ def _cosine(left: list[float], right: list[float]) -> float:
 
 def detect_dependent_sources(
     extracted_sources: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], set[str]]:
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Return evidence relationships and canonical dependency-group keys.
+
+    Dependence is an equivalence relation used when evaluating one claim. A single
+    representative from a duplicate group may count; citing two aliases from the
+    same group may not. Distinct scholarly work identities are never collapsed by
+    the deliberately coarse local feature-hash embedding alone.
+    """
+
     relationships: list[dict[str, Any]] = []
-    dependent_documents: set[str] = set()
+    parents: dict[str, str] = {}
+
+    def find(item: str) -> str:
+        parents.setdefault(item, item)
+        while parents[item] != item:
+            parents[item] = parents[parents[item]]
+            item = parents[item]
+        return item
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[max(left_root, right_root)] = min(left_root, right_root)
+
     for left_index, left in enumerate(extracted_sources):
         for right in extracted_sources[left_index + 1 :]:
             exact_duplicate = left["content_hash"] == right["content_hash"] or bool(
@@ -68,8 +153,18 @@ def detect_dependent_sources(
                 ),
                 default=0.0,
             )
-            if not exact_duplicate and similarity < 0.82:
-                continue
+            left_reputation = _json(left.get("reputation")) or {}
+            right_reputation = _json(right.get("reputation")) or {}
+            left_work_identity = str(left_reputation.get("work_identity") or "")
+            right_work_identity = str(right_reputation.get("work_identity") or "")
+            same_work = bool(
+                left_work_identity and left_work_identity == right_work_identity
+            )
+            if not exact_duplicate and not same_work:
+                if left_work_identity and right_work_identity:
+                    continue
+                if similarity < 0.94 or _evidence_token_similarity(left, right) < 0.72:
+                    continue
             first, second = sorted(
                 [left["source_document_id"], right["source_document_id"]]
             )
@@ -79,16 +174,43 @@ def detect_dependent_sources(
                     "source_document_id": first,
                     "related_source_document_id": second,
                     "relationship": relationship,
-                    "confidence": 100 if exact_duplicate else min(99, round(similarity * 100)),
+                    "confidence": (
+                        100
+                        if exact_duplicate
+                        else 99
+                        if same_work
+                        else min(99, round(similarity * 100))
+                    ),
                     "reason": (
                         "identical acquired content or semantic chunk hash"
                         if exact_duplicate
+                        else "same normalized scholarly work identity"
+                        if same_work
                         else f"local feature-hash chunk cosine similarity {similarity:.3f}"
                     ),
                 }
             )
-            dependent_documents.update((first, second))
-    return relationships, dependent_documents
+            union(first, second)
+    dependency_groups = {
+        item: min(member for member in parents if find(member) == find(item))
+        for item in parents
+    }
+    return relationships, dependency_groups
+
+
+def _evidence_token_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
+    def tokens(source: dict[str, Any]) -> set[str]:
+        return {
+            token.casefold()
+            for item in source.get("evidence", [])
+            for token in re.findall(r"[\wÄÖÜäöüß-]{4,}", str(item.get("exact_text", "")))
+        }
+
+    left_tokens = tokens(left)
+    right_tokens = tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
 def _vector_literal(values: list[float]) -> str:
@@ -105,6 +227,262 @@ def _read_minio_object(client: Minio, bucket: str, key: str, maximum_bytes: int)
     finally:
         response.close()
         response.release_conn()
+
+
+def _source_independence_key(source: dict[str, Any]) -> str:
+    reputation = _json(source.get("reputation")) or {}
+    return str(
+        reputation.get("work_identity")
+        or scholarly_work_identity(str(source.get("canonical_url", "")))
+        or (f"content:{source['content_hash']}" if source.get("content_hash") else "")
+        or f"document:{source.get('source_document_id', '')}"
+    )
+
+
+def _claim_independence_key(
+    source: dict[str, Any], dependency_groups: dict[str, str]
+) -> str:
+    source_id = str(source["source_document_id"])
+    if source_id in dependency_groups:
+        return f"dependency:{dependency_groups[source_id]}"
+    return _source_independence_key(source)
+
+
+def _is_primary_source(source: dict[str, Any]) -> bool:
+    domain = str(source.get("domain", "")).casefold().split(":", 1)[0]
+    return (
+        str(source.get("source_type", "")).casefold() in _PRIMARY_TYPES
+        and domain not in _NON_PRIMARY_DOMAINS
+    )
+
+
+def prepare_ai_synthesized_claims(
+    ai_synthesis: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    dependency_groups: dict[str, str],
+    minimum_independent: int = 2,
+    coverage_unit_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate model proposals against exact locally extracted evidence IDs."""
+
+    if (
+        not ai_synthesis
+        or ai_synthesis.get("abstained")
+        or float(ai_synthesis.get("confidence", 0)) < 0.65
+    ):
+        return []
+    evidence_by_id = {
+        f"{item['source']['source_document_id']}:{item['excerpt_hash']}": item
+        for item in candidates
+    }
+    prepared: list[dict[str, Any]] = []
+    for proposal in ai_synthesis.get("claims", [])[:30]:
+        statement = " ".join(str(proposal.get("statement", "")).split())
+        claim_type = str(proposal.get("claim_type", "fact"))
+        proposed_units = {
+            str(value)
+            for value in proposal.get("coverage_unit_ids", [])
+            if coverage_unit_ids is None or str(value) in coverage_unit_ids
+        }
+        if (
+            not 20 <= len(statement) <= 700
+            or claim_type not in {"fact", "inference", "opinion"}
+            or meta_claim_reason(statement)
+            or (coverage_unit_ids is not None and not proposed_units)
+        ):
+            continue
+        selected: list[tuple[dict[str, Any], str]] = []
+        seen_ids: set[str] = set()
+        for item in proposal.get("evidence", [])[:12]:
+            evidence_id = str(item.get("evidence_id", ""))
+            relationship = str(item.get("relationship", ""))
+            candidate = evidence_by_id.get(evidence_id)
+            if candidate is None or evidence_id in seen_ids or relationship not in {
+                "supports", "contradicts", "context"
+            }:
+                continue
+            seen_ids.add(evidence_id)
+            selected.append((candidate, relationship))
+        links = [
+            {
+                "candidate": candidate,
+                "relationship": relationship,
+                "independence_key": _claim_independence_key(
+                    candidate["source"], dependency_groups
+                ),
+                "independent": True,
+                "primary": _is_primary_source(candidate["source"]),
+                "direct": relationship != "context",
+            }
+            for candidate, relationship in selected
+        ]
+        if not links:
+            continue
+        central = bool(proposal.get("central"))
+        independent_supports = {
+            link["independence_key"]
+            for link in links
+            if link["relationship"] == "supports"
+        }
+        if not independent_supports:
+            continue
+        prepared.append(
+            {
+                "id": uuid4(),
+                "statement": statement,
+                "claim_type": claim_type,
+                "central": central and len(independent_supports) >= minimum_independent,
+                "central_eligible": len(independent_supports) >= minimum_independent,
+                "independent_support_count": len(independent_supports),
+                "confidence": min(95, max(50, round(float(ai_synthesis["confidence"]) * 100))),
+                "status": (
+                    "disputed"
+                    if any(link["relationship"] == "contradicts" for link in links)
+                    else "supported"
+                ),
+                "coverage_unit_ids": sorted(proposed_units),
+                "links": links,
+            }
+        )
+    eligible = [claim for claim in prepared if claim["central_eligible"]]
+    if not eligible:
+        return []
+    chosen_central_ids = {
+        claim["id"]
+        for claim in sorted(
+            eligible,
+            key=lambda claim: (
+                claim["central"],
+                claim["independent_support_count"],
+                sum(1 for link in claim["links"] if link["primary"]),
+                len(claim["coverage_unit_ids"]),
+                claim["statement"],
+            ),
+            reverse=True,
+        )[:4]
+    }
+    for claim in prepared:
+        claim["central"] = claim["id"] in chosen_central_ids
+        claim.pop("central_eligible", None)
+        claim.pop("independent_support_count", None)
+    return prepared
+
+
+def _readiness_claims(prepared_claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": str(claim["id"]),
+            "statement": claim["statement"],
+            "status": claim["status"],
+            "central": claim["central"],
+            "coverage_unit_ids": claim.get("coverage_unit_ids", []),
+            "evidence": [
+                {
+                    "relationship": link["relationship"],
+                    "direct": link["direct"],
+                    "independent": link["independent"],
+                    "primary": link["primary"],
+                    "source_id": str(link["candidate"]["source"]["source_document_id"]),
+                    "independence_key": link["independence_key"],
+                }
+                for link in claim["links"]
+            ],
+        }
+        for claim in prepared_claims
+    ]
+
+
+@activity.defn(name="evaluate-explanation-readiness")
+async def evaluate_explanation_readiness_activity(request: dict[str, Any]) -> dict[str, Any]:
+    plan = request["plan"]
+    extracted_sources = request.get("extracted_sources", [])
+    candidates = [
+        {**evidence, "source": source}
+        for source in extracted_sources
+        for evidence in source.get("evidence", [])[:6]
+    ]
+    _, dependency_groups = detect_dependent_sources(extracted_sources)
+    coverage_units = list(plan.get("explanation_plan", []))
+    prepared_claims = prepare_ai_synthesized_claims(
+        request.get("ai_synthesis"),
+        candidates,
+        dependency_groups,
+        minimum_independent=int(plan["completion_criteria"]["minimum_independent"]),
+        coverage_unit_ids={str(item.get("id")) for item in coverage_units},
+    )
+    policy = explanation_policy(plan.get("format_policy", {}), plan.get("approval_profile", {}))
+    result = evaluate_explanation_readiness(
+        policy=policy,
+        claims=_readiness_claims(prepared_claims),
+        coverage_units=coverage_units,
+        minimum_independent_sources=int(plan["completion_criteria"]["minimum_independent"]),
+        minimum_primary_sources=int(plan["completion_criteria"]["minimum_primary"]),
+        counterevidence_search_completed=bool(request.get("counterevidence_search_completed")),
+    )
+    return {
+        **result.as_dict(),
+        "enrichment_round": int(request.get("enrichment_round", 0)),
+    }
+
+
+@activity.defn(name="find-next-approved-research-candidate")
+async def find_next_approved_research_candidate(
+    request: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Select the next human-approved candidate without weakening review gates."""
+
+    settings = Settings()
+    current_id = UUID(str(request["opportunity_id"]))
+    excluded = [UUID(str(value)) for value in request.get("excluded_opportunity_ids", [])]
+    if current_id not in excluded:
+        excluded.append(current_id)
+    connection = await asyncpg.connect(settings.database_dsn)
+    try:
+        row = await connection.fetchrow(
+            """SELECT candidate.id,candidate.title,
+                      count(DISTINCT os.id) AS source_candidate_count,
+                      count(DISTINCT ss.id) AS snapshot_count,
+                      (SELECT rr.state FROM research_runs rr
+                       WHERE rr.opportunity_id=candidate.id AND rr.deleted_at IS NULL
+                       ORDER BY rr.created_at DESC LIMIT 1) AS research_state
+               FROM opportunities current
+               JOIN opportunities candidate
+                 ON candidate.subject_profile_id=current.subject_profile_id
+               LEFT JOIN opportunity_sources os ON os.opportunity_id=candidate.id
+               LEFT JOIN source_snapshots ss ON ss.source_document_id=os.source_document_id
+               LEFT JOIN LATERAL (
+                   SELECT total FROM opportunity_scores score
+                   WHERE score.opportunity_id=candidate.id
+                   ORDER BY score.score_version DESC LIMIT 1
+               ) latest_score ON true
+               WHERE current.id=$1
+                 AND candidate.deleted_at IS NULL
+                 AND candidate.decision='approved'
+                 AND NOT(candidate.id=ANY($2::uuid[]))
+                 AND NOT EXISTS (
+                     SELECT 1 FROM research_dossiers dossier
+                     WHERE dossier.opportunity_id=candidate.id
+                       AND dossier.deleted_at IS NULL
+                       AND coalesce((dossier.completion_evaluation->'explanation_readiness'->>'ready')::boolean,false)
+                 )
+               GROUP BY candidate.id,candidate.title,latest_score.total
+               HAVING count(DISTINCT os.id)>0
+               ORDER BY latest_score.total DESC NULLS LAST,candidate.created_at
+               LIMIT 1""",
+            current_id,
+            excluded,
+        )
+        if row is None:
+            return None
+        return {
+            "opportunity_id": str(row["id"]),
+            "title": row["title"],
+            "source_candidate_count": int(row["source_candidate_count"]),
+            "snapshot_count": int(row["snapshot_count"]),
+            "research_state": row["research_state"],
+        }
+    finally:
+        await connection.close()
 
 
 @activity.defn(name="index-source-snapshot")
@@ -203,9 +581,12 @@ async def load_live_research_plan(request: dict[str, Any]) -> dict[str, Any]:
         row = await connection.fetchrow(
             """SELECT rr.id AS research_run_id, rr.state, rr.started_by, rr.correlation_id,
                       o.id AS opportunity_id, o.title, o.summary, o.decision,
-                      sp.topic, sp.research_goal, sp.risk, sp.source_requirements
+                      sp.topic, sp.research_goal, sp.risk, sp.source_requirements,
+                      sp.format_policy,sp.approval_profile,sp.domain_policy,
+                      cp.editorial_rules AS channel_editorial_rules
                FROM opportunities o
                JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               JOIN channel_profiles cp ON cp.id=sp.channel_profile_id
                JOIN LATERAL (
                  SELECT id,state,started_by,correlation_id FROM research_runs
                  WHERE opportunity_id=o.id AND deleted_at IS NULL
@@ -227,12 +608,16 @@ async def load_live_research_plan(request: dict[str, Any]) -> dict[str, Any]:
         sources = await connection.fetch(
             """SELECT DISTINCT ON (sd.id)
                       sd.id AS source_document_id, sd.title, sd.canonical_url, sd.publisher,
-                      sd.source_type, sd.domain, ss.id AS source_snapshot_id,
+                      sd.source_type, sd.domain, sd.reputation, ss.id AS source_snapshot_id,
                       ss.normalized_object_key, ss.content_hash, ss.retrieved_at
                FROM opportunity_sources os
                JOIN source_documents sd ON sd.id=os.source_document_id
                JOIN source_snapshots ss ON ss.source_document_id=sd.id
                WHERE os.opportunity_id=$1
+                 AND NOT (
+                   sd.reputation->>'discovered_via' = 'generic_evidence_search'
+                   AND coalesce(sd.reputation->>'relevance_score','') = ''
+                 )
                ORDER BY sd.id, ss.snapshot_number DESC""",
             opportunity_id,
         )
@@ -241,6 +626,14 @@ async def load_live_research_plan(request: dict[str, Any]) -> dict[str, Any]:
                 "opportunity has no immutable source snapshots", non_retryable=True
             )
         requirements = _json(row["source_requirements"]) or {}
+        latest_query_plan = await connection.fetchrow(
+            """SELECT coverage_units,queries FROM research_ai_query_plans
+               WHERE opportunity_id=$1 AND abstained=false
+               ORDER BY plan_version DESC LIMIT 1""",
+            opportunity_id,
+        )
+        channel_rules = _json(row["channel_editorial_rules"]) or {}
+        automation_workflow = channel_rules.get("automation_workflow") or {}
         return {
             "research_run_id": str(row["research_run_id"]),
             "opportunity_id": str(row["opportunity_id"]),
@@ -249,6 +642,22 @@ async def load_live_research_plan(request: dict[str, Any]) -> dict[str, Any]:
             "topic": row["topic"],
             "research_goal": row["research_goal"],
             "risk": row["risk"],
+            "format_policy": _json(row["format_policy"]) or {},
+            "approval_profile": _json(row["approval_profile"]) or {},
+            "channel_workflow": {
+                "key": str(automation_workflow.get("key") or ""),
+                "name": str(automation_workflow.get("name") or ""),
+                "research_review": str(
+                    automation_workflow.get("research_review") or "human_dossier"
+                ),
+            },
+            "domain_policy": _json(row["domain_policy"]) or {"allow": [], "block": []},
+            "explanation_plan": (
+                _json(latest_query_plan["coverage_units"]) if latest_query_plan else []
+            ) or [],
+            "evidence_search_queries": (
+                _json(latest_query_plan["queries"]) if latest_query_plan else []
+            ) or [],
             "actor_id": str(request.get("actor_id") or row["started_by"]),
             "correlation_id": str(request.get("correlation_id") or row["correlation_id"]),
             "completion_criteria": {
@@ -292,6 +701,7 @@ async def load_live_research_plan(request: dict[str, Any]) -> dict[str, Any]:
                         "publisher",
                         "source_type",
                         "domain",
+                        "reputation",
                     )
                 }
                 for source in sources
@@ -346,7 +756,7 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
     candidates = [
         {**evidence, "source": source}
         for source in extracted_sources
-        for evidence in source.get("evidence", [])[:4]
+        for evidence in source.get("evidence", [])[:6]
     ]
     if not candidates:
         raise ApplicationError(
@@ -356,12 +766,12 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
     ordered_clusters = sorted(
         clusters,
         key=lambda cluster: (
-            -len({candidates[index]["source"]["domain"] for index in cluster}),
+            -len({_source_independence_key(candidates[index]["source"]) for index in cluster}),
             -max(int(candidates[index]["relevance_score"]) for index in cluster),
             cluster[0],
         ),
     )[:12]
-    near_duplicate_pairs, dependent_documents = detect_dependent_sources(extracted_sources)
+    near_duplicate_pairs, dependency_groups = detect_dependent_sources(extracted_sources)
     request_hash = hashlib.sha256(
         json.dumps(request, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
@@ -381,14 +791,21 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
         criteria = plan["completion_criteria"]
         dossier_id = uuid4()
         dossier_version = 1
-        prepared_claims: list[dict[str, Any]] = []
-        for position, cluster in enumerate(ordered_clusters):
+        prepared_claims = prepare_ai_synthesized_claims(
+            request.get("ai_synthesis"),
+            candidates,
+            dependency_groups,
+            minimum_independent=int(criteria["minimum_independent"]),
+            coverage_unit_ids={
+                str(item.get("id")) for item in plan.get("explanation_plan", [])
+            },
+        )
+        ai_claims_applied = bool(prepared_claims)
+        for position, cluster in enumerate(ordered_clusters if not prepared_claims else []):
             representative_index = max(
                 cluster, key=lambda index: int(candidates[index]["relevance_score"])
             )
             representative = candidates[representative_index]
-            domains = [candidates[index]["source"]["domain"] for index in cluster]
-            domain_counts = Counter(domains)
             links: list[dict[str, Any]] = []
             for index in cluster:
                 candidate = candidates[index]
@@ -400,16 +817,15 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                     {
                         "candidate": candidate,
                         "relationship": relation,
-                        "independent": domain_counts[source["domain"]] == 1
-                        and source["source_document_id"] not in dependent_documents,
-                        "primary": str(source["source_type"]).casefold() in _PRIMARY_TYPES,
+                        "independent": True,
+                        "primary": _is_primary_source(source),
                         "direct": relation != "context",
                     }
                 )
             support_domains = {
-                link["candidate"]["source"]["domain"]
+                _claim_independence_key(link["candidate"]["source"], dependency_groups)
                 for link in links
-                if link["relationship"] == "supports" and link["independent"]
+                if link["relationship"] == "supports"
             }
             has_contradiction = any(
                 link["relationship"] == "contradicts" for link in links
@@ -422,6 +838,7 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                     "central": position < 3,
                     "confidence": min(95, 48 + len(support_domains) * 16),
                     "status": "disputed" if has_contradiction else "supported",
+                    "coverage_unit_ids": [],
                     "links": links,
                 }
             )
@@ -464,13 +881,36 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
             for link in claim.evidence
             if link.primary and link.direct
         }
+        readiness = evaluate_explanation_readiness(
+            policy=explanation_policy(
+                plan.get("format_policy", {}), plan.get("approval_profile", {})
+            ),
+            claims=_readiness_claims(prepared_claims),
+            coverage_units=plan.get("explanation_plan", []),
+            minimum_independent_sources=int(criteria["minimum_independent"]),
+            minimum_primary_sources=int(criteria["minimum_primary"]),
+            counterevidence_search_completed=bool(
+                request.get("counterevidence_search_completed")
+            ),
+        )
         completion_document = {
-            "complete": completion.complete,
-            "blockers": list(completion.blockers),
+            "complete": bool(completion.complete and readiness.ready),
+            "research_complete": completion.complete,
+            "blockers": [*completion.blockers, *readiness.gaps],
             "independent_supporting_sources": len(supporting_sources),
             "primary_sources": len(primary_sources),
             "criteria": criteria,
             "policy": "deterministic-research-completion-v1",
+            "claim_synthesis": (
+                "source-bound-lan-ai-v1"
+                if ai_claims_applied
+                else "deterministic-lexical-v1"
+            ),
+            "ai_synthesis_id": (request.get("ai_synthesis") or {}).get("synthesis_id"),
+            "explanation_readiness": {
+                **readiness.as_dict(),
+                "enrichment_round": int(request.get("enrichment_round", 0)),
+            },
         }
         years = sorted(
             {
@@ -484,21 +924,43 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
             for claim in prepared_claims
             if len(
                 {
-                    link["candidate"]["source"]["domain"]
+                    _source_independence_key(link["candidate"]["source"])
                     for link in claim["links"]
                     if link["relationship"] == "supports" and link["independent"]
                 }
             )
             >= int(criteria["minimum_independent"])
         ][:5]
+        automatic_source_brief = (
+            plan.get("channel_workflow", {}).get("research_review")
+            == "automatic_source_brief"
+        )
+        automatic_handoff = bool(completion_document["complete"] and automatic_source_brief)
+        if automatic_handoff:
+            completion_document["review_mode"] = "automatic_source_brief"
         result = {
             "research_run_id": str(research_run_id),
             "dossier_id": str(dossier_id),
             "claim_count": len(prepared_claims),
             "evidence_count": sum(len(claim["links"]) for claim in prepared_claims),
             "source_count": len(extracted_sources),
-            "completion_met": completion.complete,
+            "completion_met": bool(completion.complete and readiness.ready),
+            "explanation_readiness": completion_document["explanation_readiness"],
+            "review_mode": (
+                "automatic_source_brief" if automatic_source_brief else "human_dossier"
+            ),
         }
+        if automatic_handoff:
+            script_workflow_id = f"script-generation-source-brief-{dossier_id.hex}-v1"
+            result["automatic_script_request"] = {
+                "workflow_id": script_workflow_id,
+                "dossier_id": str(dossier_id),
+                "expected_dossier_version": 1,
+                "sensitivity": "internal",
+                "idempotency_key": f"source-brief-{dossier_id.hex}-v1",
+                "actor_id": str(actor_id),
+                "correlation_id": str(plan["correlation_id"]),
+            }
         async with connection.transaction():
             await connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtext($1))",
@@ -523,21 +985,38 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                 "SELECT COALESCE(MAX(dossier_version),0)+1 FROM research_dossiers WHERE opportunity_id=$1",
                 opportunity_id,
             )
-            status = "in_review" if completion.complete else "blocked"
+            status = (
+                "approved"
+                if automatic_handoff
+                else "in_review" if completion_document["complete"] else "blocked"
+            )
+            review_comment = (
+                "Automatically accepted as a source brief after deterministic readiness checks; "
+                "the human topic selection authorized script preparation."
+                if automatic_handoff
+                else None
+            )
             await connection.execute(
                 """INSERT INTO research_dossiers
                 (id,version,created_at,updated_at,deleted_at,opportunity_id,dossier_version,status,
                  executive_summary,chronology,unresolved_questions,alternative_explanations,
                  source_quality_notes,safe_conclusions,prohibited_overstatements,proposed_angles,
-                 completion_evaluation,reviewed_by,reviewed_at,review_comment)
+                 explanation_plan,completion_evaluation,reviewed_by,reviewed_at,review_comment)
                 VALUES($1,1,$2,$2,NULL,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,
-                       $11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,NULL,NULL,NULL)""",
+                       $11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16,$17,$18)""",
                 dossier_id,
                 now,
                 opportunity_id,
                 dossier_version,
                 status,
-                f"Extracted {len(candidates)} bounded evidence passages from {len(extracted_sources)} immutable source snapshot(s); editorial review is required.",
+                (
+                    f"Source brief assembled from {len(candidates)} relevant passages in "
+                    f"{len(extracted_sources)} immutable source snapshot(s); readiness passed "
+                    "and script preparation continues automatically."
+                    if automatic_handoff
+                    else f"Extracted {len(candidates)} bounded evidence passages from "
+                    f"{len(extracted_sources)} immutable source snapshot(s); editorial review is required."
+                ),
                 json.dumps(
                     [
                         {"date": year, "event": "Date appears in extracted source evidence"}
@@ -571,7 +1050,11 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                     ]
                 ),
                 json.dumps([plan["opportunity_title"]]),
+                json.dumps(plan.get("explanation_plan", [])),
                 json.dumps(completion_document),
+                actor_id if automatic_handoff else None,
+                now if automatic_handoff else None,
+                review_comment,
             )
             for source in extracted_sources:
                 for chunk_number, chunk in enumerate(source.get("chunks", []), start=1):
@@ -614,8 +1097,8 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                     """INSERT INTO claims
                     (id,version,created_at,updated_at,deleted_at,research_dossier_id,
                      normalized_statement,claim_type,scope,relevant_at,entities,confidence,status,
-                     risk,central,review_comment,reviewed_by,reviewed_at)
-                    VALUES($1,1,$2,$2,NULL,$3,$4,$5,$6,NULL,'[]'::jsonb,$7,$8,$9,$10,NULL,NULL,NULL)""",
+                     risk,central,coverage_unit_ids,review_comment,reviewed_by,reviewed_at)
+                    VALUES($1,1,$2,$2,NULL,$3,$4,$5,$6,NULL,'[]'::jsonb,$7,$8,$9,$10,$11::jsonb,$12,$13,$14)""",
                     claim["id"],
                     now,
                     dossier_id,
@@ -623,9 +1106,17 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                     claim["claim_type"],
                     plan["topic"],
                     claim["confidence"],
-                    claim["status"],
+                    (
+                        "approved"
+                        if automatic_handoff and claim["status"] == "supported"
+                        else claim["status"]
+                    ),
                     plan["risk"],
                     claim["central"],
+                    json.dumps(claim.get("coverage_unit_ids", [])),
+                    review_comment if automatic_handoff else None,
+                    actor_id if automatic_handoff else None,
+                    now if automatic_handoff else None,
                 )
                 for link in claim["links"]:
                     candidate = link["candidate"]
@@ -669,15 +1160,25 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                         link["independent"],
                         link["direct"],
                         link["primary"],
-                        "deterministic lexical evidence extraction; reviewer confirmation required",
+                        (
+                            "source-bound evidence extraction; automatically accepted with the source brief"
+                            if automatic_handoff
+                            else "source-bound evidence extraction; reviewer confirmation required"
+                        ),
                         now,
                     )
             await connection.execute(
                 """UPDATE research_runs
-                   SET state='DOSSIER_REVIEW', research_plan=$2::jsonb,
-                       progress=$3::jsonb, completed_at=$4, updated_at=$4, version=version+1
+                   SET state=$2, research_plan=$3::jsonb,
+                       progress=$4::jsonb, completed_at=$5, updated_at=$5, version=version+1
                    WHERE id=$1""",
                 research_run_id,
+                (
+                    "SCRIPTING"
+                    if automatic_handoff
+                    else "DOSSIER_REVIEW" if completion_document["complete"]
+                    else "INSUFFICIENT_EXPLANATION_EVIDENCE"
+                ),
                 json.dumps(plan["research_plan"]),
                 json.dumps(
                     {
@@ -685,7 +1186,8 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                         "sources": len(extracted_sources),
                         "claims": len(prepared_claims),
                         "evidence_links": result["evidence_count"],
-                        "completion_met": completion.complete,
+                        "completion_met": completion_document["complete"],
+                        "explanation_readiness": completion_document["explanation_readiness"],
                     }
                 ),
                 now,
@@ -694,14 +1196,57 @@ async def persist_live_research_dossier(request: dict[str, Any]) -> dict[str, An
                 """INSERT INTO workflow_transitions
                 (id,aggregate_type,aggregate_id,from_stage,to_stage,reason,actor_id,
                  correlation_id,occurred_at)
-                VALUES($1,'opportunity',$2,'RESEARCHING','DOSSIER_REVIEW',$3,$4,$5,$6)""",
+                VALUES($1,'opportunity',$2,'RESEARCHING',$3,$4,$5,$6,$7)""",
                 uuid4(),
                 opportunity_id,
-                "immutable evidence extracted into a versioned review dossier",
+                (
+                    "SCRIPTING"
+                    if automatic_handoff
+                    else "DOSSIER_REVIEW" if completion_document["complete"] else "PAUSED"
+                ),
+                (
+                    "trusted source brief passed deterministic readiness and continued automatically"
+                    if automatic_handoff
+                    else "immutable evidence extracted into a versioned review dossier"
+                ),
                 actor_id,
                 plan["correlation_id"],
                 now,
             )
+            if automatic_handoff:
+                script_request = result["automatic_script_request"]
+                await connection.execute(
+                    """INSERT INTO workflow_control_records
+                    (workflow_id,workflow_type,request_payload,parent_workflow_id,
+                     correlation_id,started_by,created_at)
+                    VALUES($1,'script-generation',$2::jsonb,$3,$4,$5,$6)
+                    ON CONFLICT (workflow_id) DO NOTHING""",
+                    script_request["workflow_id"],
+                    json.dumps(script_request),
+                    workflow_id,
+                    plan["correlation_id"],
+                    actor_id,
+                    now,
+                )
+                await _append_audit(
+                    connection,
+                    action="dossier.source_brief_accepted",
+                    actor_id=actor_id,
+                    target_type="research_dossier",
+                    target_id=str(dossier_id),
+                    correlation_id=str(plan["correlation_id"]),
+                    context={
+                        "workflow_key": plan.get("channel_workflow", {}).get("key"),
+                        "dossier_version": 1,
+                        "completion_met": True,
+                        "claim_ids": [
+                            str(claim["id"])
+                            for claim in prepared_claims
+                            if claim["status"] == "supported"
+                        ],
+                        "automatic_continuation_workflow_id": script_request["workflow_id"],
+                    },
+                )
             await connection.execute(
                 """INSERT INTO idempotency_records
                 (id,scope,idempotency_key,request_hash,status,external_id,result,created_at,updated_at)

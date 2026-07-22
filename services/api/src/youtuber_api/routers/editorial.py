@@ -28,9 +28,14 @@ from youtuber_api.db import get_session
 from youtuber_api.editorial_gateway import TemporalEditorialGateway
 from youtuber_api.models import (
     ApprovalModel,
+    ChannelProfileModel,
     ClaimEvidenceModel,
     ClaimModel,
+    ComfyWorkflowHeadModel,
+    ComfyWorkflowVersionModel,
     EvidenceExcerptModel,
+    MediaProductionModel,
+    OpportunityModel,
     ResearchDossierModel,
     SceneAlternativeModel,
     SceneModel,
@@ -42,12 +47,18 @@ from youtuber_api.models import (
     StoryboardModel,
     StoryboardVersionModel,
     SourceSnapshotModel,
+    SubjectProfileModel,
     UserModel,
+    VoiceProfileHeadModel,
+    VoiceProfileVersionModel,
     WorkflowControlRecordModel,
     WorkflowTransitionModel,
 )
 from youtuber_api.schemas import (
+    AutomaticContinuation,
     EditorialApprovalWrite,
+    ExistingResearchScriptImportStart,
+    MediaProductionStart,
     ResearchWorkflowCancel,
     ResearchWorkflowLogEntry,
     ResearchWorkflowRetry,
@@ -78,6 +89,7 @@ Editor = Annotated[UserModel, Depends(require(Permission.EDIT_EDITORIAL))]
 _WORKFLOW_ID = re.compile(r"^[a-zA-Z0-9_.:-]{1,240}$")
 _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TERMINATED", "TIMED_OUT"}
 _EDITORIAL_WORKFLOWS = {
+    "script-import-existing-research",
     "script-generation",
     "script-regeneration",
     "script-verification",
@@ -162,6 +174,15 @@ async def start_script_run(
         raise HTTPException(status_code=404, detail="Dossier not found")
     if dossier.status != "approved" or dossier.version != payload.expected_dossier_version:
         raise HTTPException(status_code=409, detail="Use the exact current approved dossier version")
+    readiness = dossier.completion_evaluation.get("explanation_readiness", {})
+    if not readiness.get("ready"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Dossier is approved but not ready for the configured explainer format",
+                "gaps": readiness.get("gaps", ["explanation_readiness_missing"]),
+            },
+        )
     if await session.scalar(select(ScriptModel.id).where(ScriptModel.research_dossier_id == dossier.id)):
         raise HTTPException(status_code=409, detail="This dossier already has a versioned script")
     approved_claims = await session.scalar(
@@ -200,6 +221,156 @@ async def start_script_run(
         target_id=str(dossier.id),
         correlation_id=request.state.correlation_id,
         context={"workflow_id": workflow_id, "dossier_version": dossier.version},
+    )
+    await session.commit()
+    return await _workflow_view(session, gateway, workflow_id)
+
+
+@router.post(
+    "/script-import-runs", response_model=ResearchWorkflowView, status_code=202
+)
+async def start_existing_research_script_import(
+    payload: ExistingResearchScriptImportStart,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ResearchWorkflowView:
+    opportunity = await session.get(OpportunityModel, payload.opportunity_id)
+    if opportunity is None or opportunity.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Active opportunity not found")
+
+    script = await session.scalar(
+        select(ScriptModel).where(
+            ScriptModel.opportunity_id == opportunity.id,
+            ScriptModel.deleted_at.is_(None),
+        )
+    )
+    if script is not None:
+        if script.status == "approved":
+            raise HTTPException(
+                status_code=409,
+                detail="The current script is approved; create a new production branch before replacing it",
+            )
+        if await session.scalar(
+            select(StoryboardModel.id).where(StoryboardModel.script_id == script.id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This script already has a storyboard and cannot be replaced by an import",
+            )
+        dossier = await session.get(ResearchDossierModel, script.research_dossier_id)
+    else:
+        dossier = await session.scalar(
+            select(ResearchDossierModel)
+            .where(
+                ResearchDossierModel.opportunity_id == opportunity.id,
+                ResearchDossierModel.status == "approved",
+                ResearchDossierModel.deleted_at.is_(None),
+            )
+            .order_by(
+                ResearchDossierModel.dossier_version.desc(),
+                ResearchDossierModel.version.desc(),
+            )
+        )
+    if dossier is None or dossier.deleted_at is not None or dossier.status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Use existing research requires an approved source brief for this opportunity",
+        )
+    readiness = dossier.completion_evaluation.get("explanation_readiness", {})
+    if not readiness.get("ready"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "The selected source brief is not explanation-ready",
+                "gaps": readiness.get("gaps", ["explanation_readiness_missing"]),
+            },
+        )
+    approved_claims = await session.scalar(
+        select(func.count(ClaimModel.id)).where(
+            ClaimModel.research_dossier_id == dossier.id,
+            ClaimModel.status == "approved",
+            ClaimModel.deleted_at.is_(None),
+        )
+    )
+    if not approved_claims:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected source brief has no approved claims",
+        )
+
+    workflow_id = f"script-import-existing-research-{payload.idempotency_key}"
+    workflow_payload: dict[str, Any] = {
+        "workflow_id": workflow_id,
+        "mode": "replace_unapproved" if script is not None else "initial",
+        "opportunity_id": str(opportunity.id),
+        "dossier_id": str(dossier.id),
+        "expected_dossier_version": dossier.version,
+        "script_title": payload.title,
+        "script_text": payload.script_text,
+        "script_text_hash": hashlib.sha256(payload.script_text.encode()).hexdigest(),
+        "sensitivity": payload.sensitivity,
+        "idempotency_key": payload.idempotency_key,
+        "actor_id": str(actor.id),
+        "correlation_id": request.state.correlation_id,
+    }
+    if script is not None:
+        current = await session.get(ScriptVersionModel, script.current_version_id)
+        if current is None:
+            raise HTTPException(status_code=409, detail="Current script version is missing")
+        segment_rows = list(
+            await session.scalars(
+                select(ScriptSegmentModel)
+                .where(ScriptSegmentModel.script_version_id == current.id)
+                .order_by(ScriptSegmentModel.segment_order)
+            )
+        )
+        locked = [item.segment_key for item in segment_rows if item.locked]
+        if locked:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Unlock all script segments before replacing the draft",
+                    "locked_segment_keys": locked,
+                },
+            )
+        workflow_payload.update(
+            {
+                "script_id": str(script.id),
+                "expected_version": current.version_number,
+                "expected_hash": current.content_hash,
+                "segment_keys": [item.segment_key for item in segment_rows],
+            }
+        )
+
+    gateway = _gateway(request)
+    _, reconciled = await _start_tracked(
+        session,
+        gateway,
+        workflow_type="script-import-existing-research",
+        payload=workflow_payload,
+        actor=actor,
+        correlation_id=request.state.correlation_id,
+    )
+    await append_audit(
+        session,
+        action=(
+            "script.existing_research_import_reconciled"
+            if reconciled
+            else "script.existing_research_import_started"
+        ),
+        actor_id=actor.id,
+        target_type="research_dossier",
+        target_id=str(dossier.id),
+        correlation_id=request.state.correlation_id,
+        context={
+            "workflow_id": workflow_id,
+            "opportunity_id": str(opportunity.id),
+            "dossier_version": dossier.version,
+            "mode": workflow_payload["mode"],
+            "script_text_hash": workflow_payload["script_text_hash"],
+            "script_character_count": len(payload.script_text),
+        },
     )
     await session.commit()
     return await _workflow_view(session, gateway, workflow_id)
@@ -593,7 +764,11 @@ async def list_scripts(
     scripts = list(
         await session.scalars(
             select(ScriptModel)
-            .where(ScriptModel.deleted_at.is_(None))
+            .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+            .where(
+                ScriptModel.deleted_at.is_(None),
+                OpportunityModel.deleted_at.is_(None),
+            )
             .order_by(ScriptModel.created_at.desc())
         )
     )
@@ -901,8 +1076,52 @@ async def approve_script(
         correlation_id=request.state.correlation_id,
         context={"version": version.version_number, "content_hash": version.content_hash},
     )
+    existing_storyboard = await session.scalar(
+        select(StoryboardModel.id).where(StoryboardModel.script_id == script.id)
+    )
+    if existing_storyboard:
+        continuation = AutomaticContinuation(
+            state="completed",
+            action="storyboard_generation",
+            message="A storyboard already exists for this approved script.",
+        )
+    else:
+        idempotency_key = f"approval-{version.id.hex}-v{version.version_number}"
+        workflow_id = f"storyboard-generation-{idempotency_key}"
+        _, reconciled = await _start_tracked(
+            session,
+            _gateway(request),
+            workflow_type="storyboard-generation",
+            payload={
+                "workflow_id": workflow_id,
+                "script_id": str(script.id),
+                "script_version_id": str(version.id),
+                "sensitivity": "internal",
+                "idempotency_key": idempotency_key,
+                "actor_id": str(actor.id),
+                "correlation_id": request.state.correlation_id,
+            },
+            actor=actor,
+            correlation_id=request.state.correlation_id,
+        )
+        continuation = AutomaticContinuation(
+            state="reconciled" if reconciled else "started",
+            action="storyboard_generation",
+            workflow_id=workflow_id,
+            message="Storyboard generation started automatically from the approved script hash.",
+        )
+    await append_audit(
+        session,
+        action=f"automation.script_{continuation.state}",
+        actor_id=actor.id,
+        target_type="script_version",
+        target_id=str(version.id),
+        correlation_id=request.state.correlation_id,
+        context=continuation.model_dump(mode="json"),
+    )
     await session.commit()
-    return await _script_detail(session, script)
+    detail = await _script_detail(session, script)
+    return detail.model_copy(update={"automatic_continuation": continuation})
 
 
 async def _storyboard_detail(
@@ -955,7 +1174,13 @@ async def list_storyboards(
     storyboards = list(
         await session.scalars(
             select(StoryboardModel)
-            .where(StoryboardModel.deleted_at.is_(None))
+            .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
+            .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+            .where(
+                StoryboardModel.deleted_at.is_(None),
+                ScriptModel.deleted_at.is_(None),
+                OpportunityModel.deleted_at.is_(None),
+            )
             .order_by(StoryboardModel.created_at.desc())
         )
     )
@@ -1425,5 +1650,106 @@ async def approve_storyboard(
         correlation_id=request.state.correlation_id,
         context={"version": version.version_number, "content_hash": version.content_hash},
     )
+    existing_production = await session.scalar(
+        select(MediaProductionModel.id).where(
+            MediaProductionModel.storyboard_version_id == version.id
+        )
+    )
+    if existing_production:
+        continuation = AutomaticContinuation(
+            state="completed",
+            action="media_production",
+            message="Media production already exists for this approved storyboard version.",
+        )
+    else:
+        channel = await session.scalar(
+            select(ChannelProfileModel)
+            .join(SubjectProfileModel, SubjectProfileModel.channel_profile_id == ChannelProfileModel.id)
+            .join(OpportunityModel, OpportunityModel.subject_profile_id == SubjectProfileModel.id)
+            .join(ScriptModel, ScriptModel.opportunity_id == OpportunityModel.id)
+            .where(ScriptModel.id == storyboard.script_id)
+        )
+        render_settings = channel.default_render_settings if channel else {}
+        workflow_key = str(render_settings.get("workflow_key", ""))
+        workflow_statement = (
+            select(ComfyWorkflowVersionModel)
+            .join(
+                ComfyWorkflowHeadModel,
+                ComfyWorkflowHeadModel.active_version_id == ComfyWorkflowVersionModel.id,
+            )
+            .where(ComfyWorkflowVersionModel.approval_state == "approved")
+            .order_by(ComfyWorkflowVersionModel.workflow_key)
+        )
+        if workflow_key:
+            workflow_statement = workflow_statement.where(
+                ComfyWorkflowVersionModel.workflow_key == workflow_key
+            )
+        comfy_workflow = await session.scalar(workflow_statement.limit(1))
+        voice_key = str(render_settings.get("voice_profile_key", ""))
+        voice_statement = (
+            select(VoiceProfileVersionModel)
+            .join(
+                VoiceProfileHeadModel,
+                VoiceProfileHeadModel.active_version_id == VoiceProfileVersionModel.id,
+            )
+            .where(VoiceProfileVersionModel.enabled.is_(True))
+            .order_by(VoiceProfileVersionModel.profile_key)
+        )
+        if voice_key:
+            voice_statement = voice_statement.where(
+                VoiceProfileVersionModel.profile_key == voice_key
+            )
+        voice = await session.scalar(voice_statement.limit(1))
+        if comfy_workflow is None or voice is None:
+            continuation = AutomaticContinuation(
+                state="awaiting_input",
+                action="media_production",
+                message="Storyboard approval is recorded, but an active approved visual workflow and enabled voice profile are required.",
+            )
+        else:
+            configured_resolution = str(render_settings.get("resolution", ""))
+            try:
+                width_text, height_text = configured_resolution.lower().split("x", 1)
+                width, height = int(width_text), int(height_text)
+            except (AttributeError, TypeError, ValueError):
+                width, height = 854, 480
+            allowed = comfy_workflow.allowed_resolutions or []
+            if {"width": width, "height": height} not in allowed and allowed:
+                width, height = int(allowed[0]["width"]), int(allowed[0]["height"])
+            idempotency_key = f"approval-{version.id.hex}-v{version.version_number}"
+            from youtuber_api.routers.media import start_production
+
+            run = await start_production(
+                MediaProductionStart(
+                    storyboard_version_id=version.id,
+                    expected_storyboard_hash=version.content_hash,
+                    render_tier=str(render_settings.get("render_tier", "preview")),
+                    workflow_key=comfy_workflow.workflow_key,
+                    voice_profile_key=voice.profile_key,
+                    width=width,
+                    height=height,
+                    fps=int(render_settings.get("fps", 24)),
+                    idempotency_key=idempotency_key,
+                ),
+                request,
+                actor,
+                session,
+            )
+            continuation = AutomaticContinuation(
+                state="started",
+                action="media_production",
+                workflow_id=run.workflow_id,
+                message="Media production and automated QA started from the approved storyboard hash.",
+            )
+    await append_audit(
+        session,
+        action=f"automation.storyboard_{continuation.state}",
+        actor_id=actor.id,
+        target_type="storyboard_version",
+        target_id=str(version.id),
+        correlation_id=request.state.correlation_id,
+        context=continuation.model_dump(mode="json"),
+    )
     await session.commit()
-    return await _storyboard_detail(session, storyboard)
+    detail = await _storyboard_detail(session, storyboard)
+    return detail.model_copy(update={"automatic_continuation": continuation})

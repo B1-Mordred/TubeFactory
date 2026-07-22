@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import asyncpg
 from temporalio import activity
@@ -13,13 +14,227 @@ from temporalio.exceptions import ApplicationError
 from editorial_core.editorial import validate_scene_spec, validate_storyboard
 from editorial_worker.config import Settings
 from editorial_worker.channel_workflow import channel_workflow_context
-from editorial_worker.contracts import StoryboardDraft
+from editorial_worker.contracts import StoryboardContentDraft, StoryboardDraft
 from editorial_worker.db import append_audit
 from editorial_worker.model_activities import load_task_routes
 
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _diverse_visual_plan(
+    source_ids_by_segment: list[list[str]], requested: list[str]
+) -> list[str]:
+    """Keep a good model plan, otherwise apply a deterministic varied visual rhythm."""
+
+    source_bound = {"citation_card", "chart", "source_screenshot"}
+    safe_requested = [
+        visual_type
+        if source_ids or visual_type not in source_bound
+        else "diagram"
+        for visual_type, source_ids in zip(requested, source_ids_by_segment, strict=True)
+    ]
+    minimum_types = min(3, len(safe_requested))
+    has_adjacent_repeat = any(
+        current == previous
+        for previous, current in zip(safe_requested, safe_requested[1:], strict=False)
+    )
+    if len(set(safe_requested)) >= minimum_types and not has_adjacent_repeat:
+        return safe_requested
+
+    rhythm = (
+        "title_card",
+        "timeline",
+        "chart",
+        "diagram",
+        "branded_transition",
+        "text",
+        "citation_card",
+        "branded_transition",
+    )
+    plan: list[str] = []
+    for index, source_ids in enumerate(source_ids_by_segment):
+        candidate = rhythm[index % len(rhythm)]
+        if candidate in source_bound and not source_ids:
+            candidate = "text" if index % 2 else "timeline"
+        if plan and candidate == plan[-1]:
+            candidate = "diagram" if candidate != "diagram" else "text"
+        plan.append(candidate)
+    return plan
+
+
+def _diverse_visual_brief(
+    visual_type: str, purpose: str, on_screen_text: list[str], original: str
+) -> str:
+    text = " · ".join(on_screen_text[:3]) or purpose
+    if visual_type == "title_card":
+        return f"Klare typografische Titelkarte mit einem zentralen Leitmotiv. Kerntext: {text}"
+    if visual_type == "timeline":
+        return f"Horizontale, schrittweise Abfolge ohne erfundene Datenwerte. Inhalt: {text}"
+    if visual_type == "chart":
+        return (
+            "Quellengebundene qualitative Chart-Darstellung ohne erfundene Zahlen oder "
+            f"Achsenwerte. Inhalt: {text}"
+        )
+    if visual_type == "text":
+        return f"Ruhige typografische Erklärkarte mit klarer visueller Hierarchie. Inhalt: {text}"
+    if visual_type == "citation_card":
+        return f"Quellenkarte mit sichtbarer Claim-zu-Quelle-Zuordnung. Kernaussage: {text}"
+    if visual_type == "branded_transition":
+        return f"Kurze FaktischSimpel-Zwischenkarte als visueller Kapitelwechsel. Inhalt: {text}"
+    return original
+
+
+_GENERIC_SCENE_MARKERS = (
+    "erfüllt die redaktionelle rolle",
+    "freigegebenen aussagen",
+    "generic visual",
+    "appropriate visual",
+    "passende visualisierung",
+    "visual for this segment",
+    "schrittweise erklären",
+)
+
+
+def _topic_excerpt(value: str, *, limit: int = 180) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    return compact[:limit].rstrip(" ,;:")
+
+
+def _scene_concreteness_errors(
+    scenes: list[dict[str, Any]], segment_narrations: dict[str, str]
+) -> list[str]:
+    """Reject production placeholders while keeping creative choices model-owned."""
+
+    errors: list[str] = []
+    total_duration = sum(float(scene.get("duration", 0)) for scene in scenes)
+    transition_duration = 0.0
+    previous_visual: str | None = None
+    seen_briefs: set[str] = set()
+    for index, scene in enumerate(scenes):
+        purpose = _topic_excerpt(str(scene.get("purpose", "")))
+        brief = _topic_excerpt(str(scene.get("visual_brief", "")), limit=4_000)
+        normalized = f"{purpose} {brief}".casefold()
+        if any(marker in normalized for marker in _GENERIC_SCENE_MARKERS):
+            errors.append(f"scene[{index}]: purpose or visual brief is a generic placeholder")
+        if len(brief) < 35:
+            errors.append(f"scene[{index}]: visual brief is too short to produce concretely")
+        on_screen = [str(value).strip() for value in scene.get("on_screen_text", []) if str(value).strip()]
+        if not on_screen:
+            errors.append(f"scene[{index}]: at least one concrete on-screen text cue is required")
+        referenced = [str(value) for value in scene.get("narration_segment_ids", [])]
+        narration = " ".join(segment_narrations.get(value, "") for value in referenced)
+        topic_tokens = {
+            token
+            for token in re.findall(r"[\wÄÖÜäöüß-]{5,}", narration.casefold())
+            if token not in {"diese", "dieser", "einen", "einer", "werden", "wurde", "sowie"}
+        }
+        scene_tokens = set(re.findall(r"[\wÄÖÜäöüß-]{5,}", normalized.casefold()))
+        if topic_tokens and not topic_tokens.intersection(scene_tokens):
+            errors.append(f"scene[{index}]: visual plan is not tied to its narration topic")
+        brief_key = re.sub(r"\W+", " ", brief.casefold()).strip()
+        if brief_key in seen_briefs:
+            errors.append(f"scene[{index}]: visual brief duplicates an earlier scene")
+        seen_briefs.add(brief_key)
+        visual_type = str(scene.get("visual_type", ""))
+        if visual_type == "branded_transition":
+            transition_duration += float(scene.get("duration", 0))
+        if previous_visual == visual_type:
+            errors.append(f"scene[{index}]: adjacent scenes repeat visual_type {visual_type}")
+        previous_visual = visual_type
+    if total_duration and transition_duration / total_duration > 0.15:
+        errors.append("branded transitions exceed 15 percent of storyboard duration")
+    return errors
+
+
+def _assemble_storyboard_draft(request: dict[str, Any]) -> StoryboardDraft:
+    try:
+        full_draft = StoryboardDraft.model_validate(request["content_draft"])
+        if all(not validate_scene_spec(scene) for scene in full_draft.scenes):
+            return full_draft
+    except Exception:
+        # Keep audited full-contract fixture prompts replayable.
+        pass
+    content = StoryboardContentDraft.model_validate(request["content_draft"])
+    expected = [str(UUID(value)) for value in request["expected_segment_ids"]]
+    expected_set = set(expected)
+    by_segment = {str(scene.narration_segment_id): scene for scene in content.scenes}
+    if len(by_segment) != len(content.scenes) or set(by_segment) != expected_set:
+        raise ValueError("semantic storyboard must contain exactly one scene per script segment")
+
+    durations = {str(UUID(key)): float(value) for key, value in request["segment_durations"].items()}
+    source_ids_by_segment = [
+        list(request["allowed_source_ids"].get(segment_id, []))
+        for segment_id in expected
+    ]
+    segment_narrations = {
+        str(key): str(value)
+        for key, value in request.get("segment_narrations", {}).items()
+    }
+    visual_plan = _diverse_visual_plan(
+        source_ids_by_segment,
+        [by_segment[segment_id].visual_type for segment_id in expected],
+    )
+    scenes = []
+    for order, segment_id in enumerate(expected, start=1):
+        scene = by_segment[segment_id]
+        claim_ids = list(request["allowed_claim_ids"].get(segment_id, []))
+        source_ids = source_ids_by_segment[order - 1]
+        visual_type = visual_plan[order - 1]
+        narration_excerpt = _topic_excerpt(segment_narrations.get(segment_id, ""))
+        purpose = _topic_excerpt(scene.purpose)
+        if any(marker in purpose.casefold() for marker in _GENERIC_SCENE_MARKERS):
+            purpose = f"Macht diesen konkreten Erklärschritt sichtbar: {narration_excerpt}"
+        on_screen_text = [str(value).strip() for value in scene.on_screen_text if str(value).strip()]
+        if not on_screen_text and narration_excerpt:
+            on_screen_text = [narration_excerpt[:100]]
+        visual_brief = _diverse_visual_brief(
+            visual_type,
+            purpose,
+            on_screen_text,
+            scene.visual_brief,
+        )
+        if len(visual_brief.strip()) < 35 or any(
+            marker in visual_brief.casefold() for marker in _GENERIC_SCENE_MARKERS
+        ):
+            visual_brief = (
+                f"Konkrete {visual_type}-Darstellung dieses Narrationsschritts, ohne neue "
+                f"Fakten oder erfundene Zahlen: {narration_excerpt}"
+            )
+        scenes.append(
+            {
+                "scene_id": str(uuid5(NAMESPACE_URL, f"tubefactory:scene:{segment_id}")),
+                "order": order,
+                "purpose": purpose,
+                "narration_segment_ids": [segment_id],
+                "claim_ids": claim_ids,
+                "duration": durations[segment_id],
+                "visual_type": visual_type,
+                "visual_brief": visual_brief,
+                "on_screen_text": on_screen_text,
+                "citation_style": "Kurzer Quellenhinweis im Bild; vollständige Quelle in der Beschreibung.",
+                "source_ids": source_ids,
+                "asset_requests": [],
+                "transition": "Ruhiger, klarer Schnitt zur nächsten Erklärstufe.",
+                "music_sfx_policy": "Leise, sachlich und ohne Signalwirkung auf die Belegstärke.",
+                "synthetic_media_flag": visual_type in {"comfyui_image", "comfyui_video"},
+                "accessibility_notes": "Hoher Kontrast; Bildinhalt wird durch Narration oder Bildschirmtext erklärt.",
+            }
+        )
+    return StoryboardDraft.model_validate({"scenes": scenes})
+
+
+@activity.defn(name="assemble-storyboard-draft")
+async def assemble_storyboard_draft(request: dict[str, Any]) -> dict[str, Any]:
+    try:
+        draft = _assemble_storyboard_draft(request)
+    except Exception as exc:
+        raise ApplicationError(
+            f"semantic storyboard output could not be assembled: {str(exc)[:1000]}",
+            non_retryable=True,
+        ) from exc
+    return {"draft": draft.model_dump(mode="json")}
 
 
 @activity.defn(name="load-storyboard-generation-context")
@@ -150,6 +365,8 @@ async def load_storyboard_generation_context(request: dict[str, Any]) -> dict[st
                 "segments": segments,
             },
             "expected_segment_ids": [item["id"] for item in segments],
+            "segment_durations": {item["id"]: item["duration_seconds"] for item in segments},
+            "segment_narrations": {item["id"]: item["narration"] for item in segments},
             "allowed_claim_ids": {key: sorted(value) for key, value in allowed_claim_ids.items()},
             "allowed_source_ids": {key: sorted(value) for key, value in allowed_source_ids.items()},
         }
@@ -338,12 +555,78 @@ async def validate_scene_alternative(request: dict[str, Any]) -> dict[str, Any]:
     matches = [
         dict(item) for item in generated.scenes if item.get("order") == request["scene_order"]
     ]
+    if not matches:
+        try:
+            semantic = StoryboardContentDraft.model_validate(request["generated_draft"])
+            base = next(
+                dict(item)
+                for item in request["current_scenes"]
+                if item.get("scene_id") == request["scene_id"]
+            )
+            target_segments = {
+                str(value) for value in base.get("narration_segment_ids", [])
+            }
+            semantic_matches = [
+                scene
+                for scene in semantic.scenes
+                if str(scene.narration_segment_id) in target_segments
+            ]
+            if len(semantic_matches) == 1:
+                scene = semantic_matches[0]
+                visual_type = scene.visual_type
+                if (
+                    visual_type in {"citation_card", "chart", "source_screenshot"}
+                    and not base.get("source_ids")
+                ):
+                    visual_type = "diagram"
+                base.update(
+                    {
+                        "purpose": scene.purpose,
+                        "visual_type": visual_type,
+                        "visual_brief": scene.visual_brief,
+                        "on_screen_text": scene.on_screen_text,
+                        "synthetic_media_flag": visual_type
+                        in {"comfyui_image", "comfyui_video"},
+                    }
+                )
+                matches = [base]
+        except (StopIteration, ValueError):
+            matches = []
     if len(matches) != 1:
         raise ApplicationError(
             "scene alternative output did not contain exactly one target order",
             non_retryable=True,
         )
     candidate = matches[0]
+    requested_type = re.search(
+        r"\bvisual_type\s+(?:(?:exakt|exactly|exact)\s+)?[:=]?\s*([a-z_]+)",
+        str(request.get("instruction", "")).casefold(),
+    )
+    allowed_types = {
+        "title_card", "citation_card", "text", "diagram", "timeline", "chart",
+        "source_screenshot", "licensed_media", "comfyui_image", "comfyui_video",
+        "waveform", "branded_transition",
+    }
+    if requested_type and requested_type.group(1) in allowed_types:
+        visual_type = requested_type.group(1)
+        if (
+            visual_type in {"citation_card", "chart", "source_screenshot"}
+            and not candidate.get("source_ids")
+        ):
+            raise ApplicationError(
+                f"requested visual_type {visual_type} requires an allowed source",
+                non_retryable=True,
+            )
+        candidate["visual_type"] = visual_type
+        candidate["visual_brief"] = _diverse_visual_brief(
+            visual_type,
+            str(candidate.get("purpose", "")),
+            [str(value) for value in candidate.get("on_screen_text", [])],
+            str(candidate.get("visual_brief", "")),
+        )
+        candidate["synthetic_media_flag"] = visual_type in {
+            "comfyui_image", "comfyui_video",
+        }
     candidate["scene_id"] = request["scene_id"]
     errors = list(validate_scene_spec(candidate))
     combined = [
@@ -500,6 +783,15 @@ async def validate_storyboard_activity(request: dict[str, Any]) -> dict[str, Any
         validate_storyboard(
             draft.scenes,
             expected_segment_ids=request["expected_segment_ids"],
+        )
+    )
+    errors.extend(
+        _scene_concreteness_errors(
+            draft.scenes,
+            {
+                str(key): str(value)
+                for key, value in request.get("segment_narrations", {}).items()
+            },
         )
     )
     known_segments = set(request["expected_segment_ids"])

@@ -1,21 +1,45 @@
 import React from 'react';
-import {AbsoluteFill, Sequence, interpolate, useCurrentFrame} from 'remotion';
+import {AbsoluteFill, Img, OffthreadVideo, Sequence, interpolate, useCurrentFrame, useVideoConfig} from 'remotion';
 
 const textShadow = '0 2px 18px rgba(0,0,0,.65)';
+const fonts = {
+  sans: 'Arial, Helvetica, sans-serif',
+  serif: 'Georgia, Times New Roman, serif',
+  rounded: 'Arial Rounded MT Bold, Trebuchet MS, sans-serif',
+  mono: 'Liberation Mono, Courier New, monospace',
+};
+const radii = {square: 0, soft: 18, rounded: 38};
 
 const Scene = ({scene, brand, fps}) => {
   const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
   const opacity = interpolate(frame, [0, Math.max(1, fps / 3)], [0, 1], {extrapolateRight: 'clamp'});
+  const scaleEnd = brand.motionStyle === 'dynamic' ? 1.08 : brand.motionStyle === 'calm' ? 1.035 : 1;
+  const scale = interpolate(frame, [0, Math.max(1, scene.durationSeconds * fps)], [1, scaleEnd], {extrapolateRight: 'clamp'});
   const synthetic = Boolean(scene.syntheticMediaFlag);
+  const radius = radii[brand.cornerStyle] ?? radii.soft;
+  const video = scene.assetUrl && scene.assetMimeType?.startsWith('video/');
+  const image = scene.assetUrl && scene.assetMimeType?.startsWith('image/');
+  const overlay = brand.imageTreatment === 'cinematic' ? '.72' : brand.imageTreatment === 'documentary' ? '.58' : brand.imageTreatment === 'clean' ? '.32' : '.48';
   return (
-    <AbsoluteFill style={{background: `radial-gradient(circle at 70% 25%, ${brand.primary}33, transparent 42%), ${brand.background}`, color: '#f8fafc', fontFamily: 'Arial, sans-serif', padding: '7%', opacity}}>
-      <div style={{fontSize: 22, letterSpacing: 3, textTransform: 'uppercase', color: brand.primary}}>{brand.name}</div>
-      <div style={{marginTop: 42, maxWidth: '88%', fontSize: 56, lineHeight: 1.08, fontWeight: 760, textShadow}}>{scene.purpose}</div>
-      <div style={{marginTop: 30, maxWidth: '78%', fontSize: 28, lineHeight: 1.35, color: '#cbd5e1', textShadow}}>{scene.visualBrief}</div>
-      {scene.onScreenText?.length > 0 ? <div style={{marginTop: 28, fontSize: 24, color: '#e2e8f0'}}>{scene.onScreenText.join(' • ')}</div> : null}
-      <div style={{position: 'absolute', left: '7%', right: '7%', bottom: '7%', borderTop: `2px solid ${brand.primary}88`, paddingTop: 14, display: 'flex', justifyContent: 'space-between', fontSize: 18, color: '#94a3b8'}}>
-        <span>{scene.citationStyle || 'Sources in production manifest'}</span>
-        {synthetic ? <span style={{color: '#fbbf24'}}>Synthetic visual</span> : null}
+    <AbsoluteFill style={{background: brand.background, color: brand.text, fontFamily: fonts[brand.bodyFont], opacity, overflow: 'hidden'}}>
+      {image ? <Img src={scene.assetUrl} style={{position: 'absolute', inset: '-2%', width: '104%', height: '104%', objectFit: 'cover', transform: `scale(${scale})`}} /> : null}
+      {video ? <OffthreadVideo src={scene.assetUrl} muted style={{position: 'absolute', inset: 0, width, height, objectFit: 'cover'}} /> : null}
+      {!image && !video ? <AbsoluteFill style={{background: `radial-gradient(circle at 76% 20%, ${brand.accent}88, transparent 34%), linear-gradient(135deg, ${brand.background}, ${brand.primary}55)`}} /> : null}
+      <AbsoluteFill style={{background: `linear-gradient(90deg, ${brand.background}F2 0%, ${brand.background}${Math.round(Number(overlay) * 255).toString(16).padStart(2, '0')} 48%, transparent 82%)`}} />
+      <div style={{position: 'absolute', inset: '6%', display: 'flex', flexDirection: 'column'}}>
+        <div style={{display: 'flex', alignItems: 'center', gap: 18}}>
+          <div style={{display: 'grid', placeItems: 'center', minWidth: 54, height: 54, padding: '0 12px', borderRadius: radius / 2, background: brand.primary, color: brand.surface, fontWeight: 900, letterSpacing: 1}}>{brand.logoText}</div>
+          <div><div style={{fontSize: 22, letterSpacing: 3, textTransform: 'uppercase', color: brand.text, fontWeight: 800}}>{brand.name}</div>{brand.tagline ? <div style={{marginTop: 4, fontSize: 16, color: brand.mutedText}}>{brand.tagline}</div> : null}</div>
+        </div>
+        <div style={{marginTop: 'auto', maxWidth: '72%', padding: '30px 34px', borderLeft: `7px solid ${brand.accent}`, borderRadius: radius, background: `${brand.surface}E8`, boxShadow: '0 22px 70px rgba(0,0,0,.18)'}}>
+          <div style={{fontFamily: fonts[brand.headingFont], fontSize: 52, lineHeight: 1.08, fontWeight: 760, color: brand.text}}>{scene.purpose}</div>
+          {scene.onScreenText?.length > 0 ? <div style={{marginTop: 22, fontSize: 24, lineHeight: 1.35, color: brand.mutedText}}>{scene.onScreenText.join(' • ')}</div> : null}
+        </div>
+        <div style={{display: 'flex', justifyContent: 'space-between', gap: 24, marginTop: 24, paddingTop: 14, borderTop: `2px solid ${brand.primary}88`, fontSize: 16, color: brand.mutedText, textShadow}}>
+          <span>{scene.citationStyle || 'Sources in Production Manifest'}</span>
+          {synthetic ? <span style={{color: brand.text, fontWeight: 750}}>Synthetic visual</span> : null}
+        </div>
       </div>
     </AbsoluteFill>
   );

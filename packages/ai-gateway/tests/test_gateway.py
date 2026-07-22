@@ -9,7 +9,10 @@ from editorial_ai_gateway.gateway import (
     FunctionDriver,
     GatewayRequest,
     ProviderRoute,
+    _decode_json_http_response,
+    _deadline_http_timeout,
     deterministic_redact,
+    read_bounded_http_body,
 )
 
 
@@ -56,6 +59,14 @@ def test_provider_routes_enforce_fixed_safe_endpoints() -> None:
         ProviderRoute.model_validate(data)
 
 
+def test_http_timeout_honors_the_bounded_model_deadline() -> None:
+    timeout = _deadline_http_timeout(600)
+
+    assert timeout.total == 600
+    assert timeout.sock_read == 600
+    assert timeout.connect == 10
+
+
 def test_provider_schema_preserves_structure_and_drops_unsupported_grammar_constraints() -> None:
     schema = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -93,6 +104,52 @@ def test_provider_schema_preserves_structure_and_drops_unsupported_grammar_const
 
 def test_provider_content_accepts_a_single_markdown_json_fence() -> None:
     assert _content_json('```json\n{"ok": true}\n```') == {"ok": True}
+
+
+def test_provider_content_extracts_json_after_local_reasoning_text() -> None:
+    assert _content_json('Reasoning omitted from result.\n{"ok": true}\nDone.') == {
+        "ok": True
+    }
+
+
+def test_json_http_decoder_reassembles_openai_sse_content() -> None:
+    raw = (
+        b'data: {"choices":[{"delta":{"content":"{\\"answer\\":"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"\\"ok\\"}"}}]}\n\n'
+        b'data: [DONE]\n'
+    )
+
+    value = _decode_json_http_response(raw)
+
+    assert value["choices"][0]["message"]["content"] == '{"answer":"ok"}'
+
+
+def test_json_http_decoder_accepts_unescaped_controls_in_local_message_content() -> None:
+    raw = b'{"choices":[{"message":{"content":"line one\nline two"}}]}'
+
+    value = _decode_json_http_response(raw)
+
+    assert value["choices"][0]["message"]["content"] == "line one\nline two"
+
+
+async def test_bounded_http_reader_consumes_every_available_chunk() -> None:
+    class Content:
+        async def iter_chunked(self, size):
+            assert size == 33
+            for chunk in (b'{"part":', b'"complete"}'):
+                yield chunk
+
+    assert await read_bounded_http_body(Content(), 32) == b'{"part":"complete"}'
+
+
+async def test_bounded_http_reader_rejects_the_first_byte_over_limit() -> None:
+    class Content:
+        async def iter_chunked(self, size):
+            yield b"1234"
+            yield b"5"
+
+    with pytest.raises(ValueError, match="byte limit"):
+        await read_bounded_http_body(Content(), 4)
 
 async def test_gateway_validates_schema_and_hashes_structured_output() -> None:
     async def fake(*args):

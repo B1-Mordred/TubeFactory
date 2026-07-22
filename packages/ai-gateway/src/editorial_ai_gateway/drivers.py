@@ -5,7 +5,12 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
-from editorial_ai_gateway.gateway import DriverResult, JSONHTTPDriver, ProviderRoute
+from editorial_ai_gateway.gateway import (
+    DriverResult,
+    JSONHTTPDriver,
+    ModelOutputError,
+    ProviderRoute,
+)
 
 
 _GRAMMAR_UNSUPPORTED_SCHEMA_KEYWORDS = {
@@ -59,7 +64,22 @@ def _content_json(value: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(candidate)
     except json.JSONDecodeError as exc:
-        raise ValueError("model provider content was not JSON") from exc
+        parsed = None
+        decoder = json.JSONDecoder()
+        for position, character in enumerate(candidate):
+            if character != "{":
+                continue
+            try:
+                embedded, _ = decoder.raw_decode(candidate[position:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(embedded, dict):
+                parsed = embedded
+                break
+        if parsed is None:
+            raise ModelOutputError(
+                "model provider content was not JSON", candidate
+            ) from exc
     if not isinstance(parsed, dict):
         raise ValueError("model provider content root must be an object")
     return parsed
@@ -91,6 +111,7 @@ class OpenAICompatibleDriver(JSONHTTPDriver):
                 "response_format": {"type": "json_schema", "json_schema": {"name": "editorial_output", "strict": True, "schema": provider_compatible_schema(response_schema)}},
                 "temperature": 0,
                 "max_tokens": route.output_limit,
+                "stream": False,
             },
             deadline=deadline,
         )

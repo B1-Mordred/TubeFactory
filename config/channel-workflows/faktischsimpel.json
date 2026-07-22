@@ -4,40 +4,38 @@
       "address": "Du",
       "language": "de",
       "prior_knowledge": "interessierte Allgemeinheit ohne vorausgesetztes Fachwissen",
-      "learning_goal": "Zusammenhänge verstehen, einordnen und anhand der Quellen selbst weiterrecherchieren"
+      "learning_goal": "Ein aktuelles Thema aus Technik oder Wissenschaft wirklich verstehen und selbst einordnen können"
     },
     "editorial_rules": {
       "evidence_first": true,
       "automation_workflow": {
-        "key": "faktischsimpel.explainer",
-        "name": "FaktischSimpel Erklärvideo",
+        "key": "faktischsimpel.simple_explainer",
+        "name": "FaktischSimpel: Einfaches Erklärvideo (5–10 min)",
         "version": 1,
         "enabled": true,
         "language": "de",
-        "summary": "Evidenzgebundene Erklärvideos, die ohne Vorwissen beginnen, komplexe Zusammenhänge schrittweise aufbauen und Gesichertes, unterschiedliche Einschätzungen sowie offene Fragen sichtbar trennen.",
+        "research_review": "automatic_source_brief",
+        "summary": "Ein schlanker, qualitätsorientierter Ablauf für aktuelle Themen aus Technik und Wissenschaft: Der Mensch wählt das Thema, TubeFactory recherchiert verlässliche Grundlagen, entwickelt ein verständliches Script und ein visuell zusammenhängendes Storyboard und produziert nach dessen Freigabe automatisch das Video.",
         "prompts": {
-          "script_writer": "Schreibe ein deutsches Erklärvideo für eine interessierte Allgemeinheit ohne vorausgesetztes Fachwissen. Sprich die Zuschauerin oder den Zuschauer respektvoll mit Du an. Beginne mit einer konkreten Frage oder Alltagssituation und liefere früh eine mentale Landkarte: Was erklären wir, welche Schritte folgen und warum ist das relevant? Baue das Verständnis danach in kleinen, logisch abhängigen Schritten auf. Führe jeden unvermeidbaren Fachbegriff vor seiner ersten Nutzung in einem einfachen Satz ein. Verwende kurze, natürliche Sätze und höchstens einen neuen Kerngedanken pro Satz. Eine Analogie darf Verständnis schaffen, muss aber als Analogie erkennbar bleiben und darf nie als Beleg dienen.\n\nDie vollständige Ausgabe braucht mindestens acht Segmente und diese Funktionen: hook, thesis, context, evidence, counterevidence, uncertainty, conclusion und call_to_action. Nutze zusätzliche context- oder evidence-Segmente, wenn ein Zwischenschritt sonst übersprungen würde. Erkläre Ursache und Korrelation niemals als dasselbe. Kennzeichne klar: (1) was durch die freigegebenen Belege gesichert ist, (2) welche Deutungen oder fachlichen Einschätzungen voneinander abweichen und warum, und (3) welche Fragen mit den vorliegenden Quellen offenbleiben. Formuliere Unsicherheit präzise statt mit vagen Floskeln. Vermeide Sensationssprache, falsche Ausgewogenheit, absolute Aussagen ohne passenden Beleg und unnötige Fachsprache.\n\nNutze ausschließlich freigegebene Claims und ihre exakten Evidence-IDs. Jede Tatsachenbehauptung muss mit einer Annotation über den exakt identischen Narrationstext verknüpft sein; Start- und Endposition müssen stimmen. Zitate müssen exakt bleiben. Der Schluss fasst nicht nur zusammen, sondern gibt ein belastbares Einordnungsmodell. Der Call-to-Action lädt zum Prüfen der verlinkten Primärquellen oder zu einer sachlichen Anschlussfrage ein; keine leere Like-und-Abo-Formel. Zielumfang: ungefähr 6 bis 10 Minuten, sofern das Dossier keinen engeren Rahmen verlangt.",
-          "script_verifier": "Prüfe den Entwurf unabhängig als strenger Fakten- und Verständlichkeitsredakteur für FaktischSimpel. Akzeptiere keine Aussage allein deshalb, weil sie plausibel klingt. Melde als error: Tatsachen ohne gültige Claim- und Evidence-Verknüpfung, Überdehnung eines Belegs, Verwechslung von Korrelation und Ursache, erfundene Details, eine als Beweis verwendete Analogie, verschleierte Unsicherheit, ausgelassene zentrale Gegenbelege oder eine falsche Darstellung von Konsens. Melde außerdem als error, wenn die Pflichtfunktionen hook, thesis, context, evidence, counterevidence, uncertainty, conclusion und call_to_action fehlen oder die Erklärschritte logisch springen.\n\nPrüfe die Verständlichkeit konkret: Fachbegriffe müssen vor Nutzung erklärt sein; ein Satz soll höchstens einen neuen Kerngedanken tragen; die Zuschauer sollen jederzeit wissen, welcher Schritt gerade erklärt wird. Unterschiedliche Einschätzungen sind nur dann als solche zu präsentieren, wenn das Dossier sie belegt. Offene Fragen dürfen nicht rhetorisch geschlossen werden. Prüfe, ob wörtliche Zitate exakt, Annotationstexte identisch mit der Narration und alle Offsets plausibel sind. Warnungen sind für Stilverbesserungen reserviert; Beleg-, Struktur- und Sicherheitsprobleme sind errors. Setze valid nur dann auf true, wenn keine error-Meldung verbleibt und die deterministische Claim-Abdeckung vollständig ist. Führe in jeder Meldung Segment, problematische Aussage und eine konkrete Korrekturrichtung an, ohne selbst neue Fakten einzuführen.",
-          "storyboard": "Entwickle ein ruhiges, anschauliches Storyboard für FaktischSimpel. Jede Szene muss genau den zugeordneten Narrationsschritt verständlicher machen; dekorative Bilder ohne Erklärfunktion sind zu vermeiden. Bevorzuge klare Diagramme, beschriftete Abläufe, Vergleiche, Zeitleisten, einfache Karten, maßstäbliche Größenvergleiche, Quellen-Screenshots und sparsame Hervorhebungen. Verwende Charts nur mit Achsen, Einheit, Zeitraum und sichtbarer Quellenzuordnung. On-Screen-Text soll pro Einblendung kurz sein, in der Regel höchstens sechs Wörter, und die Narration ergänzen statt wiederholen.\n\nGesichertes, unterschiedliche Einschätzungen und offene Fragen brauchen visuell unterscheidbare, aber nicht wertende Muster. Nutze für Belege eine zurückhaltende Quellenzeile; zeige Primärquellen bevorzugt. Verwende keine fotorealistische KI-Rekonstruktion realer Ereignisse oder Personen. Generierte abstrakte Illustrationen müssen synthetic_media_flag=true tragen und dürfen keine Evidenz vortäuschen. Halte Markenstil und Übergänge konsistent: heller neutraler Hintergrund, dunkles Grün, gedecktes Gold als Akzent, keine hektischen Zooms oder Clickbait-Symbole. Jede Szene benötigt konkrete accessibility_notes; Farbe allein darf nie Information transportieren. Verknüpfe ausschließlich die im Segment erlaubten Claim-, Source- und Narration-IDs und gib nur das geforderte JSON zurück."
+          "script_writer": "Schreibe ein deutsches Erklärvideo für FaktischSimpel, das ohne Vorwissen funktioniert und gesprochen ungefähr fünf bis zehn Minuten dauert. Finde für das konkrete Thema die klarste Dramaturgie, statt eine starre Schablone abzuarbeiten. Beginne mit einer greifbaren Frage, Beobachtung oder Situation und mache früh deutlich, was die Zuschauer am Ende verstanden haben werden. Entwickle die Erklärung Schritt für Schritt: Ein Gedanke soll den nächsten vorbereiten, unvermeidbare Fachbegriffe werden vor ihrer Verwendung einfach erklärt und Beispiele oder Analogien helfen beim Verstehen, ohne als Beleg ausgegeben zu werden. Sprich natürlich, ruhig und direkt mit Du an.\n\nDie technische Ausgabe braucht die Segmentfunktionen hook, thesis, context, evidence, counterevidence, uncertainty, conclusion und call_to_action; zusätzliche Segmente sind nur dort sinnvoll, wo sie der Erklärung helfen. Diese Bezeichnungen sind Produktionsmetadaten und sollen nicht als hörbare Kapitelüberschriften erscheinen. Nutze ausschließlich die freigegebenen, automatisch aus dem Quellenbrief übernommenen Claims und ihre Evidence-IDs. Jede überprüfbare Aussage muss exakt auf die passende Quelle begrenzt bleiben. Unterscheide klar zwischen gut belegtem Wissen, plausiblen Einordnungen, abweichenden Einschätzungen und offenen Fragen, aber überfrachte das Script nicht mit methodischen Vorbehalten. Priorisiere Verständnis, Präzision, sinnvolle Beispiele und einen flüssigen Erzählbogen. Vermeide Clickbait, unnötige Fachsprache, Wiederholungen und künstliche Füllsätze. Der Schluss soll die Leitfrage verständlich beantworten und eine hilfreiche Einordnung hinterlassen.",
+          "script_verifier": "Prüfe den Entwurf unabhängig als Fakten- und Verständlichkeitsredaktion für FaktischSimpel. Entscheidend ist, ob ein Mensch ohne Vorwissen dem Gedankengang folgen kann, ob die Leitfrage tatsächlich beantwortet wird und ob das Ergebnis als fünf- bis zehnminütiges Erklärvideo interessant und gehaltvoll ist. Suche nach logischen Sprüngen, unklar eingeführten Begriffen, unnötigen Wiederholungen, abstrakten Passagen ohne Beispiel und Aussagen, die weiter gehen als die verknüpften Quellen. Ursache und Korrelation, Messwert und Interpretation sowie gesicherter Stand und offene Frage müssen sauber getrennt sein.\n\nMelde als error nur Probleme, die Faktentreue, Nachvollziehbarkeit, notwendige Produktionsstruktur oder ein sinnvolles Ergebnis wirklich blockieren: unbelegte Tatsachen, falsche Evidence-Zuordnung, erfundene Details, überzogene Schlussfolgerungen, ausgelassene zentrale Gegeninformation oder ein unverständlicher Erklärsprung. Nutze warnings für verbesserbaren Stil. Die technischen Segmentfunktionen hook, thesis, context, evidence, counterevidence, uncertainty, conclusion und call_to_action müssen vorhanden sein, dürfen dramaturgisch aber frei und themengerecht ausgestaltet werden. Schlage konkrete Korrekturen vor, ohne neue Fakten einzuführen. Setze valid nur dann auf true, wenn keine errors verbleiben und die deterministische Quellen- und Claim-Prüfung bestanden ist.",
+          "storyboard": "Entwickle aus dem freigegebenen Script ein durchgehendes FaktischSimpel-Storyboard, das die Erklärung sichtbar leichter verständlich macht. Lege zuerst gedanklich eine kleine visuelle Stilwelt für dieses Video fest und halte Formen, Farben, Typografie, Perspektive, Maßstab und Übergänge über alle Szenen hinweg konsistent. Nutze pro Abschnitt die Darstellung, die den jeweiligen Gedanken am besten erklärt: zum Beispiel vereinfachte Abläufe, räumliche Modelle, Vergleiche, Karten, Zeitleisten, Größenrelationen, beschriftete Diagramme, Quellenansichten oder zurückhaltende illustrative Sequenzen. Bilder sollen nicht bloß dekorieren, sondern jeweils eine konkrete Verständnisaufgabe erfüllen.\n\nPlane die Szenen so, dass daraus zusammenhängende Videosequenzen entstehen und visuelle Elemente bei Bedarf über mehrere Einstellungen weitergeführt werden können. On-Screen-Text bleibt kurz und ergänzt die Narration. Diagramme brauchen verständliche Beschriftungen und bei Daten eine sichtbare Quellenzuordnung. Verwende keine täuschend echte KI-Rekonstruktion realer Ereignisse oder Personen; generierte Illustrationen werden als synthetisch markiert und dürfen keine Evidenz vortäuschen. Der Markenstil ist ruhig und modern: heller neutraler Hintergrund, dunkles Grün, gedecktes Gold als Akzent, klare Bewegung statt hektischer Zooms. Jede Szene erhält konkrete accessibility_notes. Verknüpfe nur die für das Segment erlaubten Claim-, Source- und Narration-IDs und gib ausschließlich das geforderte JSON zurück."
         },
         "stages": [
-          {"key": "topic_discovery", "label": "Themenradar und Dublettenprüfung", "mode": "automatic"},
-          {"key": "opportunity_review", "label": "Thema und Nutzenversprechen prüfen", "mode": "human_gate"},
-          {"key": "source_acquisition", "label": "Quellen sichern und normalisieren", "mode": "automatic"},
-          {"key": "dossier_review", "label": "Claims, Gegenbelege und offene Fragen freigeben", "mode": "human_gate"},
-          {"key": "script_generation", "label": "Schrittweises deutsches Erklärskript", "mode": "automatic"},
-          {"key": "independent_verification", "label": "Unabhängige Fakten- und Verständlichkeitsprüfung", "mode": "automatic"},
-          {"key": "script_review", "label": "Exakte Skriptversion freigeben", "mode": "human_gate"},
-          {"key": "storyboard_generation", "label": "Erklärendes, quellengebundenes Storyboard", "mode": "automatic"},
-          {"key": "storyboard_review", "label": "Szenen und Quellenbindungen freigeben", "mode": "human_gate"},
-          {"key": "media_production", "label": "Narration, Visuals, Schnitt und QA", "mode": "automatic"},
-          {"key": "media_review", "label": "Exakten Render prüfen und freigeben", "mode": "human_gate"},
-          {"key": "private_upload", "label": "Privater YouTube-Upload", "mode": "assisted"},
+          {"key": "topic_discovery", "label": "Aktuelle Themen aus Technik und Wissenschaft finden", "mode": "automatic"},
+          {"key": "topic_review", "label": "Thema auswählen und Nutzenversprechen bestätigen", "mode": "human_gate"},
+          {"key": "source_brief", "label": "Vertrauenswürdige Informationen zusammentragen", "mode": "automatic"},
+          {"key": "script_generation", "label": "Verständliches Erklärscript entwickeln und prüfen", "mode": "automatic"},
+          {"key": "script_review", "label": "Script redaktionell freigeben", "mode": "human_gate"},
+          {"key": "storyboard_generation", "label": "Zusammenhängendes visuelles Konzept und Storyboard erstellen", "mode": "automatic"},
+          {"key": "storyboard_review", "label": "Storyboard und Bildsprache freigeben", "mode": "human_gate"},
+          {"key": "media_production", "label": "Einheitliche Videosequenzen, Narration und Schnitt erzeugen", "mode": "automatic"},
+          {"key": "media_review", "label": "Fertiges Erklärvideo prüfen", "mode": "human_gate"},
+          {"key": "private_upload", "label": "Privaten Upload vorbereiten", "mode": "assisted"},
           {"key": "publication_review", "label": "Veröffentlichung separat autorisieren", "mode": "human_gate"}
         ],
         "human_gates": [
           "opportunity_shortlist",
-          "dossier_approval",
           "script_approval",
           "storyboard_approval",
           "media_approval",
@@ -49,7 +47,7 @@
       "primary": "#174C3C",
       "accent": "#D6A43A",
       "background": "#F6F3EA",
-      "visual_style": "ruhig, präzise, diagrammorientiert, nicht sensationalistisch"
+      "visual_style": "ruhig, modern, klar, zusammenhängend und erklärend statt dekorativ"
     },
     "default_render_settings": {
       "aspect_ratio": "16:9",
@@ -63,28 +61,31 @@
     }
   },
   "subject": {
-    "name": "FaktischSimpel Themenradar",
+    "name": "FaktischSimpel: Aktuelle Technik & Wissenschaft",
     "enabled": true,
-    "topic": "Erklärungsbedürftige Zusammenhänge aus Wissenschaft, Technik, Gesellschaft und Alltag mit belastbarer Evidenz und erkennbarem Nutzen für ein deutschsprachiges Publikum",
-    "research_goal": "Finde konkrete, zeitgemäße Fragen, bei denen ein FaktischSimpel-Video einen komplexen Zusammenhang ohne Vorwissen schrittweise erklären kann. Bevorzuge Themen mit zugänglichen Primärquellen, klar trennbaren gesicherten Erkenntnissen, fachlichen Einschätzungen und offenen Fragen. Vermeide bloße Nachrichtenwiedergabe; gesucht wird ein dauerhaft nützliches Erklärstück mit nachvollziehbarem Erkenntnisgewinn.",
+    "topic": "Aktuelle, für ein deutschsprachiges Publikum relevante Fragen und Entwicklungen aus Technik und Wissenschaft, die sich in fünf bis zehn Minuten anschaulich erklären lassen",
+    "research_goal": "Finde aktuelle Themen, bei denen eine verständliche Erklärung echten Erkenntnisgewinn bietet. Ein gutes Thema besitzt eine klare Leitfrage, genügend verlässliche öffentlich zugängliche Informationen und ein visuelles Erklärungspotenzial. Bevorzuge neue Forschung, technische Entwicklungen und wissenschaftlich erklärbare Alltagsfragen. Die Aktualität ist der Anlass; das Video soll vor allem den zugrunde liegenden Zusammenhang verständlich machen.",
     "excluded_angles": [
-      "reine Nachrichtennacherzählung ohne erklärbaren Zusammenhang",
-      "Empörung, Angst oder Prominenz als einziges Nutzenversprechen",
-      "medizinische, rechtliche oder finanzielle Einzelfallberatung",
-      "Themen ohne mindestens zwei voneinander unabhängige belastbare Quellen"
+      "reine Produktmeldung oder Nachricht ohne erklärbaren Zusammenhang",
+      "Clickbait, Empörung oder Angst als einziges Nutzenversprechen",
+      "medizinische Einzelfallberatung oder unbelegte Heilversprechen",
+      "Themen, für die keine zwei voneinander unabhängigen verlässlichen Quellen auffindbar sind"
     ],
     "seed_queries": [
-      "aktuelle Studie überraschender Zusammenhang Alltag Deutschland",
-      "neue Forschung warum funktioniert Technik Auswirkungen Alltag",
-      "gesellschaftlicher Trend Daten Ursachen Einordnung Deutschland",
-      "wissenschaftlicher Konsens offene Fragen aktuelle Forschung"
+      "site:helmholtz.de/newsroom Forschung Technologie",
+      "site:mpg.de Forschung neue Studie",
+      "site:fraunhofer.de Presse Forschung Technologie",
+      "site:idw-online.de news Forschung Technik Wissenschaft",
+      "site:spektrum.de/news Forschung Technik Wissenschaft",
+      "site:scinexx.de/news Forschung neue Studie",
+      "site:mdr.de/wissen Forschung Technik"
     ],
     "related_concepts": [
-      "Ursache und Korrelation",
-      "wissenschaftlicher Konsens",
-      "Messunsicherheit",
-      "Systemzusammenhang",
-      "Alltagsauswirkung",
+      "Funktionsweise",
+      "Ursache und Wirkung",
+      "Messung und Unsicherheit",
+      "praktische Bedeutung",
+      "Grenzen des Wissens",
       "Technikfolgen"
     ],
     "negative_keywords": [
@@ -104,47 +105,62 @@
     "source_requirements": {
       "minimum_independent": 2,
       "minimum_primary": 1,
-      "expected_primary_types": ["official record", "original study", "official dataset"]
+      "expected_primary_types": ["original study", "official research institution", "official dataset", "technical documentation"]
     },
     "schedule": {
-      "cron": "0 7 * * 1",
+      "cron": "0 7 * * 1,4",
       "timezone": "Europe/Berlin"
     },
     "freshness_policy": {
-      "lookback_days": 21,
+      "lookback_days": 30,
       "maximum_source_age_days": 3650
     },
     "format_policy": {
-      "target": "evidence_first_explainer",
-      "duration_seconds": 480
+      "target": "simple_explainer",
+      "evidence_research_timing": "after_topic_selection",
+      "duration_seconds": 450,
+      "minimum_duration_seconds": 300,
+      "maximum_duration_seconds": 600,
+      "speaking_rate_wpm": 135,
+      "max_enrichment_rounds": 2,
+      "minimum_coverage_units": 5,
+      "topic_review_quality": {
+        "minimum_confidence": 0.65,
+        "dimension_minimums": {
+          "explainer_need": 70,
+          "audience_relevance": 65,
+          "video_suitability": 65,
+          "channel_fit": 70
+        }
+      }
     },
     "editorial_profile": {
-      "tone": "sachlich, anschaulich, schrittweise, ruhig und ohne unnötige Fachsprache",
+      "tone": "sachlich, neugierig, anschaulich, ruhig und ohne unnötige Fachsprache",
       "address": "Du",
-      "distinguish": ["gesichert", "unterschiedliche Einschätzungen", "offen"]
+      "distinguish": ["gut belegt", "Einordnung", "offen"]
     },
     "risk": "medium",
     "budget": {
-      "tokens": 75000,
+      "tokens": 65000,
       "gpu_seconds": 1800,
       "currency_minor": 0
     },
     "opportunity_weights": {
-      "audience_fit": 1.25,
-      "evidence_potential": 1.35,
+      "audience_fit": 1.2,
+      "evidence_potential": 1.2,
       "novelty": 1.0,
-      "timeliness": 0.75,
+      "timeliness": 1.2,
       "educational_value": 1.35,
-      "visual_explainability": 1.1,
+      "visual_explainability": 1.25,
       "channel_differentiation": 1.0,
-      "risk": 1.2,
-      "estimated_cost": 0.75,
-      "duplication": 1.1
+      "risk": 1.0,
+      "estimated_cost": 0.7,
+      "duplication": 1.0
     },
     "approval_profile": {
       "mode": "supervised",
       "sensitive_topics": ["finance", "health", "politics"],
-      "evidence_density_minimum": 1.5,
+      "evidence_density_minimum": 0.8,
       "repeated_scene_limit": 1
     }
   }

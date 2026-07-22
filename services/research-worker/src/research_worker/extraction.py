@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import re
@@ -158,12 +159,51 @@ def _validate_json_depth(value: Any, depth: int = 0) -> None:
             _validate_json_depth(item, depth + 1)
 
 
+def _clean_structured_markup(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _clean_structured_markup(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clean_structured_markup(item) for item in value]
+    if isinstance(value, str) and re.search(r"</?[a-zA-Z][^>]*>", value):
+        return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())
+    return value
+
+
+def _reconstruct_openalex_abstract(value: Any) -> Any:
+    """Add readable exact text without discarding the source catalog payload.
+
+    OpenAlex exposes abstracts as an inverted index.  Retaining that object is
+    useful for audit, while a reconstructed field lets the normal bounded
+    sentence extractor cite the authors' abstract exactly.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    inverted = value.get("abstract_inverted_index")
+    if not isinstance(inverted, dict) or "abstract_reconstructed" in value:
+        return value
+    positioned: list[tuple[int, str]] = []
+    for token, positions in inverted.items():
+        if not isinstance(token, str) or not isinstance(positions, list):
+            continue
+        for position in positions:
+            if isinstance(position, int) and position >= 0:
+                positioned.append((position, token))
+    if positioned:
+        value = dict(value)
+        value["abstract_reconstructed"] = " ".join(
+            token for _, token in sorted(positioned)
+        )
+    return value
+
+
 def _extract_json(body: bytes) -> ExtractedDocument:
     try:
         value = json.loads(_decode_text(body))
     except json.JSONDecodeError as exc:
         raise ValueError("source declared JSON but could not be parsed") from exc
     _validate_json_depth(value)
+    value = _reconstruct_openalex_abstract(_clean_structured_markup(value))
     text = _bounded(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
     isolated = _normalize_untrusted_text(text)
     return ExtractedDocument(

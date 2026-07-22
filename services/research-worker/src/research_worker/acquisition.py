@@ -61,6 +61,17 @@ class DomainPolicy:
         return not self.allow or any(_domain_matches(hostname, rule) for rule in self.allow)
 
 
+@dataclass(frozen=True)
+class SearxngSearchResponse:
+    """Bounded search results plus the source-health signals SearXNG returns."""
+
+    results: tuple[dict[str, Any], ...]
+    requested_engines: tuple[str, ...]
+    responding_engines: tuple[str, ...]
+    unresponsive_engines: tuple[dict[str, str], ...]
+    time_range: str | None
+
+
 class PublicAddressResolver(AbstractResolver):
     """Resolve once, reject the whole answer if any address is not globally routable.
 
@@ -410,12 +421,15 @@ async def search_searxng(
     policy: DomainPolicy,
     maximum_results: int = 10,
     lookback_days: int | None = None,
-) -> list[dict[str, Any]]:
+    engines: tuple[str, ...] = (),
+) -> SearxngSearchResponse:
     parts = urlsplit(endpoint)
     if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
         raise ValueError("SEARXNG_ENDPOINT must be an absolute HTTP(S) URL without credentials")
     timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=12)
     params = {"q": query, "format": "json", "language": language, "safesearch": "1"}
+    if engines:
+        params["engines"] = ",".join(dict.fromkeys(engine.strip() for engine in engines if engine.strip()))
     if lookback_days is not None:
         if lookback_days <= 1:
             params["time_range"] = "day"
@@ -447,6 +461,7 @@ async def search_searxng(
                     raise ValueError("SearXNG response exceeds the configured byte limit")
             payload = json.loads(raw)
     findings: list[dict[str, Any]] = []
+    responding_engines: set[str] = set()
     for item in payload.get("results", []):
         try:
             canonical = canonicalize_url(str(item.get("url", "")))
@@ -457,6 +472,11 @@ async def search_searxng(
         title = str(item.get("title", "")).strip()[:500]
         if not title:
             continue
+        responding_engines.update(
+            str(engine).strip()[:80]
+            for engine in item.get("engines", [])
+            if str(engine).strip()
+        )
         findings.append(
             {
                 "url": canonical,
@@ -468,4 +488,18 @@ async def search_searxng(
         )
         if len(findings) >= maximum_results:
             break
-    return findings
+    unresponsive_engines: list[dict[str, str]] = []
+    for failure in payload.get("unresponsive_engines", []):
+        if not isinstance(failure, (list, tuple)) or not failure:
+            continue
+        engine = str(failure[0]).strip()[:80]
+        reason = str(failure[1] if len(failure) > 1 else "unavailable").strip()[:240]
+        if engine:
+            unresponsive_engines.append({"engine": engine, "reason": reason})
+    return SearxngSearchResponse(
+        results=tuple(findings),
+        requested_engines=tuple(dict.fromkeys(engine.strip() for engine in engines if engine.strip())),
+        responding_engines=tuple(sorted(responding_engines)),
+        unresponsive_engines=tuple(unresponsive_engines),
+        time_range=params.get("time_range"),
+    )

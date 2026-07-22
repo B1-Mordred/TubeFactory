@@ -19,16 +19,20 @@ from editorial_core.workflow import ProductionStage, validate_transition
 from youtuber_api.audit import append_audit
 from youtuber_api.config import get_settings
 from youtuber_api.db import get_session
+from youtuber_api.editorial_gateway import TemporalEditorialGateway
 from youtuber_api.models import (
     ClaimEvidenceModel,
     ClaimModel,
     EvidenceExcerptModel,
     OpportunityModel,
+    OpportunityAIQualificationModel,
     OpportunitySourceModel,
     OpportunityScoreModel,
     ResearchDossierModel,
+    DossierAIAssessmentModel,
     ResearchRunModel,
     SemanticChunkModel,
+    ScriptModel,
     SourceDocumentModel,
     SourceRelationshipModel,
     SourceSnapshotModel,
@@ -39,6 +43,10 @@ from youtuber_api.models import (
 )
 from youtuber_api.research_gateway import TemporalResearchGateway
 from youtuber_api.schemas import (
+    AllOpportunityArchiveView,
+    AllOpportunityArchiveWrite,
+    AutomaticContinuation,
+    ArchivedOpportunityListItem,
     ClaimLedgerItem,
     DossierDetail,
     DossierListItem,
@@ -55,6 +63,8 @@ from youtuber_api.schemas import (
     ResearchWorkflowLogEntry,
     ResearchWorkflowRetry,
     ReviewDecision,
+    ScoredOpportunityArchiveView,
+    ScoredOpportunityArchiveWrite,
     SourceBrowserItem,
     SourceIndexStart,
     SourcePreview,
@@ -96,6 +106,19 @@ def _validated_workflow_id(workflow_id: str) -> str:
     if not _WORKFLOW_ID_PATTERN.fullmatch(workflow_id):
         raise HTTPException(status_code=422, detail="Invalid workflow ID")
     return workflow_id
+
+
+def _eligible_evidence_source() -> Any:
+    """Hide automatically rejected legacy enrichment noise from evidence surfaces."""
+
+    return ~and_(
+        SourceDocumentModel.reputation["discovered_via"].as_string()
+        == "generic_evidence_search",
+        func.coalesce(
+            SourceDocumentModel.reputation["relevance_score"].as_string(), ""
+        )
+        == "",
+    )
 
 
 async def _start_tracked_workflow(
@@ -265,11 +288,6 @@ async def start_live_research_run(
         .order_by(ResearchRunModel.created_at.desc())
         .limit(1)
     )
-    if latest_run is None or latest_run.state != ProductionStage.RESEARCHING.value:
-        raise HTTPException(
-            status_code=409,
-            detail="Complete approved source acquisition before building the dossier",
-        )
     snapshot_count = await session.scalar(
         select(func.count(func.distinct(SourceSnapshotModel.id)))
         .select_from(OpportunitySourceModel)
@@ -281,6 +299,56 @@ async def start_live_research_run(
     )
     if not snapshot_count:
         raise HTTPException(status_code=409, detail="No immutable source snapshots are available")
+    if latest_run is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Complete approved source acquisition before building the dossier",
+        )
+    if latest_run.state != ProductionStage.RESEARCHING.value:
+        if latest_run.state not in {
+            "INSUFFICIENT_EXPLANATION_EVIDENCE",
+            "DOSSIER_REVIEW",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Research cannot be restarted from state {latest_run.state}",
+            )
+        now = datetime.now(timezone.utc)
+        revision_run = ResearchRunModel(
+            opportunity_id=opportunity.id,
+            workflow_id=f"research-revision-{payload.idempotency_key}",
+            state=ProductionStage.RESEARCHING.value,
+            research_plan={
+                **(latest_run.research_plan or {}),
+                "revision_of_research_run_id": str(latest_run.id),
+                "reason": "automatic explanation-readiness optimization",
+            },
+            progress={
+                "percent": 25,
+                "sources_acquired": int(snapshot_count),
+                "revision_of_research_run_id": str(latest_run.id),
+            },
+            correlation_id=request.state.correlation_id,
+            started_by=actor.id,
+            completed_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(revision_run)
+        await session.flush()
+        session.add(
+            WorkflowTransitionModel(
+                aggregate_type="opportunity",
+                aggregate_id=opportunity.id,
+                from_stage="PAUSED" if latest_run.state == "INSUFFICIENT_EXPLANATION_EVIDENCE" else "DOSSIER_REVIEW",
+                to_stage=ProductionStage.RESEARCHING.value,
+                reason="automatic evidence enrichment revision started",
+                actor_id=actor.id,
+                correlation_id=request.state.correlation_id,
+                occurred_at=now,
+            )
+        )
+        latest_run = revision_run
     await _start_tracked_workflow(
         session,
         gateway,
@@ -300,6 +368,7 @@ async def start_live_research_run(
             "opportunity_id": str(opportunity.id),
             "research_run_id": str(latest_run.id),
             "snapshot_count": snapshot_count,
+            "revision": bool(latest_run.research_plan.get("revision_of_research_run_id")),
         },
     )
     await session.commit()
@@ -629,6 +698,11 @@ async def list_opportunities(
             OpportunitySourceModel.opportunity_id,
             func.count(OpportunitySourceModel.id).label("source_count"),
         )
+        .join(
+            SourceDocumentModel,
+            SourceDocumentModel.id == OpportunitySourceModel.source_document_id,
+        )
+        .where(_eligible_evidence_source())
         .group_by(OpportunitySourceModel.opportunity_id)
         .subquery()
     )
@@ -641,6 +715,11 @@ async def list_opportunities(
             SourceSnapshotModel,
             SourceSnapshotModel.source_document_id == OpportunitySourceModel.source_document_id,
         )
+        .join(
+            SourceDocumentModel,
+            SourceDocumentModel.id == OpportunitySourceModel.source_document_id,
+        )
+        .where(_eligible_evidence_source())
         .group_by(OpportunitySourceModel.opportunity_id)
         .subquery()
     )
@@ -687,6 +766,12 @@ async def list_opportunities(
         if opportunity.id in seen:
             continue
         seen.add(opportunity.id)
+        qualification = await session.scalar(
+            select(OpportunityAIQualificationModel)
+            .where(OpportunityAIQualificationModel.opportunity_id == opportunity.id)
+            .order_by(OpportunityAIQualificationModel.qualification_version.desc())
+            .limit(1)
+        )
         items.append(
             OpportunityListItem(
                 id=opportunity.id, version=opportunity.version,
@@ -701,11 +786,214 @@ async def list_opportunities(
                 score_penalties=score.penalties if score else {},
                 score_weights=score.weights if score else {},
                 score_reasoning=score.reasoning if score else [], source_count=source_count,
+                ai_qualification=(
+                    {
+                        "id": str(qualification.id),
+                        "version": qualification.qualification_version,
+                        "dimensions": qualification.dimensions,
+                        "confidence": qualification.confidence,
+                        "abstained": qualification.abstained,
+                        "rationale": qualification.rationale,
+                        "uncertainty": qualification.uncertainty,
+                        "resulting_score_version": qualification.resulting_score_version,
+                    }
+                    if qualification else None
+                ),
                 snapshot_count=snapshot_count, research_state=research_state,
                 created_at=opportunity.created_at,
             )
         )
     return items
+
+
+@router.get(
+    "/opportunities/archived", response_model=list[ArchivedOpportunityListItem]
+)
+async def list_archived_opportunities(
+    _: Viewer,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    subject_profile_id: UUID | None = None,
+) -> list[ArchivedOpportunityListItem]:
+    score_rows = (
+        select(
+            OpportunityScoreModel,
+            func.row_number()
+            .over(
+                partition_by=OpportunityScoreModel.opportunity_id,
+                order_by=OpportunityScoreModel.score_version.desc(),
+            )
+            .label("position"),
+        )
+        .subquery()
+    )
+    source_counts = (
+        select(
+            OpportunitySourceModel.opportunity_id,
+            func.count(OpportunitySourceModel.id).label("source_count"),
+        )
+        .group_by(OpportunitySourceModel.opportunity_id)
+        .subquery()
+    )
+    statement = (
+        select(
+            OpportunityModel,
+            score_rows,
+            func.coalesce(source_counts.c.source_count, 0),
+        )
+        .outerjoin(
+            score_rows,
+            and_(
+                score_rows.c.opportunity_id == OpportunityModel.id,
+                score_rows.c.position == 1,
+            ),
+        )
+        .outerjoin(source_counts, source_counts.c.opportunity_id == OpportunityModel.id)
+        .where(OpportunityModel.deleted_at.is_not(None))
+        .order_by(OpportunityModel.deleted_at.desc(), OpportunityModel.created_at.desc())
+    )
+    if subject_profile_id is not None:
+        statement = statement.where(OpportunityModel.subject_profile_id == subject_profile_id)
+    rows = (await session.execute(statement)).all()
+    items: list[ArchivedOpportunityListItem] = []
+    for row in rows:
+        opportunity = row[0]
+        score = row._mapping
+        source_count = int(row[-1])
+        items.append(
+            ArchivedOpportunityListItem(
+                id=opportunity.id,
+                version=opportunity.version,
+                subject_profile_id=opportunity.subject_profile_id,
+                title=opportunity.title,
+                summary=opportunity.summary,
+                editorial_rationale=opportunity.editorial_rationale,
+                policy_snapshot=opportunity.policy_snapshot,
+                decision=opportunity.decision,
+                grouping_reason=opportunity.grouping_reason,
+                estimated_cost=opportunity.estimated_cost,
+                score=score.get("total"),
+                score_version=score.get("score_version"),
+                score_components=score.get("positive_components") or {},
+                score_penalties=score.get("penalties") or {},
+                score_weights=score.get("weights") or {},
+                score_reasoning=score.get("reasoning") or [],
+                source_count=source_count,
+                snapshot_count=0,
+                research_state=None,
+                created_at=opportunity.created_at,
+                archived_at=opportunity.deleted_at,
+            )
+        )
+    return items
+
+
+@router.post(
+    "/opportunities/archive-scored", response_model=ScoredOpportunityArchiveView
+)
+async def archive_scored_opportunities(
+    payload: ScoredOpportunityArchiveWrite,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ScoredOpportunityArchiveView:
+    """Remove stale scored findings from the active board without erasing evidence history."""
+
+    subject = await session.get(SubjectProfileModel, payload.subject_profile_id)
+    if subject is None or subject.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Subject profile not found")
+    candidates = list(
+        (
+            await session.scalars(
+                select(OpportunityModel)
+                .join(
+                    OpportunityScoreModel,
+                    OpportunityScoreModel.opportunity_id == OpportunityModel.id,
+                )
+                .where(
+                    OpportunityModel.subject_profile_id == subject.id,
+                    OpportunityModel.deleted_at.is_(None),
+                )
+                .order_by(OpportunityModel.created_at, OpportunityModel.id)
+                .with_for_update()
+            )
+        ).unique()
+    )
+    blocked_ids: set[UUID] = set()
+    archived_at = datetime.now(timezone.utc)
+    archived_ids: list[str] = []
+    for opportunity in candidates:
+        opportunity.deleted_at = archived_at
+        opportunity.updated_at = archived_at
+        opportunity.version += 1
+        archived_ids.append(str(opportunity.id))
+    await append_audit(
+        session,
+        action="opportunity.scored_batch_archived",
+        actor_id=actor.id,
+        target_type="subject_profile",
+        target_id=str(subject.id),
+        correlation_id=request.state.correlation_id,
+        context={
+            "reason": payload.reason,
+            "archived_count": len(archived_ids),
+            "archived_opportunity_ids": archived_ids,
+            "blocked_opportunity_ids": [str(value) for value in sorted(blocked_ids, key=str)],
+            "immutable_scores_retained": True,
+            "linked_research_and_editorial_history_retained": True,
+        },
+    )
+    await session.commit()
+    return ScoredOpportunityArchiveView(
+        subject_profile_id=subject.id,
+        archived_count=len(archived_ids),
+        blocked_count=len(blocked_ids),
+        archived_at=archived_at,
+    )
+
+
+@router.post(
+    "/opportunities/archive-all", response_model=AllOpportunityArchiveView
+)
+async def archive_all_opportunities(
+    payload: AllOpportunityArchiveWrite,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AllOpportunityArchiveView:
+    """Archive every active finding while retaining its complete immutable lineage."""
+
+    opportunities = list(
+        await session.scalars(
+            select(OpportunityModel)
+            .where(OpportunityModel.deleted_at.is_(None))
+            .order_by(OpportunityModel.created_at, OpportunityModel.id)
+            .with_for_update()
+        )
+    )
+    archived_at = datetime.now(timezone.utc)
+    for opportunity in opportunities:
+        opportunity.deleted_at = archived_at
+        opportunity.updated_at = archived_at
+        opportunity.version += 1
+    await append_audit(
+        session,
+        action="opportunity.systemwide_batch_archived",
+        actor_id=actor.id,
+        target_type="opportunity_archive",
+        target_id="all-active",
+        correlation_id=request.state.correlation_id,
+        context={
+            "reason": payload.reason,
+            "archived_count": len(opportunities),
+            "immutable_scores_retained": True,
+            "linked_research_and_editorial_history_retained": True,
+        },
+    )
+    await session.commit()
+    return AllOpportunityArchiveView(
+        archived_count=len(opportunities),
+        archived_at=archived_at,
+    )
 
 
 @router.post(
@@ -775,6 +1063,52 @@ async def decide_opportunity(
             "editorial_rationale": rationale, "policy_snapshot": policy_snapshot,
         },
     )
+    continuation: AutomaticContinuation | None = None
+    if payload.decision == "approved":
+        source_count = await session.scalar(
+            select(func.count(OpportunitySourceModel.id)).where(
+                OpportunitySourceModel.opportunity_id == opportunity.id
+            )
+        )
+        if not source_count:
+            continuation = AutomaticContinuation(
+                state="awaiting_input",
+                action="source_acquisition",
+                message="Approval is recorded, but this opportunity has no linked source candidates.",
+            )
+        else:
+            idempotency_key = f"approval-{opportunity.id.hex}-v{opportunity.version}"
+            workflow_id = f"source-acquisition-{idempotency_key}"
+            _, reconciled = await _start_tracked_workflow(
+                session,
+                _gateway(request),
+                workflow_type="source-acquisition",
+                workflow_request={
+                    "workflow_id": workflow_id,
+                    "idempotency_key": idempotency_key,
+                    "opportunity_id": str(opportunity.id),
+                    "actor_id": str(actor.id),
+                    "correlation_id": request.state.correlation_id,
+                    "auto_continue": True,
+                },
+                actor=actor,
+                correlation_id=request.state.correlation_id,
+            )
+            continuation = AutomaticContinuation(
+                state="reconciled" if reconciled else "started",
+                action="source_acquisition_and_dossier",
+                workflow_id=workflow_id,
+                message="Source acquisition started and will continue automatically into dossier generation.",
+            )
+        await append_audit(
+            session,
+            action=f"automation.opportunity_{continuation.state}",
+            actor_id=actor.id,
+            target_type="opportunity",
+            target_id=str(opportunity.id),
+            correlation_id=request.state.correlation_id,
+            context=continuation.model_dump(mode="json"),
+        )
     await session.commit()
     return OpportunityDecisionView(
         id=opportunity.id,
@@ -782,6 +1116,7 @@ async def decide_opportunity(
         version=opportunity.version,
         decision_reason=opportunity.decision_reason,
         decided_at=opportunity.decided_at,
+        automatic_continuation=continuation,
     )
 
 
@@ -792,6 +1127,7 @@ async def list_sources(
     opportunity_id: UUID | None = Query(default=None),
 ) -> list[SourceBrowserItem]:
     statement = select(SourceDocumentModel).where(SourceDocumentModel.deleted_at.is_(None))
+    statement = statement.where(_eligible_evidence_source())
     if opportunity_id is not None:
         statement = statement.join(
             OpportunitySourceModel,
@@ -1024,7 +1360,9 @@ async def list_dossiers(
     dossiers = list(
         await session.scalars(
             select(ResearchDossierModel)
+            .join(OpportunityModel, OpportunityModel.id == ResearchDossierModel.opportunity_id)
             .where(ResearchDossierModel.deleted_at.is_(None))
+            .where(OpportunityModel.deleted_at.is_(None))
             .order_by(ResearchDossierModel.created_at.desc())
         )
     )
@@ -1080,9 +1418,15 @@ async def get_dossier(
             ClaimLedgerItem(
                 id=claim.id, normalized_statement=claim.normalized_statement, claim_type=claim.claim_type,
                 confidence=claim.confidence, status=claim.status, risk=claim.risk, central=claim.central,
-                version=claim.version, evidence=evidence,
+                coverage_unit_ids=claim.coverage_unit_ids, version=claim.version, evidence=evidence,
             )
         )
+    assessment = await session.scalar(
+        select(DossierAIAssessmentModel)
+        .where(DossierAIAssessmentModel.research_dossier_id == dossier.id)
+        .order_by(DossierAIAssessmentModel.assessment_version.desc())
+        .limit(1)
+    )
     return DossierDetail(
         id=dossier.id, opportunity_id=dossier.opportunity_id, dossier_version=dossier.dossier_version,
         version=dossier.version,
@@ -1092,7 +1436,22 @@ async def get_dossier(
         alternative_explanations=dossier.alternative_explanations,
         source_quality_notes=dossier.source_quality_notes, safe_conclusions=dossier.safe_conclusions,
         prohibited_overstatements=dossier.prohibited_overstatements, proposed_angles=dossier.proposed_angles,
+        explanation_plan=dossier.explanation_plan,
         claims=ledger,
+        ai_evidence_assessment=(
+            {
+                "id": str(assessment.id),
+                "version": assessment.assessment_version,
+                "claim_assessments": assessment.claim_assessments,
+                "source_assessments": assessment.source_assessments,
+                "methodological_limits": assessment.methodological_limits,
+                "counterevidence_gaps": assessment.counterevidence_gaps,
+                "confidence": assessment.confidence,
+                "abstained": assessment.abstained,
+                "uncertainty": assessment.uncertainty,
+            }
+            if assessment else None
+        ),
     )
 
 
@@ -1127,7 +1486,7 @@ async def review_claim(
     return ClaimLedgerItem(
         id=claim.id, normalized_statement=claim.normalized_statement, claim_type=claim.claim_type,
         confidence=claim.confidence, status=claim.status, risk=claim.risk, central=claim.central,
-        version=claim.version, evidence=[],
+        coverage_unit_ids=claim.coverage_unit_ids, version=claim.version, evidence=[],
     )
 
 
@@ -1165,6 +1524,25 @@ async def review_dossier(
     dossier.reviewed_at = datetime.now(timezone.utc)
     dossier.updated_at = dossier.reviewed_at
     dossier.version += 1
+    approved_claim_ids: list[str] = []
+    if payload.decision == "approved":
+        supported_claims = list(
+            await session.scalars(
+                select(ClaimModel).where(
+                    ClaimModel.research_dossier_id == dossier.id,
+                    ClaimModel.status == "supported",
+                    ClaimModel.deleted_at.is_(None),
+                )
+            )
+        )
+        for claim in supported_claims:
+            claim.status = "approved"
+            claim.review_comment = payload.comment
+            claim.reviewed_by = actor.id
+            claim.reviewed_at = dossier.reviewed_at
+            claim.updated_at = dossier.reviewed_at
+            claim.version += 1
+            approved_claim_ids.append(str(claim.id))
     await append_audit(
         session,
         action=f"dossier.{payload.decision}", actor_id=actor.id, target_type="research_dossier",
@@ -1173,11 +1551,102 @@ async def review_dossier(
             "version": dossier.version, "comment": payload.comment,
             "completion_met": completion_met, "override_reason": payload.override_reason,
             "policy_snapshot": policy_snapshot,
+            "claims_approved_with_dossier": approved_claim_ids,
         },
     )
+    if approved_claim_ids:
+        await append_audit(
+            session,
+            action="dossier.supported_claims_approved",
+            actor_id=actor.id,
+            target_type="research_dossier",
+            target_id=str(dossier.id),
+            correlation_id=request.state.correlation_id,
+            context={
+                "dossier_version": dossier.version,
+                "claim_ids": approved_claim_ids,
+                "comment": payload.comment,
+            },
+        )
+    continuation: AutomaticContinuation | None = None
+    if payload.decision == "approved":
+        existing_script = await session.scalar(
+            select(ScriptModel.id).where(ScriptModel.research_dossier_id == dossier.id)
+        )
+        readiness = dossier.completion_evaluation.get("explanation_readiness", {})
+        approved_claims = await session.scalar(
+            select(func.count(ClaimModel.id)).where(
+                ClaimModel.research_dossier_id == dossier.id,
+                ClaimModel.status == "approved",
+                ClaimModel.deleted_at.is_(None),
+            )
+        )
+        if existing_script:
+            continuation = AutomaticContinuation(
+                state="completed",
+                action="script_generation",
+                message="A versioned script already exists for this approved dossier.",
+            )
+        elif not readiness.get("ready"):
+            continuation = AutomaticContinuation(
+                state="awaiting_input",
+                action="script_generation",
+                message="Approval is recorded, but explanation-readiness gates still block script generation.",
+            )
+        elif not approved_claims:
+            continuation = AutomaticContinuation(
+                state="awaiting_input",
+                action="script_generation",
+                message="Approval is recorded, but at least one claim must be approved before script generation.",
+            )
+        else:
+            idempotency_key = f"approval-{dossier.id.hex}-v{dossier.version}"
+            workflow_id = f"script-generation-{idempotency_key}"
+            workflow_payload = {
+                "workflow_id": workflow_id,
+                "dossier_id": str(dossier.id),
+                "expected_dossier_version": dossier.version,
+                "sensitivity": "internal",
+                "idempotency_key": idempotency_key,
+                "actor_id": str(actor.id),
+                "correlation_id": request.state.correlation_id,
+            }
+            existing = await session.get(WorkflowControlRecordModel, workflow_id)
+            if existing is None:
+                session.add(
+                    WorkflowControlRecordModel(
+                        workflow_id=workflow_id,
+                        workflow_type="script-generation",
+                        request_payload=workflow_payload,
+                        parent_workflow_id=None,
+                        correlation_id=request.state.correlation_id,
+                        started_by=actor.id,
+                        created_at=datetime.now(timezone.utc),
+                    )
+                )
+                await session.flush()
+            await TemporalEditorialGateway(request.app.state.temporal_client).start(
+                "script-generation", existing.request_payload if existing else workflow_payload
+            )
+            continuation = AutomaticContinuation(
+                state="reconciled" if existing else "started",
+                action="script_generation",
+                workflow_id=workflow_id,
+                message="Script generation and independent verification started automatically.",
+            )
+        await append_audit(
+            session,
+            action=f"automation.dossier_{continuation.state}",
+            actor_id=actor.id,
+            target_type="research_dossier",
+            target_id=str(dossier.id),
+            correlation_id=request.state.correlation_id,
+            context=continuation.model_dump(mode="json"),
+        )
     await session.commit()
     return DossierListItem(
         id=dossier.id, opportunity_id=dossier.opportunity_id, dossier_version=dossier.dossier_version,
         version=dossier.version, status=dossier.status, executive_summary=dossier.executive_summary,
         completion_evaluation=dossier.completion_evaluation, created_at=dossier.created_at,
+        automatic_continuation=continuation,
     )

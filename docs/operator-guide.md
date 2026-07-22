@@ -44,7 +44,7 @@ docker compose --profile core --profile research ps
 
 The profile adds private `searxng`, `research-worker`, and the self-hosted Firecrawl subsystem (API, Playwright, DNS/egress guards, PostgreSQL, Redis and RabbitMQ). None publishes a host port. SearXNG and the worker have controlled retrieval egress; the worker also joins the application/data networks so Temporal activities can persist metadata and objects. Firecrawl's browser is isolated from application/data networks and has no direct public route: DNS crosses a narrow forwarder and HTTP(S) crosses a public-address-pinning proxy. Live discovery, approved HTML, PDF, JSON, XML, CSV and text acquisition, JavaScript rendering fallback, exact-offset deterministic evidence extraction and reviewable dossier synthesis are available. The deterministic fixture path remains the repeatable offline dossier acceptance gate.
 
-For a live opportunity, shortlist it as a reviewer, acquire its approved sources as an operator, then use **Build evidence dossier** after the opportunity reports immutable snapshots and `researching`. A dossier whose completion rules are unmet remains visibly blocked. Approval then requires a reviewer to enter the separately displayed reasoned override; the reason and failed criteria are retained in the audit event.
+For a live opportunity, shortlist it as a reviewer. That approval starts durable source acquisition and then dossier generation automatically; progress and retries remain visible in Workflow activity. A dossier whose completion rules are unmet remains visibly blocked. Approval then requires a reviewer to enter the separately displayed reasoned override; the reason and failed criteria are retained in the audit event. An approved, explanation-ready dossier automatically starts cited script generation and independent verification.
 
 Each subject selects `assisted`, `supervised`, or `trusted` policy. Configure sensitive categories and evidence-density/repeated-scene limits in the same form. Sensitive/high-risk work always requires human dossier and final-video review, regardless of mode; publication always requires a reviewer. Before shortlisting any discovered or manual opportunity, provide the required **Why does this video deserve to exist?** rationale. The evaluated policy and rationale follow the approval lineage.
 
@@ -72,6 +72,16 @@ From **Scripts & storyboards**:
 2. Inspect sentence annotations, claim badges, evidence excerpts, coverage and verifier issues. Unsupported factual text remains blocked and cannot be approved.
 3. Manual edits create a draft immutable version. Run the independent verifier, then approve the exact verified version/hash. Select unlocked segments to regenerate; every unselected or locked segment is preserved exactly and the result again requires verification.
 4. Generate a storyboard only from the exact approved script version. Scene edits clone a complete storyboard version. Locks reject edit/regeneration. **Regenerate** stores an immutable alternative; **Select** revalidates and clones the complete storyboard, after which a reviewer approves the exact new hash.
+
+### Channel Brand Kit
+
+Open **Channels & subjects → Channel profiles**, choose a Channel and select **Brand Kit**. The same versioned editor is also available through **Edit**. The **Channel Brand Kit** editor stores a versioned visual identity with the Channel profile: logo text, tagline, semantic colors, heading/body font families, corner and motion character, image treatment, and a free-text visual direction. The 16:9 preview updates while editing. Saving creates a new Channel-profile version; already approved editorial artifacts keep their original inputs.
+
+Colors must be six-digit hexadecimal values and pass the server-side readability checks for normal text, muted text, surfaces, and the primary brand color. The editor intentionally does not accept CSS or arbitrary asset URLs. This keeps Brand Kits portable between the fixture renderer, ComfyUI scene generation, Remotion assembly, and future production adapters.
+
+Media production snapshots the exact Channel-profile version and normalized Brand Kit into the production manifest. Narration is generated first; the actual mastered segment lengths determine render timing without changing the approved SceneSpec. Each SceneSpec must then yield exactly one image or video Media Asset. Assembly accesses those internal MinIO objects through short-lived signed URLs, which are never persisted in the manifest or provenance records.
+
+Until the external engines are ready, `fixture-scene` and `fixture-narrator` exercise the same Media Asset and narration contracts. To switch to production providers, configure an enabled ComfyUI provider/workflow capable of returning one supported image or video asset per SceneSpec and a Voicebox profile capable of returning mastered WAV plus segment timing. Keep both services reachable from `editorial-worker`; MinIO remains reachable only on the internal data network.
 
 ### GPU/media profile and split host
 

@@ -98,6 +98,8 @@ def test_discovery_models_are_registered() -> None:
 def test_profile_schemas_default_disabled_and_high_risk_rules() -> None:
     channel = ChannelProfileWrite(slug="test-channel", name="Test Channel", languages=["en"])
     assert channel.enabled is False
+    assert channel.brand_kit["logo_text"] == "TC"
+    assert channel.brand_kit["schema_version"] == 1
     subject = SubjectProfileWrite(
         channel_profile_id="21cb77e7-4de6-44f6-8987-a5fe83b84eb9",
         name="Test subject",

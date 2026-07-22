@@ -8,7 +8,12 @@ import respx
 from unittest.mock import AsyncMock, patch
 
 from editorial_worker.comfyui import ComfyUICapabilityError, ComfyUIClient
-from editorial_worker.media_activities import _crossfade_wavs, _fixture_wav
+from editorial_worker.media_activities import (
+    _await_with_activity_heartbeat,
+    _crossfade_wavs,
+    _fixture_wav,
+    _synchronize_media_timing,
+)
 from editorial_worker.voicebox import VoiceboxRESTClient, VoiceboxWSClient
 
 
@@ -54,3 +59,60 @@ def test_voice_chunks_are_crossfaded_into_valid_mono_wav():
         assert reader.getnchannels() == 1
         assert reader.getframerate() == 48_000
         assert reader.getnframes() == 95_040
+
+
+@pytest.mark.asyncio
+async def test_long_media_wait_emits_repeated_temporal_heartbeats():
+    with patch("editorial_worker.media_activities.activity.heartbeat") as heartbeat:
+        result = await _await_with_activity_heartbeat(
+            __import__("asyncio").sleep(0.035, result="finished"),
+            "waiting_for_test_render",
+            interval_seconds=0.01,
+        )
+
+    assert result == "finished"
+    assert heartbeat.call_count >= 3
+    heartbeat.assert_any_call({"state": "waiting_for_test_render"})
+
+
+def test_mastered_narration_defines_scene_and_chapter_timing_without_changing_scene_spec():
+    context = {
+        "segments": [
+            {"id": "segment-1", "duration_seconds": 8.0},
+            {"id": "segment-2", "duration_seconds": 7.0},
+        ],
+        "scenes": [
+            {"id": "scene-1", "duration_seconds": 8.0, "scene_spec": {"purpose": "First", "duration": 8.0, "narration_segment_ids": ["segment-1"]}},
+            {"id": "scene-2", "duration_seconds": 7.0, "scene_spec": {"purpose": "Second", "duration": 7.0, "narration_segment_ids": ["segment-2"]}},
+        ],
+    }
+    narration = {
+        "narration": [
+            {"script_segment_id": "segment-1", "duration_seconds": 10.5},
+            {"script_segment_id": "segment-2", "duration_seconds": 6.25},
+        ],
+        "duration_seconds": 16.75,
+        "chapters": [],
+    }
+
+    timed_context, timed_narration = _synchronize_media_timing(context, narration)
+
+    assert [item["duration_seconds"] for item in timed_context["scenes"]] == [10.5, 6.25]
+    assert timed_context["scenes"][0]["scene_spec"]["duration"] == 8.0
+    assert timed_context["scenes"][0]["storyboard_duration_seconds"] == 8.0
+    assert timed_narration["chapters"][1]["timecode_seconds"] == 10.5
+    assert timed_context["production_duration_seconds"] == 16.75
+
+
+def test_mastered_narration_must_be_assigned_exactly_once():
+    context = {
+        "segments": [{"id": "segment-1", "duration_seconds": 8.0}],
+        "scenes": [
+            {"id": "scene-1", "duration_seconds": 8.0, "scene_spec": {"purpose": "First", "narration_segment_ids": ["segment-1"]}},
+            {"id": "scene-2", "duration_seconds": 8.0, "scene_spec": {"purpose": "Duplicate", "narration_segment_ids": ["segment-1"]}},
+        ],
+    }
+    narration = {"narration": [{"script_segment_id": "segment-1", "duration_seconds": 8.5}]}
+
+    with pytest.raises(ValueError, match="exactly one"):
+        _synchronize_media_timing(context, narration)

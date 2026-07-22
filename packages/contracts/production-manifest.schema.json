@@ -10,6 +10,7 @@
     "storyboard_version_id": {"type": "string", "format": "uuid"},
     "storyboard_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "render_tier": {"enum": ["preview", "full"]},
+    "brand": {"type": "object"},
     "scenes": {"type": "array"},
     "narration": {"type": "array"},
     "captions": {"type": "array"},

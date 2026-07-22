@@ -1,4 +1,14 @@
+from uuid import uuid4
+
+import pytest
+from pydantic import ValidationError
+
 from youtuber_api.main import app
+from youtuber_api.schemas import (
+    AllOpportunityArchiveWrite,
+    ExistingResearchScriptImportStart,
+    ScoredOpportunityArchiveWrite,
+)
 
 
 def test_application_routes_can_be_constructed() -> None:
@@ -43,6 +53,9 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/research/source-relationships" in paths
     assert "/api/v1/research/opportunities/{opportunity_id}/decision" in paths
     assert "/api/v1/research/opportunities" in paths
+    assert "/api/v1/research/opportunities/archived" in paths
+    assert "/api/v1/research/opportunities/archive-scored" in paths
+    assert "/api/v1/research/opportunities/archive-all" in paths
     assert "/api/v1/research/dossiers/{dossier_id}" in paths
     assert "/api/v1/research/dossiers/{dossier_id}/review" in paths
     assert "/api/v1/research/claims/{claim_id}/review" in paths
@@ -52,6 +65,7 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/task-model-assignments/{task_type}" in paths
     assert "/api/v1/prompt-templates/{template_key}" in paths
     assert "/api/v1/editorial/script-runs" in paths
+    assert "/api/v1/editorial/script-import-runs" in paths
     assert "/api/v1/editorial/runs/{workflow_id}/events" in paths
     assert "/api/v1/editorial/runs/{workflow_id}/cancel" in paths
     assert "/api/v1/editorial/runs/{workflow_id}/retry" in paths
@@ -87,3 +101,42 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/optimization/budgets/{scope}" in paths
     assert "/api/v1/optimization/budget-usage" in paths
     assert "/api/v1/optimization/operational-evidence" in paths
+
+
+def test_scored_opportunity_archive_requires_an_explicit_reason() -> None:
+    with pytest.raises(ValidationError):
+        ScoredOpportunityArchiveWrite(subject_profile_id=uuid4(), reason="cleanup")
+
+    payload = ScoredOpportunityArchiveWrite(
+        subject_profile_id=uuid4(),
+        reason="Remove obsolete discovery findings before a clean acceptance run.",
+    )
+    assert payload.reason.startswith("Remove obsolete")
+
+
+def test_systemwide_opportunity_archive_requires_an_explicit_reason() -> None:
+    with pytest.raises(ValidationError):
+        AllOpportunityArchiveWrite(reason="cleanup")
+
+    payload = AllOpportunityArchiveWrite(
+        reason="Archive every old workflow lineage before starting a clean test run."
+    )
+    assert payload.reason.startswith("Archive every")
+
+
+def test_existing_research_script_import_requires_substantive_text() -> None:
+    with pytest.raises(ValidationError):
+        ExistingResearchScriptImportStart(
+            opportunity_id=uuid4(),
+            title="Draft",
+            script_text="too short",
+            idempotency_key="import-test",
+        )
+
+    payload = ExistingResearchScriptImportStart(
+        opportunity_id=uuid4(),
+        title="Imported explainer",
+        script_text="A complete source-bound script sentence. " * 10,
+        idempotency_key="import-test",
+    )
+    assert len(payload.script_text) >= 200

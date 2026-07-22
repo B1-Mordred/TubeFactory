@@ -293,6 +293,17 @@ async def decide_recommendation(
         target_type="model_recommendation", target_id=str(recommendation_id),
         correlation_id=request.state.correlation_id, context={"reason": payload.reason},
     )
+    if payload.decision == "approved":
+        return await apply_recommendation(
+            recommendation_id,
+            RecommendationApplyWrite(
+                expected_baseline_assignment_id=recommendation.baseline_assignment_id,
+                comment=payload.reason,
+            ),
+            request,
+            actor,
+            session,
+        )
     await session.commit()
     return _recommendation_view(recommendation, decision, None)
 

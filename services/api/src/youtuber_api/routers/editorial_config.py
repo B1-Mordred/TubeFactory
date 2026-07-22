@@ -4,16 +4,18 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from temporalio.client import WorkflowFailureError
 
 from editorial_core.authorization import Permission
 from youtuber_api.audit import append_audit
 from youtuber_api.db import get_session
+from youtuber_api.editorial_gateway import TemporalEditorialGateway
 from youtuber_api.models import (
     AIModelModel,
     AIUsageRecordModel,
@@ -32,6 +34,7 @@ from youtuber_api.schemas import (
     PromptTemplateView,
     PromptTemplateWrite,
     ProviderUpdate,
+    ProviderModelDiscoveryView,
     ProviderView,
     ProviderWrite,
     TaskModelAssignmentView,
@@ -42,6 +45,293 @@ from youtuber_api.security import require
 
 router = APIRouter(tags=["editorial-configuration"])
 ProviderAdmin = Annotated[UserModel, Depends(require(Permission.MANAGE_PROVIDERS))]
+
+
+_ADVISORY_PROMPTS: dict[str, dict[str, Any]] = {
+    "topic_qualifier": {
+        "key": "system.topic_qualifier",
+        "system": (
+            "You are an advisory topic qualifier for an evidence-first explainer channel. "
+            "Judge only the supplied candidate and channel brief. Do not invent facts, sources, "
+            "or a final score. Semantic duplication and evidence gates are handled outside the model. "
+            "Use abstained=true when the input is too thin. Return only schema-valid JSON."
+        ),
+        "input": {
+            "type": "object",
+            "required": ["candidate", "channel", "subject", "deterministic_trace"],
+            "properties": {
+                "candidate": {"type": "object"},
+                "channel": {"type": "object"},
+                "subject": {"type": "object"},
+                "deterministic_trace": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+        "response": {
+            "type": "object",
+            "required": ["dimensions", "confidence", "abstained", "rationale", "uncertainty"],
+            "properties": {
+                "dimensions": {
+                    "type": "object",
+                    "required": ["explainer_need", "audience_relevance", "video_suitability", "channel_fit", "angle_originality"],
+                    "properties": {name: {"type": "number", "minimum": 0, "maximum": 100} for name in ("explainer_need", "audience_relevance", "video_suitability", "channel_fit", "angle_originality")},
+                    "additionalProperties": False,
+                },
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "abstained": {"type": "boolean"},
+                "rationale": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                "uncertainty": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "evidence_reviewer": {
+        "key": "system.evidence_reviewer",
+        "system": (
+            "You are a source-bound evidence reviewer. Assess each supplied claim only against its "
+            "exact excerpts and source metadata. Distinguish support, context, and contradiction; "
+            "flag causal overreach, method and transferability limits, dependence, and missing "
+            "counterevidence. Never approve a claim or dossier and never invent an excerpt. Use "
+            "abstained=true if the excerpts are insufficient. Return one plain JSON object only, "
+            "without markdown or reasoning outside the fields. Express every claim and source "
+            "assessment as one concise string beginning with the supplied ID."
+        ),
+        "input": {
+            "type": "object",
+            "required": ["dossier", "claims"],
+            "properties": {"dossier": {"type": "object"}, "claims": {"type": "array"}},
+            "additionalProperties": False,
+        },
+        "response": {
+            "type": "object",
+            "required": ["claim_assessments", "source_assessments", "methodological_limits", "counterevidence_gaps", "confidence", "abstained", "uncertainty"],
+            "properties": {
+                "claim_assessments": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
+                "source_assessments": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
+                "methodological_limits": {"type": "array", "items": {"type": "string"}, "maxItems": 30},
+                "counterevidence_gaps": {"type": "array", "items": {"type": "string"}, "maxItems": 30},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "abstained": {"type": "boolean"},
+                "uncertainty": {"type": "array", "items": {"type": "string"}, "maxItems": 30},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "evidence_synthesizer": {
+        "key": "system.evidence_synthesizer",
+        "system": (
+            "You synthesize review candidates only from supplied exact excerpts. Create atomic, "
+            "cautious subject-matter claims that directly answer the research question and assigned "
+            "explanation coverage units. Treat current_claim_bank as already retained work: do not "
+            "repeat or lightly paraphrase it. Work primarily on target_coverage_units when supplied, "
+            "and aim for two or three non-overlapping factual atoms per target unit when the excerpts "
+            "support them. Never return an editorial or document-description meta-claim "
+            "such as what a learning item could include, what a paper discusses, or what could be "
+            "compared. Reserve central=true for only three to five thesis-level claims across the "
+            "complete claim bank; mark mechanisms, examples, limits, definitions, and other useful "
+            "details central=false. Every central "
+            "claim must cite at least two supporting excerpt IDs with different independence_key "
+            "values. Use context or contradicts when an excerpt does not directly support the claim. "
+            "Never invent evidence, IDs, numbers, quotations, or source independence. Do not approve "
+            "anything; a human reviewer remains mandatory. A title, catalog field, identifier, or other "
+            "metadata is context only and cannot directly support a content claim. Every supporting "
+            "excerpt must itself contain the factual substance of the claim. Never list examples, "
+            "methods, numbers, or effects unless the cited excerpts explicitly contain them. Prefer "
+            "qualified wording over causal or universal claims. When readiness_policy is supplied, "
+            "attempt at least its minimum_factual_claims as distinct atomic claims and cover every "
+            "essential explanation unit; never pad the count with paraphrases or meta-claims. Set "
+            "abstained=true if the required direct evidence is unavailable. Even when abstained=true, "
+            "return claims as an empty array and include every other required response field. "
+            "Return one plain schema-valid JSON object without markdown."
+        ),
+        "input": {
+            "type": "object",
+            "required": ["research_question", "explanation_plan", "sources"],
+            "properties": {
+                "research_question": {"type": "object"},
+                "explanation_plan": {"type": "array", "maxItems": 20},
+                "readiness_policy": {"type": "object"},
+                "current_claim_bank": {"type": "array", "maxItems": 30},
+                "target_coverage_units": {"type": "array", "maxItems": 20},
+                "review_feedback": {"type": "object"},
+                "sources": {"type": "array", "maxItems": 20},
+            },
+            "additionalProperties": False,
+        },
+        "response": {
+            "type": "object",
+            "required": ["claims", "confidence", "abstained", "uncertainty"],
+            "properties": {
+                "claims": {
+                    "type": "array",
+                    "maxItems": 30,
+                    "items": {
+                        "type": "object",
+                            "required": ["statement", "claim_type", "central", "coverage_unit_ids", "evidence"],
+                        "properties": {
+                            "statement": {"type": "string", "minLength": 20, "maxLength": 700},
+                            "claim_type": {"enum": ["fact", "inference", "opinion"]},
+                            "central": {"type": "boolean"},
+                            "coverage_unit_ids": {
+                                "type": "array", "minItems": 1, "maxItems": 4,
+                                "items": {"type": "string", "minLength": 3, "maxLength": 80},
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 12,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["evidence_id", "relationship"],
+                                    "properties": {
+                                        "evidence_id": {"type": "string", "minLength": 10, "maxLength": 180},
+                                        "relationship": {"enum": ["supports", "contradicts", "context"]},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "abstained": {"type": "boolean"},
+                "uncertainty": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "research_query_planner": {
+        "key": "system.research_query_planner",
+        "system": (
+            "Plan a topic-specific explanation before planning evidence searches. Produce at least "
+            "six concise coverage units that together support a no-prior-knowledge explanation: "
+            "foundation, mechanism, evidence, limits, alternatives or implications, and open questions. "
+            "When current_readiness.existing_coverage_units is non-empty, this is an enrichment round: "
+            "preserve those coverage unit IDs and meanings exactly, do not redesign the explanation "
+            "plan, and focus searches on uncovered units and the supplied review_feedback. "
+            "Then return concise search-engine queries, not answers, and bind every query to one or more "
+            "coverage unit IDs. The first two queries must be English-language scholarly-catalog queries: "
+            "first an original/primary-research query and then an independent review query. Translate "
+            "the topic's central technical concepts into established English terminology for both, "
+            "while retaining the concrete subject instead of broadening to a merely adjacent field. "
+            "Then cover the subject language when useful. Include distinct roles "
+            "for original or primary research, official data or documentation, an independent review, "
+            "and limitations or counterevidence. Use concrete concepts and synonyms instead of quoting "
+            "the complete candidate title. Every query must retain at least two central topic concepts; "
+            "country names and generic words such as study, challenge, technology, or analysis do not "
+            "count as central concepts. Do not invent source URLs, findings, or facts. Set "
+            "abstained=true if the topic is too ambiguous. Return one plain schema-valid JSON object."
+        ),
+        "input": {
+            "type": "object",
+            "required": ["candidate", "subject", "current_readiness"],
+            "properties": {
+                "candidate": {"type": "object"},
+                "subject": {"type": "object"},
+                "current_readiness": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+        "response": {
+            "type": "object",
+            "required": ["coverage_units", "queries", "confidence", "abstained", "uncertainty"],
+            "properties": {
+                "coverage_units": {
+                    "type": "array", "minItems": 6, "maxItems": 9,
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "question", "role", "essential"],
+                        "properties": {
+                            "id": {"type": "string", "minLength": 3, "maxLength": 80},
+                            "question": {"type": "string", "minLength": 10, "maxLength": 500},
+                            "role": {"enum": ["foundation", "mechanism", "evidence", "limits", "alternatives", "implications", "open_questions"]},
+                            "essential": {"type": "boolean"},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "required": ["query", "role", "language", "coverage_unit_ids"],
+                        "properties": {
+                            "query": {"type": "string", "minLength": 5, "maxLength": 300},
+                            "role": {"enum": ["primary", "official", "independent", "counterevidence"]},
+                            "language": {"type": "string", "minLength": 2, "maxLength": 20},
+                            "coverage_unit_ids": {
+                                "type": "array", "minItems": 1, "maxItems": 6,
+                                "items": {"type": "string", "minLength": 3, "maxLength": 80},
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "abstained": {"type": "boolean"},
+                "uncertainty": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+async def _ensure_advisory_prompt(session: AsyncSession, task_type: str, actor_id: UUID) -> None:
+    definition = _ADVISORY_PROMPTS.get(task_type)
+    if definition is None:
+        return
+    now = datetime.now(timezone.utc)
+    payload = {
+        "template_key": definition["key"],
+        "task_type": task_type,
+        "system_instructions": definition["system"],
+        "template": "Structured input:\n{{structured_input_json}}\n\nRequired response schema:\n{{response_schema_json}}",
+        "input_schema": definition["input"],
+        "response_schema": definition["response"],
+    }
+    content_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    template = await session.scalar(
+        select(PromptTemplateModel).where(
+            PromptTemplateModel.template_key == definition["key"],
+            PromptTemplateModel.content_hash == content_hash,
+        )
+    )
+    if template is None:
+        maximum = await session.scalar(
+            select(func.max(PromptTemplateModel.template_version)).where(
+                PromptTemplateModel.template_key == definition["key"]
+            )
+        )
+        template = PromptTemplateModel(
+            **payload,
+            template_version=(maximum or 0) + 1,
+            content_hash=content_hash,
+            created_by=actor_id,
+            created_at=now,
+            comment="Reconciled system default for deterministic hybrid AI review",
+        )
+        session.add(template)
+        await session.flush()
+    head = await session.get(
+        PromptTemplateHeadModel, definition["key"], with_for_update=True
+    )
+    if head is None:
+        session.add(
+            PromptTemplateHeadModel(
+                template_key=definition["key"],
+                active_template_id=template.id,
+                updated_at=now,
+            )
+        )
+    elif head.active_template_id != template.id:
+        head.active_template_id = template.id
+        head.updated_at = now
 
 
 def _provider_view(provider: ProviderModel) -> ProviderView:
@@ -96,6 +386,47 @@ async def list_providers(
         )
     )
     return [_provider_view(provider) for provider in providers]
+
+
+@router.post(
+    "/providers/{provider_id}/discover-models",
+    response_model=ProviderModelDiscoveryView,
+)
+async def discover_models(
+    provider_id: UUID,
+    request: Request,
+    actor: ProviderAdmin,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProviderModelDiscoveryView:
+    provider = await session.get(ProviderModel, provider_id)
+    if provider is None or provider.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    workflow_id = f"provider-model-discovery-{uuid4()}"
+    try:
+        result = await TemporalEditorialGateway(
+            request.app.state.temporal_client
+        ).discover_provider_models(
+            {"workflow_id": workflow_id, "provider_id": str(provider_id)}
+        )
+    except WorkflowFailureError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The provider inventory is temporarily unreachable; the stored configuration was not changed.",
+        ) from exc
+    await append_audit(
+        session,
+        action="provider.models_discovered",
+        actor_id=actor.id,
+        target_type="provider",
+        target_id=str(provider_id),
+        correlation_id=request.state.correlation_id,
+        context={
+            "workflow_id": workflow_id,
+            "model_count": result["model_count"],
+        },
+    )
+    await session.commit()
+    return ProviderModelDiscoveryView.model_validate(result)
 
 
 @router.post("/providers", response_model=ProviderView, status_code=201)
@@ -355,6 +686,7 @@ async def write_task_assignment(
 ) -> TaskModelAssignmentView:
     if task_type != payload.task_type:
         raise HTTPException(status_code=422, detail="Task type path and body must match")
+    await _ensure_advisory_prompt(session, task_type, actor.id)
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
         {"key": f"task-model-assignment:{task_type}"},

@@ -36,11 +36,14 @@ workflow_id="$(printf '%s' "$start" | jq -er .workflow_id)"
 status=''
 for _ in $(seq 1 60); do
   status="$(curl --fail --silent --show-error --cookie "$cookie_file" "${base_url}/api/v1/research/runs/${workflow_id}")"
-  test "$(printf '%s' "$status" | jq -r .state)" = "OPPORTUNITY_REVIEW" && break
+  case "$(printf '%s' "$status" | jq -r .state)" in
+    OPPORTUNITY_REVIEW|OPPORTUNITY_REVIEW_DEGRADED|NO_NEW_OPPORTUNITIES|SOURCE_UNAVAILABLE|FAILED) break ;;
+  esac
   sleep 1
 done
 printf '%s' "$status" | jq -e '
-  .state == "OPPORTUNITY_REVIEW" and .progress == 100 and
+  (.state == "OPPORTUNITY_REVIEW" or .state == "OPPORTUNITY_REVIEW_DEGRADED") and
+  .progress == 100 and .result.search_health != "unavailable" and
   .result.search_strategy_count >= 3 and .result.raw_result_count >= .result.deduplicated_result_count and
   (.result.opportunity_ids | length) > 0
 ' >/dev/null

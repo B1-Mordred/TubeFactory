@@ -25,6 +25,17 @@ class Settings:
     minio_endpoint: str = os.getenv("MINIO_ENDPOINT", "minio:9000")
     minio_bucket: str = os.getenv("MINIO_BUCKET", "production-artifacts")
     searxng_endpoint: str = os.getenv("SEARXNG_ENDPOINT", "http://searxng:8080")
+    searxng_general_engines: str = os.getenv(
+        "SEARXNG_GENERAL_ENGINES", "bing,qwant news,bing news"
+    )
+    searxng_science_engines: str = os.getenv(
+        "SEARXNG_SCIENCE_ENGINES",
+        "bing,arxiv,pubmed",
+    )
+    openalex_endpoint: str = os.getenv(
+        "OPENALEX_ENDPOINT", "https://api.openalex.org"
+    )
+    openalex_mailto: str = os.getenv("OPENALEX_MAILTO", "")
     firecrawl_endpoint: str = os.getenv("FIRECRAWL_ENDPOINT", "")
     acquisition_user_agent: str = os.getenv(
         "ACQUISITION_USER_AGENT", "EvidenceStudioResearch/0.1 (+self-hosted editorial research)"

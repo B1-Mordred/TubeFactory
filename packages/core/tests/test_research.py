@@ -5,7 +5,19 @@ from editorial_core.research import (
     evidence_relation,
     extract_evidence_sentences,
     feature_hash_embedding,
+    scholarly_work_identity,
 )
+
+
+def test_scholarly_work_identity_collapses_common_aliases() -> None:
+    assert scholarly_work_identity("https://arxiv.org/abs/2201.05048v1") == "arxiv:2201.05048"
+    assert scholarly_work_identity("https://doi.org/10.48550/arXiv.2201.05048") == (
+        "arxiv:2201.05048"
+    )
+    assert scholarly_work_identity(
+        "https://api.openalex.org/works/W3206414838",
+        doi="https://doi.org/10.3390/en14206805",
+    ) == "doi:10.3390/en14206805"
 
 
 def test_evidence_extraction_preserves_exact_offsets_and_excludes_hostile_instruction() -> None:
@@ -22,6 +34,12 @@ def test_evidence_extraction_preserves_exact_offsets_and_excludes_hostile_instru
     assert source[evidence[0].start_offset : evidence[0].end_offset] == evidence[0].exact_text
     assert all("instructions" not in item.exact_text for item in evidence)
     assert len(evidence[0].excerpt_hash) == 64
+
+
+def test_evidence_extraction_does_not_split_decimal_measurements() -> None:
+    source = "Participants reduced sleep by 1.5 hours per night for six weeks."
+    evidence = extract_evidence_sentences(source, topic="sleep restriction")
+    assert evidence[0].exact_text == source
 
 
 def test_claim_clustering_and_relationships_are_conservative() -> None:

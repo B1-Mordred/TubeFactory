@@ -29,6 +29,24 @@ def test_search_plan_has_primary_and_falsification_branches() -> None:
     assert "correction" in plan.falsification_queries[0]
 
 
+def test_german_search_plan_uses_concise_localized_evidence_terms() -> None:
+    plan = plan_search(
+        SubjectBrief(
+            topic="Eine sehr lange allgemeine Beschreibung eines Erklärkanals, die nicht als Phrase gesucht werden soll",
+            research_goal="konkrete Fragen finden",
+            seed_queries=("aktuelle Forschung verständlich erklärt",),
+            languages=("de",),
+        )
+    )
+
+    primary = next(item.query for item in plan.strategies if item.purpose == "primary evidence")
+    assert primary.startswith("aktuelle Forschung verständlich erklärt")
+    assert "Datensatz" in primary
+    assert "Eine sehr lange allgemeine Beschreibung" not in primary
+    assert "Korrektur" in plan.falsification_queries[0]
+    assert "counterevidence" not in plan.falsification_queries[0]
+
+
 def test_fixture_discovery_deduplicates_clusters_and_scores_transparently() -> None:
     findings = (
         SearchFinding("https://example.test/report?utm_source=x", "Agency climate report", "Agency publishes climate evidence"),

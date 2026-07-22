@@ -7,6 +7,15 @@ from temporalio.worker import Worker
 
 from editorial_worker.config import Settings
 from editorial_worker.model_activities import invoke_editorial_model
+from editorial_worker.provider_activities import discover_provider_models
+from editorial_worker.provider_workflows import ProviderModelDiscoveryWorkflow
+from editorial_worker.review_activities import (
+    assess_dossier_evidence_with_ai,
+    plan_evidence_search_with_ai,
+    qualify_opportunities_with_ai,
+    review_research_synthesis_with_ai,
+    synthesize_research_evidence_with_ai,
+)
 from editorial_worker.media_activities import (
     assemble_and_qa_production,
     generate_production_narration,
@@ -14,8 +23,10 @@ from editorial_worker.media_activities import (
     load_media_production_context,
     persist_media_regeneration,
     persist_media_production,
+    synchronize_media_timing,
 )
 from editorial_worker.script_activities import (
+    assemble_script_draft,
     load_script_generation_context,
     load_script_regeneration_context,
     load_script_verification_context,
@@ -26,6 +37,7 @@ from editorial_worker.script_activities import (
     verify_script_activity,
 )
 from editorial_worker.storyboard_activities import (
+    assemble_storyboard_draft,
     load_scene_alternative_context,
     load_storyboard_generation_context,
     persist_scene_alternative,
@@ -34,6 +46,7 @@ from editorial_worker.storyboard_activities import (
     validate_storyboard_activity,
 )
 from editorial_worker.workflows import (
+    ExistingResearchScriptImportWorkflow,
     SceneAlternativeGenerationWorkflow,
     ScriptGenerationWorkflow,
     ScriptRegenerationWorkflow,
@@ -69,6 +82,8 @@ async def run() -> None:
         client,
         task_queue=settings.task_queue,
         workflows=[
+            ProviderModelDiscoveryWorkflow,
+            ExistingResearchScriptImportWorkflow,
             ScriptGenerationWorkflow,
             ScriptRegenerationWorkflow,
             ScriptVerificationWorkflow,
@@ -79,8 +94,15 @@ async def run() -> None:
             NarrationSegmentRegenerationWorkflow,
         ],
         activities=[
+            discover_provider_models,
+            qualify_opportunities_with_ai,
+            plan_evidence_search_with_ai,
+            synthesize_research_evidence_with_ai,
+            review_research_synthesis_with_ai,
+            assess_dossier_evidence_with_ai,
             load_script_generation_context,
             load_script_regeneration_context,
+            assemble_script_draft,
             invoke_editorial_model,
             merge_script_regeneration,
             verify_script_activity,
@@ -90,6 +112,7 @@ async def run() -> None:
             persist_script_verification,
             load_scene_alternative_context,
             load_storyboard_generation_context,
+            assemble_storyboard_draft,
             validate_scene_alternative,
             persist_scene_alternative,
             validate_storyboard_activity,
@@ -100,6 +123,7 @@ async def run() -> None:
             assemble_and_qa_production,
             persist_media_production,
             persist_media_regeneration,
+            synchronize_media_timing,
         ],
     )
     async with health_server:

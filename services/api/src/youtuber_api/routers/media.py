@@ -23,6 +23,7 @@ from youtuber_api.db import get_session
 from youtuber_api.editorial_gateway import TemporalEditorialGateway
 from youtuber_api.models import (
     ApprovalModel,
+    ChannelProfileModel,
     ComfyWorkflowHeadModel,
     ComfyWorkflowVersionModel,
     MediaAssetModel,
@@ -30,12 +31,14 @@ from youtuber_api.models import (
     OpportunityModel,
     ProductionManifestModel,
     ProductionRenderModel,
+    PublishMetadataVersionModel,
     QAFindingModel,
     QAOverrideModel,
     QAReportModel,
     SceneVersionModel,
     ScriptModel,
     ScriptSegmentModel,
+    ScriptVersionModel,
     StoryboardModel,
     StoryboardVersionModel,
     SubjectProfileModel,
@@ -45,12 +48,14 @@ from youtuber_api.models import (
     WorkflowControlRecordModel,
 )
 from youtuber_api.schemas import (
+    AutomaticContinuation,
     ComfyWorkflowView,
     ComfyWorkflowWrite,
     MediaAssetView,
     MediaProductionStart,
     MediaProductionView,
     MediaRegenerationStart,
+    PublishMetadataWrite,
     QAFindingView,
     QAOverrideWrite,
     RenderApprovalWrite,
@@ -266,7 +271,25 @@ async def _production_view(session: AsyncSession, production: MediaProductionMod
 
 @router.get("/productions", response_model=list[MediaProductionView])
 async def list_productions(_: Viewer, session: Annotated[AsyncSession, Depends(get_session)]) -> list[MediaProductionView]:
-    productions = list(await session.scalars(select(MediaProductionModel).order_by(MediaProductionModel.created_at.desc()).limit(100)))
+    productions = list(
+        await session.scalars(
+            select(MediaProductionModel)
+            .join(
+                StoryboardVersionModel,
+                StoryboardVersionModel.id == MediaProductionModel.storyboard_version_id,
+            )
+            .join(StoryboardModel, StoryboardModel.id == StoryboardVersionModel.storyboard_id)
+            .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
+            .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+            .where(
+                StoryboardModel.deleted_at.is_(None),
+                ScriptModel.deleted_at.is_(None),
+                OpportunityModel.deleted_at.is_(None),
+            )
+            .order_by(MediaProductionModel.created_at.desc())
+            .limit(100)
+        )
+    )
     return [await _production_view(session, item) for item in productions]
 
 
@@ -458,8 +481,109 @@ async def approve_render(render_id: UUID, payload: RenderApprovalWrite, request:
     approval = ApprovalModel(id=uuid4(), target_type="production_render", target_id=render.id, target_version=render.render_number, target_hash=render.content_hash, decision=payload.decision, comment=payload.comment, policy_snapshot={"manifest_hash": manifest.content_hash, "qa_report_hash": report.content_hash, "unoverridden_failures": unoverridden_fail, "operating_policy": policy_snapshot, "editorial_rationale": opportunity.editorial_rationale}, supersedes_approval_id=previous.id if previous else None, actor_id=actor.id, correlation_id=request.state.correlation_id, created_at=datetime.now(timezone.utc))
     session.add(approval)
     await append_audit(session, action=f"production_render.{payload.decision}", actor_id=actor.id, target_type="production_render", target_id=str(render.id), correlation_id=request.state.correlation_id, context={"render_hash": render.content_hash, "manifest_hash": manifest.content_hash, "qa_report_hash": report.content_hash, "operating_policy": policy_snapshot})
+    continuation: AutomaticContinuation | None = None
+    if payload.decision == "approved":
+        existing_metadata = await session.scalar(
+            select(PublishMetadataVersionModel).where(
+                PublishMetadataVersionModel.render_id == render.id
+            ).order_by(PublishMetadataVersionModel.version_number.desc()).limit(1)
+        )
+        if existing_metadata:
+            continuation = AutomaticContinuation(
+                state="completed",
+                action="publishing_metadata",
+                message="Publishing metadata already exists for this approved render.",
+            )
+        else:
+            assets = list(
+                await session.scalars(
+                    select(MediaAssetModel).where(MediaAssetModel.production_id == production.id)
+                )
+            )
+            caption = next(
+                (item for item in assets if item.asset_kind in {"caption_vtt", "caption_srt"}),
+                None,
+            )
+            thumbnail = next((item for item in assets if item.asset_kind == "thumbnail"), None)
+            sources = [
+                {"title": str(item.get("title", "Source")), "url": str(item.get("url", ""))}
+                for item in manifest.document.get("sources", [])
+                if item.get("url")
+            ]
+            raw_chapters = manifest.document.get("chapters", [])
+            chapters = [
+                {
+                    "title": str(item.get("title") or f"Chapter {index}"),
+                    "start_seconds": max(0, int(item.get("start_seconds", item.get("timecode_seconds", 0)))),
+                }
+                for index, item in enumerate(raw_chapters, start=1)
+            ]
+            if not chapters:
+                chapters = [{"title": "Introduction", "start_seconds": 0}]
+            script_version = await session.get(ScriptVersionModel, storyboard.script_version_id)
+            channel = await session.get(ChannelProfileModel, subject.channel_profile_id)
+            if caption is None or thumbnail is None or not sources or script_version is None:
+                missing = []
+                if caption is None:
+                    missing.append("captions")
+                if thumbnail is None:
+                    missing.append("thumbnail")
+                if not sources:
+                    missing.append("sources")
+                if script_version is None:
+                    missing.append("script title")
+                continuation = AutomaticContinuation(
+                    state="awaiting_input",
+                    action="publishing_metadata",
+                    message="Render approval is recorded, but publishing metadata needs " + ", ".join(missing) + ".",
+                )
+            else:
+                from youtuber_api.routers.publishing import create_metadata
+
+                metadata = await create_metadata(
+                    PublishMetadataWrite(
+                        render_id=render.id,
+                        expected_render_hash=render.content_hash,
+                        title=script_version.title[:100],
+                        description=(
+                            "Evidence-first explanation based on the cited sources, including uncertainty and counterevidence."
+                        ),
+                        sources=sources,
+                        evidence_url=None,
+                        chapters=chapters,
+                        tags=["evidence", "sources", "explainer"],
+                        category_id="27",
+                        language=(channel.languages[0] if channel and channel.languages else "en"),
+                        made_for_kids=False,
+                        contains_synthetic_media=any(
+                            bool(item.get("scene_spec", {}).get("synthetic_media_flag"))
+                            for item in manifest.document.get("scenes", [])
+                        ),
+                        captions={"asset_id": str(caption.id), "language": (channel.languages[0] if channel and channel.languages else "en"), "name": "Captions"},
+                        thumbnail={"asset_id": str(thumbnail.id)},
+                        comment="Automatically created after exact render approval.",
+                    ),
+                    request,
+                    actor,
+                    session,
+                )
+                continuation = AutomaticContinuation(
+                    state="completed",
+                    action="publishing_metadata",
+                    message=f"Publishing metadata v{metadata.version_number} was created automatically; private-upload approval is the next human gate.",
+                )
+        await append_audit(
+            session,
+            action=f"automation.render_{continuation.state}",
+            actor_id=actor.id,
+            target_type="production_render",
+            target_id=str(render.id),
+            correlation_id=request.state.correlation_id,
+            context=continuation.model_dump(mode="json"),
+        )
     await session.commit()
-    return await _production_view(session, production)
+    detail = await _production_view(session, production)
+    return detail.model_copy(update={"automatic_continuation": continuation})
 
 
 @router.get("/assets/{asset_id}/content")

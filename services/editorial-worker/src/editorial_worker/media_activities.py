@@ -10,7 +10,7 @@ import struct
 import subprocess
 import tempfile
 import wave
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from editorial_core.branding import normalize_brand_kit
 from editorial_core.media import TypedWorkflowInput, canonical_hash, stable_voice_chunks
 from editorial_worker.comfyui import ComfyUIClient
 from editorial_worker.config import Settings
@@ -121,7 +122,8 @@ async def load_media_production_context(request: dict[str, Any]) -> dict[str, An
     try:
         storyboard = await connection.fetchrow(
             """SELECT bv.id,bv.storyboard_id,bv.script_version_id,bv.version_number,bv.status,
-                      bv.content_hash,s.opportunity_id,cp.id AS channel_profile_id,cp.brand_kit,
+                      bv.content_hash,s.opportunity_id,cp.id AS channel_profile_id,cp.name AS channel_name,
+                      cp.version AS channel_profile_version,cp.brand_kit,
                       cp.default_render_settings,sv.verification_report
                FROM storyboard_versions bv
                JOIN storyboards b ON b.id=bv.storyboard_id
@@ -178,14 +180,18 @@ async def load_media_production_context(request: dict[str, Any]) -> dict[str, An
         )
         claim_count = await connection.fetchval("SELECT count(*) FROM script_segments seg JOIN segment_claims sc ON sc.script_segment_id=seg.id WHERE seg.script_version_id=$1", storyboard["script_version_id"])
         supported_count = await connection.fetchval("SELECT count(DISTINCT sc.id) FROM script_segments seg JOIN segment_claims sc ON sc.script_segment_id=seg.id JOIN claim_evidence ce ON ce.claim_id=sc.claim_id AND ce.relationship='supports' WHERE seg.script_version_id=$1", storyboard["script_version_id"])
+        brand = normalize_brand_kit(_json(storyboard["brand_kit"]), channel_name=storyboard["channel_name"])
         return {
             "workflow_id": request["workflow_id"], "production_id": str(_production_id(request["workflow_id"])),
             "actor_id": request["actor_id"], "correlation_id": request["correlation_id"],
             "storyboard_version_id": str(storyboard["id"]), "storyboard_hash": storyboard["content_hash"],
             "storyboard_version_number": storyboard["version_number"], "script_version_id": str(storyboard["script_version_id"]),
             "channel_profile_id": str(storyboard["channel_profile_id"]),
+            "channel_profile_version": storyboard["channel_profile_version"],
+            "channel_name": storyboard["channel_name"],
             "render_tier": request["render_tier"], "width": request["width"], "height": request["height"], "fps": request["fps"],
-            "brand": _json(storyboard["brand_kit"]),
+            "brand": brand,
+            "brand_hash": canonical_hash(brand),
             "render_policy": _json(storyboard["default_render_settings"]),
             "verification_report": _json(storyboard["verification_report"]),
             "comfy_workflow": {
@@ -205,6 +211,69 @@ async def load_media_production_context(request: dict[str, Any]) -> dict[str, An
         }
     finally:
         await connection.close()
+
+
+def _synchronize_media_timing(
+    context: dict[str, Any], narration: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Use real mastered narration lengths without altering approved SceneSpecs."""
+
+    duration_by_segment = {
+        str(item["script_segment_id"]): float(item["duration_seconds"])
+        for item in narration["narration"]
+    }
+    expected_segments = {str(item["id"]) for item in context["segments"]}
+    if set(duration_by_segment) != expected_segments:
+        raise ValueError("narration timing does not cover the exact approved Script segments")
+
+    assigned: list[str] = []
+    timed_scenes: list[dict[str, Any]] = []
+    chapters: list[dict[str, Any]] = []
+    cursor = 0.0
+    for scene in context["scenes"]:
+        segment_ids = [str(value) for value in scene["scene_spec"].get("narration_segment_ids", [])]
+        if not segment_ids or any(value not in duration_by_segment for value in segment_ids):
+            raise ValueError("a SceneSpec is not bound to mastered narration")
+        duration = sum(duration_by_segment[value] for value in segment_ids)
+        assigned.extend(segment_ids)
+        timed_scenes.append(
+            {
+                **scene,
+                "storyboard_duration_seconds": float(scene["duration_seconds"]),
+                "duration_seconds": duration,
+            }
+        )
+        chapters.append(
+            {
+                "timecode_seconds": cursor,
+                "title": str(scene["scene_spec"]["purpose"])[:160],
+                "scene_version_id": scene["id"],
+            }
+        )
+        cursor += duration
+    if len(assigned) != len(set(assigned)) or set(assigned) != expected_segments:
+        raise ValueError("mastered narration must be assigned to exactly one production scene")
+
+    timed_segments = [
+        {**item, "storyboard_duration_seconds": float(item["duration_seconds"]), "duration_seconds": duration_by_segment[str(item["id"])]}
+        for item in context["segments"]
+    ]
+    return (
+        {**context, "scenes": timed_scenes, "segments": timed_segments, "production_duration_seconds": cursor},
+        {**narration, "chapters": chapters, "duration_seconds": cursor},
+    )
+
+
+@activity.defn(name="synchronize-media-timing")
+async def synchronize_media_timing(request: dict[str, Any]) -> dict[str, Any]:
+    try:
+        context, narration = _synchronize_media_timing(request["context"], request["narration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ApplicationError(
+            f"mastered narration could not define the production timeline: {str(exc)[:1000]}",
+            non_retryable=True,
+        ) from exc
+    return {"context": context, "narration": narration}
 
 
 def _fixture_png(scene: dict[str, Any], width: int, height: int) -> bytes:
@@ -419,12 +488,12 @@ async def generate_production_narration(context: dict[str, Any]) -> dict[str, An
     combined_asset = _asset(workflow_id=context["workflow_id"], key="narration-mastered:full", production_id=production_id, kind="narration_mastered", body=combined_body, mime="audio/wav", object_key=combined_key, duration=cursor, licence={"status": "cleared", "basis": "voice_profile_consent", "consent": profile["consent"], "synthetic": True}, provenance={"profile_version_id": profile["id"], "profile_hash": profile["content_hash"], "assembly": "ordered-pcm-concatenation"})
     asset_rows.append(combined_asset)
     auxiliaries = [("captions.srt", "caption_srt", "application/x-subrip", "\n".join(srt).encode()), ("captions.vtt", "caption_vtt", "text/vtt", "\n".join(vtt).encode())]
-    chapters = []
-    chapter_cursor = 0.0
-    for scene in context["scenes"]:
-        chapters.append({"timecode_seconds": chapter_cursor, "title": scene["scene_spec"]["purpose"][:160], "scene_version_id": scene["id"]})
-        chapter_cursor += scene["duration_seconds"]
-    description = {"title": "TubeFactory production", "synthetic_media_disclosure": "This production contains synthetic visuals and narration where identified in the manifest.", "source_count": len(context["sources"])}
+    _, timed_narration = _synchronize_media_timing(
+        context,
+        {"narration": narration_rows, "duration_seconds": cursor, "chapters": []},
+    )
+    chapters = timed_narration["chapters"]
+    description = {"title": f"{context['channel_name']} production", "language": profile["language"], "synthetic_media_disclosure": "This production contains synthetic visuals and narration where identified in the manifest.", "source_count": len(context["sources"])}
     auxiliaries.extend([("chapters.json", "chapter", "application/json", json.dumps(chapters, sort_keys=True).encode()), ("description.json", "description", "application/json", json.dumps(description, sort_keys=True).encode()), ("sources.json", "source_list", "application/json", json.dumps(context["sources"], sort_keys=True).encode())])
     for filename, kind, mime, body in auxiliaries:
         key = f"productions/{production_id}/{filename}"
@@ -467,33 +536,106 @@ def _ffmpeg_scan(path: Path) -> dict[str, Any]:
     }
 
 
+async def _await_with_activity_heartbeat(
+    awaitable: Any,
+    detail: str,
+    *,
+    interval_seconds: float = 30.0,
+) -> Any:
+    """Await long provider/QA work while proving liveness to Temporal."""
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        while True:
+            activity.heartbeat({"state": detail})
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task), timeout=interval_seconds
+                )
+            except TimeoutError:
+                continue
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 @activity.defn(name="assemble-and-qa-production")
 async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     context, scene_result, narration = request["context"], request["scene_result"], request["narration"]
     settings = Settings()
     minio = _minio(settings)
     production_id = UUID(context["production_id"])
-    scene_props = [{"sceneVersionId": scene["id"], "durationSeconds": scene["duration_seconds"], "purpose": scene["scene_spec"]["purpose"], "visualBrief": scene["scene_spec"]["visual_brief"], "onScreenText": scene["scene_spec"]["on_screen_text"], "citationStyle": scene["scene_spec"]["citation_style"], "syntheticMediaFlag": scene["scene_spec"]["synthetic_media_flag"]} for scene in context["scenes"]]
-    brand_kit = context.get("brand") or {}
-    props = {"width": context["width"], "height": context["height"], "fps": context["fps"], "scenes": scene_props, "brand": {"name": brand_kit.get("name", "TubeFactory"), "primary": brand_kit.get("primary", "#6ee7ff"), "background": brand_kit.get("background", "#08111f")}}
+    assets_by_scene: dict[str, list[dict[str, Any]]] = {}
+    for asset in scene_result["assets"]:
+        assets_by_scene.setdefault(str(asset.get("scene_version_id")), []).append(asset)
+    invalid_bindings = [scene["id"] for scene in context["scenes"] if len(assets_by_scene.get(scene["id"], [])) != 1]
+    if invalid_bindings:
+        raise ApplicationError(
+            "every approved SceneSpec must resolve to exactly one Scene Media Asset: " + ", ".join(invalid_bindings[:20]),
+            non_retryable=True,
+        )
+    scene_props = []
+    manifest_scene_props = []
+    for scene in context["scenes"]:
+        asset = assets_by_scene[scene["id"]][0]
+        asset_url = await asyncio.to_thread(
+            minio.presigned_get_object,
+            settings.minio_bucket,
+            asset["object_key"],
+            timedelta(hours=2),
+        )
+        common = {
+            "sceneVersionId": scene["id"],
+            "durationSeconds": scene["duration_seconds"],
+            "storyboardDurationSeconds": scene.get("storyboard_duration_seconds", scene["duration_seconds"]),
+            "purpose": scene["scene_spec"]["purpose"],
+            "visualType": scene["scene_spec"]["visual_type"],
+            "onScreenText": scene["scene_spec"]["on_screen_text"],
+            "citationStyle": scene["scene_spec"]["citation_style"],
+            "syntheticMediaFlag": scene["scene_spec"]["synthetic_media_flag"],
+            "assetHash": asset["content_hash"],
+            "assetMimeType": asset["mime_type"],
+        }
+        scene_props.append({**common, "assetUrl": asset_url})
+        manifest_scene_props.append(common)
+    brand_kit = context["brand"]
+    brand = {**brand_kit, "name": context["channel_name"], "brandHash": context["brand_hash"], "channelProfileVersion": context["channel_profile_version"]}
+    render_props = {"width": context["width"], "height": context["height"], "fps": context["fps"], "scenes": scene_props, "brand": brand}
+    props = {"width": context["width"], "height": context["height"], "fps": context["fps"], "scenes": manifest_scene_props, "brand": brand}
     async with httpx.AsyncClient(timeout=900, follow_redirects=False) as client:
-        response = await client.post(f"{settings.render_endpoint.rstrip('/')}/render", json=props)
+        response = await _await_with_activity_heartbeat(
+            client.post(f"{settings.render_endpoint.rstrip('/')}/render", json=render_props),
+            "waiting_for_remotion_render",
+        )
         if response.status_code != 200:
             raise ApplicationError(f"Remotion render failed: {response.text[:1000]}")
         silent_video = response.content
         engine = response.headers.get("X-Render-Engine", "remotion")
         engine_version = response.headers.get("X-Render-Engine-Version", "unknown")
         composition = response.headers.get("X-Composition", "EvidenceVideo")
-    audio = await asyncio.to_thread(_get, minio, settings.minio_bucket, narration["combined_audio_key"])
+    audio = await _await_with_activity_heartbeat(
+        asyncio.to_thread(_get, minio, settings.minio_bucket, narration["combined_audio_key"]),
+        "loading_mastered_narration",
+    )
     with tempfile.TemporaryDirectory() as directory:
         silent_path, audio_path = Path(directory) / "visual.mp4", Path(directory) / "narration.wav"
         output_path, thumb_path = Path(directory) / "master.mp4", Path(directory) / "thumbnail.jpg"
         silent_path.write_bytes(silent_video); audio_path.write_bytes(audio)
-        await asyncio.to_thread(_run_ffmpeg, ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(silent_path), "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest", str(output_path)])
+        await _await_with_activity_heartbeat(
+            asyncio.to_thread(_run_ffmpeg, ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(silent_path), "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest", str(output_path)]),
+            "muxing_video_and_narration",
+        )
         final_video = output_path.read_bytes()
-        probe = await asyncio.to_thread(_probe, output_path)
-        scan = await asyncio.to_thread(_ffmpeg_scan, output_path)
-        await asyncio.to_thread(_run_ffmpeg, ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(output_path), "-frames:v", "1", "-q:v", "2", str(thumb_path)])
+        probe = await _await_with_activity_heartbeat(
+            asyncio.to_thread(_probe, output_path), "probing_render"
+        )
+        scan = await _await_with_activity_heartbeat(
+            asyncio.to_thread(_ffmpeg_scan, output_path), "scanning_render_qa"
+        )
+        await _await_with_activity_heartbeat(
+            asyncio.to_thread(_run_ffmpeg, ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(output_path), "-frames:v", "1", "-q:v", "2", str(thumb_path)]),
+            "extracting_thumbnail",
+        )
         thumbnail = thumb_path.read_bytes()
     tier_kind = "render_preview" if context["render_tier"] == "preview" else "render_master"
     video_key = f"productions/{production_id}/{context['render_tier']}-master.mp4"
@@ -503,7 +645,7 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     video_asset = _asset(workflow_id=context["workflow_id"], key=f"render:{context['render_tier']}", production_id=production_id, kind=tier_kind, body=final_video, mime="video/mp4", object_key=video_key, width=context["width"], height=context["height"], duration=narration["duration_seconds"], licence={"status": "cleared", "basis": "assembled_from_cleared_assets", "synthetic": True}, provenance={"engine": engine, "engine_version": engine_version, "composition": composition, "props_hash": canonical_hash(props), "ffmpeg": "5.1.9", "storyboard_hash": context["storyboard_hash"]})
     thumb_asset = _asset(workflow_id=context["workflow_id"], key="thumbnail", production_id=production_id, kind="thumbnail", body=thumbnail, mime="image/jpeg", object_key=thumb_key, width=context["width"], height=context["height"], licence=video_asset["licence"], provenance={"ffmpeg": "5.1.9", "source_render_hash": video_asset["content_hash"]})
     all_assets = [*scene_result["assets"], *narration["assets"], video_asset, thumb_asset]
-    manifest = {"schema_version": "1.0", "production_id": str(production_id), "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_tier": context["render_tier"], "scenes": [{"scene_version_id": item["id"], "scene_hash": item["content_hash"], "scene_spec": item["scene_spec"]} for item in context["scenes"]], "narration": narration["narration"], "captions": [item for item in all_assets if item["asset_kind"].startswith("caption_")], "chapters": narration["chapters"], "sources": context["sources"], "assets": [{key: item[key] for key in ("id", "asset_kind", "object_key", "content_hash", "mime_type", "licence", "generation_provenance")} for item in all_assets], "render": {"asset_id": video_asset["id"], "content_hash": video_asset["content_hash"], "engine": engine, "engine_version": engine_version, "composition": composition, "settings": props, "probe": probe}}
+    manifest = {"schema_version": "1.0", "production_id": str(production_id), "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_tier": context["render_tier"], "brand": {"channel_profile_id": context["channel_profile_id"], "channel_profile_version": context["channel_profile_version"], "brand_hash": context["brand_hash"], "brand_kit": brand_kit}, "scenes": [{"scene_version_id": item["id"], "scene_hash": item["content_hash"], "production_duration_seconds": item["duration_seconds"], "storyboard_duration_seconds": item.get("storyboard_duration_seconds", item["duration_seconds"]), "scene_spec": item["scene_spec"]} for item in context["scenes"]], "narration": narration["narration"], "captions": [item for item in all_assets if item["asset_kind"].startswith("caption_")], "chapters": narration["chapters"], "sources": context["sources"], "assets": [{key: item[key] for key in ("id", "asset_kind", "object_key", "content_hash", "mime_type", "licence", "generation_provenance")} for item in all_assets], "render": {"asset_id": video_asset["id"], "content_hash": video_asset["content_hash"], "engine": engine, "engine_version": engine_version, "composition": composition, "settings": props, "probe": probe}}
     manifest_body = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     manifest_key = f"productions/{production_id}/production-manifest.json"
     await _put(minio, settings.minio_bucket, manifest_key, manifest_body, "application/json")
@@ -589,7 +731,7 @@ async def persist_media_production(request: dict[str, Any]) -> dict[str, Any]:
         await connection.execute(
             """INSERT INTO media_productions(id,storyboard_version_id,storyboard_hash,workflow_id,render_tier,state,settings,correlation_id,started_by,created_at,completed_at)
                VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$10)""",
-            production_id, UUID(context["storyboard_version_id"]), context["storyboard_hash"], context["workflow_id"], context["render_tier"], "ready" if result["qa"]["verdict"] != "fail" else "blocked", json.dumps({"width": context["width"], "height": context["height"], "fps": context["fps"], "comfy_workflow_version_id": context["comfy_workflow"]["id"], "voice_profile_version_id": context["voice_profile"]["id"]}), context["correlation_id"], UUID(context["actor_id"]), now,
+            production_id, UUID(context["storyboard_version_id"]), context["storyboard_hash"], context["workflow_id"], context["render_tier"], "ready" if result["qa"]["verdict"] != "fail" else "blocked", json.dumps({"width": context["width"], "height": context["height"], "fps": context["fps"], "comfy_workflow_version_id": context["comfy_workflow"]["id"], "voice_profile_version_id": context["voice_profile"]["id"], "channel_profile_version": context["channel_profile_version"], "brand_hash": context["brand_hash"], "production_duration_seconds": context.get("production_duration_seconds")}), context["correlation_id"], UUID(context["actor_id"]), now,
         )
         for asset in result["assets"]:
             await connection.execute(
