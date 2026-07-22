@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from temporalio.service import RPCError
 
 from editorial_core.authorization import Permission
+from editorial_core.explanation_readiness import evaluate_explanation_readiness, explanation_policy
 from editorial_core.operating_policy import evaluate_operating_policy
 from editorial_core.workflow import ProductionStage, validate_transition
 from youtuber_api.audit import append_audit
@@ -52,6 +54,7 @@ from youtuber_api.schemas import (
     DossierListItem,
     FixtureResearchStart,
     LiveDiscoveryStart,
+    ManualDossierWrite,
     ManualOpportunityWrite,
     OpportunityAcquisitionStart,
     OpportunityDecisionView,
@@ -119,6 +122,102 @@ def _eligible_evidence_source() -> Any:
         )
         == "",
     )
+
+
+def _dossier_list_item(
+    dossier: ResearchDossierModel,
+    continuation: AutomaticContinuation | None = None,
+) -> DossierListItem:
+    return DossierListItem(
+        id=dossier.id,
+        opportunity_id=dossier.opportunity_id,
+        dossier_version=dossier.dossier_version,
+        version=dossier.version,
+        status=dossier.status,
+        executive_summary=dossier.executive_summary,
+        completion_evaluation=dossier.completion_evaluation,
+        created_at=dossier.created_at,
+        automatic_continuation=continuation,
+    )
+
+
+def _manual_explanation_plan(
+    opportunity: OpportunityModel,
+    payload: ManualDossierWrite,
+    *,
+    minimum_units: int,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(payload.explanation_plan, start=1):
+        label = str(item.get("label") or item.get("question") or item.get("id") or "").strip()
+        if not label:
+            continue
+        unit_id = str(item.get("id") or f"manual-{index}").strip()
+        normalized.append(
+            {
+                **item,
+                "id": unit_id,
+                "label": label,
+                "role": str(item.get("role") or "manual_review"),
+                "question": str(item.get("question") or label),
+                "essential": bool(item.get("essential", True)),
+            }
+        )
+    if normalized:
+        return normalized
+
+    seeds = [
+        (
+            "hook",
+            "Why this topic matters",
+            opportunity.summary,
+            "orientation",
+        ),
+        (
+            "basics",
+            "Core terms and mechanism",
+            payload.safe_conclusions[0],
+            "explanation",
+        ),
+        (
+            "evidence",
+            "What the sources support",
+            payload.safe_conclusions[min(1, len(payload.safe_conclusions) - 1)],
+            "evidence",
+        ),
+        (
+            "limits",
+            "Limits and unresolved questions",
+            payload.unresolved_questions[0] if payload.unresolved_questions else "Which claims remain uncertain?",
+            "limits",
+        ),
+        (
+            "context",
+            "Alternative explanations and context",
+            payload.alternative_explanations[0] if payload.alternative_explanations else "What context changes the interpretation?",
+            "context",
+        ),
+        (
+            "takeaway",
+            "Safe conclusion",
+            payload.safe_conclusions[-1],
+            "takeaway",
+        ),
+    ]
+    while len(seeds) < minimum_units:
+        number = len(seeds) + 1
+        seeds.append(
+            (
+                f"supporting-point-{number}",
+                f"Supporting explanation point {number}",
+                "Which sourced detail helps the audience understand the topic?",
+                "support",
+            )
+        )
+    return [
+        {"id": unit_id, "label": label, "question": question, "role": role, "essential": True}
+        for unit_id, label, question, role in seeds[: max(minimum_units, len(seeds))]
+    ]
 
 
 async def _start_tracked_workflow(
@@ -687,6 +786,307 @@ async def create_manual_opportunity(
         score_penalties={}, score_reasoning=[], source_count=0, snapshot_count=0,
         research_state=None, created_at=opportunity.created_at,
     )
+
+
+@router.post(
+    "/opportunities/{opportunity_id}/manual-dossier",
+    response_model=DossierListItem,
+    status_code=201,
+)
+async def create_manual_dossier(
+    opportunity_id: UUID,
+    payload: ManualDossierWrite,
+    request: Request,
+    actor: Reviewer,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> DossierListItem:
+    opportunity = await session.get(OpportunityModel, opportunity_id, with_for_update=True)
+    if opportunity is None or opportunity.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    if opportunity.version != payload.expected_opportunity_version:
+        raise HTTPException(status_code=409, detail="Opportunity changed; reload before creating a dossier")
+    if opportunity.decision != "approved":
+        raise HTTPException(status_code=409, detail="Only approved opportunities can enter dossier review")
+
+    workflow_id = f"manual-dossier-{payload.idempotency_key}"
+    existing_run = await session.scalar(
+        select(ResearchRunModel).where(ResearchRunModel.workflow_id == workflow_id).limit(1)
+    )
+    if existing_run is not None:
+        if existing_run.opportunity_id != opportunity.id:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency key is already associated with another opportunity",
+            )
+        dossier_id = (existing_run.progress or {}).get("research_dossier_id")
+        if not dossier_id:
+            raise HTTPException(status_code=409, detail="Manual dossier recovery record is incomplete")
+        dossier = await session.get(ResearchDossierModel, UUID(str(dossier_id)))
+        if dossier is None or dossier.deleted_at is not None:
+            raise HTTPException(status_code=409, detail="Manual dossier recovery target is unavailable")
+        return _dossier_list_item(dossier)
+
+    subject = await session.get(SubjectProfileModel, opportunity.subject_profile_id)
+    if subject is None or subject.deleted_at is not None:
+        raise HTTPException(status_code=409, detail="The opportunity subject profile is unavailable")
+
+    snapshot_rows = (
+        await session.execute(
+            select(SourceSnapshotModel.id, SourceSnapshotModel.source_document_id)
+            .select_from(SourceSnapshotModel)
+            .join(
+                OpportunitySourceModel,
+                OpportunitySourceModel.source_document_id == SourceSnapshotModel.source_document_id,
+            )
+            .join(SourceDocumentModel, SourceDocumentModel.id == SourceSnapshotModel.source_document_id)
+            .where(
+                OpportunitySourceModel.opportunity_id == opportunity.id,
+                _eligible_evidence_source(),
+            )
+        )
+    ).all()
+    snapshot_source_ids = {snapshot_id: source_document_id for snapshot_id, source_document_id in snapshot_rows}
+    if not snapshot_source_ids:
+        raise HTTPException(status_code=409, detail="No immutable source snapshots are available")
+
+    for claim in payload.claims:
+        if claim.source_snapshot_id is not None and claim.source_snapshot_id not in snapshot_source_ids:
+            raise HTTPException(
+                status_code=409,
+                detail="Every claim source snapshot must belong to this opportunity",
+            )
+
+    latest_run = await session.scalar(
+        select(ResearchRunModel)
+        .where(
+            ResearchRunModel.opportunity_id == opportunity.id,
+            ResearchRunModel.deleted_at.is_(None),
+        )
+        .order_by(ResearchRunModel.created_at.desc())
+        .limit(1)
+    )
+    latest_version = await session.scalar(
+        select(func.max(ResearchDossierModel.dossier_version)).where(
+            ResearchDossierModel.opportunity_id == opportunity.id,
+            ResearchDossierModel.deleted_at.is_(None),
+        )
+    )
+    try:
+        policy = explanation_policy(subject.format_policy or {}, subject.approval_profile or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"Subject explanation policy is invalid: {exc}") from exc
+    source_requirements = subject.source_requirements or {}
+    minimum_independent_sources = int(source_requirements.get("minimum_independent", 2))
+    minimum_primary_sources = int(source_requirements.get("minimum_primary", 1))
+    explanation_plan = _manual_explanation_plan(
+        opportunity,
+        payload,
+        minimum_units=policy.minimum_coverage_units,
+    )
+    now = datetime.now(timezone.utc)
+    dossier_id = uuid4()
+    claim_specs: list[tuple[Any, UUID, list[dict[str, Any]], str, list[str]]] = []
+    readiness_claims: list[dict[str, Any]] = []
+    for index, claim in enumerate(payload.claims, start=1):
+        claim_id = uuid4()
+        evidence: list[dict[str, Any]] = []
+        status = "draft"
+        if claim.source_snapshot_id is not None:
+            source_document_id = snapshot_source_ids[claim.source_snapshot_id]
+            evidence = [
+                {
+                    "relationship": claim.relationship,
+                    "source_document_id": str(source_document_id),
+                    "source_id": str(source_document_id),
+                    "source_snapshot_id": str(claim.source_snapshot_id),
+                    "source_independent": claim.source_independent,
+                    "direct_evidence": claim.direct_evidence,
+                    "primary_source": claim.primary_source,
+                }
+            ]
+            status = (
+                "supported"
+                if claim.relationship == "supports"
+                else "disputed" if claim.relationship == "contradicts" else "draft"
+            )
+        coverage_unit_ids = [
+            value
+            for value in claim.coverage_unit_ids
+            if any(unit["id"] == value for unit in explanation_plan)
+        ] or [str(explanation_plan[(index - 1) % len(explanation_plan)]["id"])]
+        readiness_claim = {
+            "id": str(claim_id),
+            "statement": claim.statement,
+            "status": status,
+            "central": claim.central,
+            "coverage_unit_ids": coverage_unit_ids,
+            "evidence": evidence,
+        }
+        readiness_claims.append(readiness_claim)
+        claim_specs.append((claim, claim_id, evidence, status, coverage_unit_ids))
+
+    readiness = evaluate_explanation_readiness(
+        policy=policy,
+        claims=readiness_claims,
+        coverage_units=explanation_plan,
+        minimum_independent_sources=minimum_independent_sources,
+        minimum_primary_sources=minimum_primary_sources,
+        counterevidence_search_completed=payload.counterevidence_search_completed,
+    )
+    completion_document = {
+        "complete": readiness.ready,
+        "manual_recovery": True,
+        "review_required": True,
+        "blockers": list(readiness.gaps),
+        "source_snapshot_count": len(snapshot_source_ids),
+        "manual_review_note": payload.review_note,
+        "explanation_readiness": readiness.as_dict(),
+    }
+    dossier = ResearchDossierModel(
+        id=dossier_id,
+        version=1,
+        opportunity_id=opportunity.id,
+        dossier_version=int(latest_version or 0) + 1,
+        status="in_review",
+        executive_summary=payload.executive_summary,
+        chronology=payload.chronology,
+        unresolved_questions=payload.unresolved_questions,
+        alternative_explanations=payload.alternative_explanations,
+        source_quality_notes=payload.source_quality_notes,
+        safe_conclusions=payload.safe_conclusions,
+        prohibited_overstatements=payload.prohibited_overstatements,
+        proposed_angles=payload.proposed_angles or [opportunity.title],
+        explanation_plan=explanation_plan,
+        completion_evaluation=completion_document,
+        reviewed_by=None,
+        reviewed_at=None,
+        review_comment=None,
+        created_at=now,
+        updated_at=now,
+        deleted_at=None,
+    )
+    session.add(dossier)
+
+    for claim, claim_id, evidence, status, coverage_unit_ids in claim_specs:
+        db_claim = ClaimModel(
+            id=claim_id,
+            version=1,
+            research_dossier_id=dossier.id,
+            normalized_statement=claim.statement,
+            claim_type=claim.claim_type,
+            scope="manual_research_recovery",
+            relevant_at=None,
+            entities=[],
+            coverage_unit_ids=coverage_unit_ids,
+            confidence=claim.confidence,
+            status=status,
+            risk=claim.risk,
+            central=claim.central,
+            review_comment=None,
+            reviewed_by=None,
+            reviewed_at=None,
+            created_at=now,
+            updated_at=now,
+            deleted_at=None,
+        )
+        session.add(db_claim)
+        if evidence and claim.source_snapshot_id is not None and claim.exact_text:
+            excerpt_hash = hashlib.sha256(claim.exact_text.encode("utf-8")).hexdigest()
+            location_anchor = f"manual-review:{payload.idempotency_key}:{claim_id.hex[:12]}"
+            excerpt = await session.scalar(
+                select(EvidenceExcerptModel)
+                .where(
+                    EvidenceExcerptModel.source_snapshot_id == claim.source_snapshot_id,
+                    EvidenceExcerptModel.excerpt_hash == excerpt_hash,
+                    EvidenceExcerptModel.location_anchor == location_anchor,
+                )
+                .limit(1)
+            )
+            if excerpt is None:
+                excerpt = EvidenceExcerptModel(
+                    id=uuid4(),
+                    source_snapshot_id=claim.source_snapshot_id,
+                    exact_text=claim.exact_text,
+                    prefix_text="",
+                    suffix_text="",
+                    location_anchor=location_anchor,
+                    start_offset=None,
+                    end_offset=None,
+                    excerpt_hash=excerpt_hash,
+                    created_at=now,
+                )
+                session.add(excerpt)
+            session.add(
+                ClaimEvidenceModel(
+                    id=uuid4(),
+                    claim_id=db_claim.id,
+                    evidence_excerpt_id=excerpt.id,
+                    relationship=claim.relationship,
+                    source_independent=claim.source_independent,
+                    direct_evidence=claim.direct_evidence,
+                    primary_source=claim.primary_source,
+                    notes=payload.review_note,
+                    created_at=now,
+                )
+            )
+
+    manual_run = ResearchRunModel(
+        id=uuid4(),
+        version=1,
+        opportunity_id=opportunity.id,
+        workflow_id=workflow_id,
+        state="DOSSIER_REVIEW",
+        research_plan={
+            "manual_recovery": True,
+            "manual_recovery_of_research_run_id": str(latest_run.id) if latest_run else None,
+            "review_note": payload.review_note,
+            "counterevidence_search_completed": payload.counterevidence_search_completed,
+        },
+        progress={
+            "percent": 100,
+            "manual_recovery": True,
+            "research_dossier_id": str(dossier.id),
+            "claim_count": len(payload.claims),
+            "source_snapshot_count": len(snapshot_source_ids),
+            "explanation_ready": readiness.ready,
+        },
+        correlation_id=request.state.correlation_id,
+        started_by=actor.id,
+        completed_at=now,
+        created_at=now,
+        updated_at=now,
+        deleted_at=None,
+    )
+    session.add(manual_run)
+    session.add(
+        WorkflowTransitionModel(
+            aggregate_type="opportunity",
+            aggregate_id=opportunity.id,
+            from_stage=latest_run.state if latest_run else None,
+            to_stage="DOSSIER_REVIEW",
+            reason="manual recovery dossier created from failed or incomplete research",
+            actor_id=actor.id,
+            correlation_id=request.state.correlation_id,
+            occurred_at=now,
+        )
+    )
+    await append_audit(
+        session,
+        action="research.manual_dossier_created",
+        actor_id=actor.id,
+        target_type="research_dossier",
+        target_id=str(dossier.id),
+        correlation_id=request.state.correlation_id,
+        context={
+            "opportunity_id": str(opportunity.id),
+            "workflow_id": workflow_id,
+            "claim_count": len(payload.claims),
+            "completion_ready": readiness.ready,
+            "blockers": list(readiness.gaps),
+        },
+    )
+    await session.commit()
+    return _dossier_list_item(dossier)
 
 
 @router.get("/opportunities", response_model=list[OpportunityListItem])

@@ -344,6 +344,23 @@ const helpTasks: HelpTask[] = [
     ],
   },
   {
+    id: "recover-failed-research",
+    title: "Recover failed research into a dossier",
+    summary: "Manually review failed or incomplete research and create a normal review dossier from existing snapshots.",
+    category: "Research & evidence",
+    page: "research",
+    roles: ["admin", "reviewer"],
+    keywords: ["failed", "research", "manual", "recover", "dossier", "source", "snapshot", "approve", "edit"],
+    steps: [
+      "Open Research & evidence and select Review finding on an approved opportunity.",
+      "Confirm that the finding has at least one immutable source snapshot; recovery does not fabricate evidence.",
+      "Use Failed research recovery to edit the manual dossier summary, safe conclusions, limits and source-quality notes.",
+      "Optionally paste claim lines and bind them to an exact excerpt from a selected source snapshot.",
+      "Create the review dossier. The failed run remains in history and the new dossier appears in the normal review queue.",
+      "Approve the recovered dossier only if the completion/readiness gates are satisfied, or record a reasoned override and resolve remaining blockers before script generation.",
+    ],
+  },
+  {
     id: "script-storyboard",
     title: "Turn approved research into a script and storyboard",
     summary: "Generate cited narration, verify coverage and plan evidence-linked scenes.",
@@ -559,22 +576,37 @@ function DetailRecord({ values, empty = "Nothing recorded" }: { values: Record<s
 }
 
 function OpportunityReviewDialog({
-  opportunity, role, decisionReason, rationale, onDecisionReasonChange, onRationaleChange, onClose, onDecision,
+  opportunity, role, csrf, decisionReason, rationale, onDecisionReasonChange, onRationaleChange, onClose, onDecision, onManualDossierCreated,
 }: {
   opportunity: Opportunity;
   role: Role;
+  csrf: string;
   decisionReason: string;
   rationale: string;
   onDecisionReasonChange: (value: string) => void;
   onRationaleChange: (value: string) => void;
   onClose: () => void;
   onDecision: (item: Opportunity, decision: "approved" | "rejected" | "deferred") => void;
+  onManualDossierCreated: (dossier: Dossier) => void | Promise<void>;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [sources, setSources] = useState<SourceBrowserItem[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(true);
   const [sourceMessage, setSourceMessage] = useState("");
   const [preview, setPreview] = useState<SourcePreview | null>(null);
+  const [manualSummary, setManualSummary] = useState(opportunity.summary);
+  const [manualConclusions, setManualConclusions] = useState(opportunity.summary);
+  const [manualQuestions, setManualQuestions] = useState("Welche Aussagen bleiben unsicher oder quellenabhängig?");
+  const [manualAlternatives, setManualAlternatives] = useState("");
+  const [manualSourceNotes, setManualSourceNotes] = useState("Manual recovery after failed or incomplete automated research; sources were reviewed by a human.");
+  const [manualOverstatements, setManualOverstatements] = useState("Nicht stärker formulieren, als es die geprüften Quellen stützen.");
+  const [manualClaims, setManualClaims] = useState("");
+  const [manualSnapshotId, setManualSnapshotId] = useState("");
+  const [manualExactText, setManualExactText] = useState("");
+  const [manualCounterevidenceChecked, setManualCounterevidenceChecked] = useState(false);
+  const [manualReviewNote, setManualReviewNote] = useState("Human recovery review: failed automated research was manually checked and converted into a dossier for formal review.");
+  const [manualMessage, setManualMessage] = useState("");
+  const [manualBusy, setManualBusy] = useState(false);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -595,6 +627,26 @@ function OpportunityReviewDialog({
     return () => { cancelled = true; };
   }, [opportunity.id]);
 
+  useEffect(() => {
+    setManualSummary(opportunity.summary);
+    setManualConclusions(opportunity.summary);
+    setManualQuestions("Welche Aussagen bleiben unsicher oder quellenabhängig?");
+    setManualAlternatives("");
+    setManualSourceNotes("Manual recovery after failed or incomplete automated research; sources were reviewed by a human.");
+    setManualOverstatements("Nicht stärker formulieren, als es die geprüften Quellen stützen.");
+    setManualClaims("");
+    setManualSnapshotId("");
+    setManualExactText("");
+    setManualCounterevidenceChecked(false);
+    setManualReviewNote("Human recovery review: failed automated research was manually checked and converted into a dossier for formal review.");
+    setManualMessage("");
+  }, [opportunity.id, opportunity.summary]);
+
+  useEffect(() => {
+    const firstSnapshot = sources.flatMap(source => source.snapshots)[0];
+    setManualSnapshotId(current => current || firstSnapshot?.id || "");
+  }, [sources]);
+
   async function showPreview(sourceId: string) {
     setSourceMessage("");
     try { setPreview(await api<SourcePreview>(`/api/v1/research/sources/${sourceId}/preview`)); }
@@ -602,9 +654,65 @@ function OpportunityReviewDialog({
   }
 
   const canReview = (role === "admin" || role === "reviewer") && (opportunity.decision === "pending" || opportunity.decision === "deferred");
+  const canRecoverResearch = (role === "admin" || role === "reviewer") && opportunity.decision === "approved";
+  const snapshotOptions = sources.flatMap(source => source.snapshots.map(snapshot => ({ snapshot, source })));
   const effectiveRationale = opportunity.editorial_rationale || rationale;
   const decisionDisabled = decisionReason.trim().length < 3;
   const shortlistDisabled = decisionDisabled || effectiveRationale.trim().length < 20;
+  const manualConclusionsReady = linesFromText(manualConclusions).length > 0;
+  const manualDisabled = manualBusy || !snapshotOptions.length || manualSummary.trim().length < 20 || !manualConclusionsReady || manualReviewNote.trim().length < 10;
+
+  async function createManualDossier(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setManualMessage("");
+    const safeConclusions = linesFromText(manualConclusions);
+    if (!safeConclusions.length) {
+      setManualMessage("At least one safe conclusion is required.");
+      return;
+    }
+    const exactText = manualExactText.trim();
+    const useExcerpt = Boolean(manualSnapshotId && exactText);
+    const claims = linesFromText(manualClaims).map(statement => ({
+      statement,
+      claim_type: "fact",
+      confidence: 70,
+      risk: "medium",
+      central: true,
+      source_snapshot_id: useExcerpt ? manualSnapshotId : null,
+      exact_text: useExcerpt ? exactText : null,
+      relationship: "supports",
+      source_independent: true,
+      direct_evidence: true,
+      primary_source: false,
+      coverage_unit_ids: [],
+    }));
+    setManualBusy(true);
+    try {
+      const dossier = await api<Dossier>(`/api/v1/research/opportunities/${opportunity.id}/manual-dossier`, {
+        method: "POST",
+        body: JSON.stringify({
+          expected_opportunity_version: opportunity.version,
+          idempotency_key: `ui-${randomUuid()}`,
+          executive_summary: manualSummary,
+          safe_conclusions: safeConclusions,
+          unresolved_questions: linesFromText(manualQuestions),
+          alternative_explanations: linesFromText(manualAlternatives),
+          source_quality_notes: linesFromText(manualSourceNotes),
+          prohibited_overstatements: linesFromText(manualOverstatements),
+          proposed_angles: [opportunity.title],
+          counterevidence_search_completed: manualCounterevidenceChecked,
+          review_note: manualReviewNote,
+          claims,
+        }),
+      }, csrf);
+      setManualMessage(`Manual dossier v${dossier.dossier_version} created for review.`);
+      await onManualDossierCreated(dossier);
+    } catch (caught) {
+      setManualMessage(caught instanceof Error ? caught.message : "Manual dossier creation failed");
+    } finally {
+      setManualBusy(false);
+    }
+  }
 
   return <dialog
     ref={dialogRef}
@@ -645,6 +753,7 @@ function OpportunityReviewDialog({
           <section className="finding-section"><p className="eyebrow">Estimated cost</p><DetailRecord values={opportunity.estimated_cost || {}} empty="No cost estimate recorded" /></section>
           {canReview && <section className="finding-section finding-decision"><p className="eyebrow">Human decision gate</p><h3>Record a reviewed decision</h3><label>Decision reason<input value={decisionReason} minLength={3} onChange={event => onDecisionReasonChange(event.target.value)} /></label>{!opportunity.editorial_rationale && <label>Why does this video deserve to exist?<textarea rows={4} value={rationale} minLength={20} onChange={event => onRationaleChange(event.target.value)} /></label>}<p className="muted">This action is version-checked and retained in audit history.</p><div className="actions"><button type="button" className="primary compact" disabled={shortlistDisabled} onClick={() => onDecision(opportunity, "approved")}>Shortlist</button><button type="button" className="secondary compact" disabled={decisionDisabled} onClick={() => onDecision(opportunity, "deferred")}>Defer</button><button type="button" className="secondary compact danger" disabled={decisionDisabled} onClick={() => onDecision(opportunity, "rejected")}>Reject</button></div></section>}
           {opportunity.decision === "approved" && <section className="finding-section"><p className="eyebrow">Automatic continuation</p><h3>Sources and dossier continue without another click</h3><p className="muted">The approval starts durable source acquisition and then the evidence dossier. Progress and retry controls are available in Workflow activity.</p></section>}
+          {canRecoverResearch && <section className="finding-section finding-decision"><p className="eyebrow">Failed research recovery</p><h3>Manually create a review dossier</h3><p className="muted">Use this when automated research failed or produced incomplete output. The dossier enters the normal review queue; script generation still requires the usual explanation-readiness gates.</p>{manualMessage && <div className={`notice ${manualMessage.includes("failed") || manualMessage.includes("required") || manualMessage.includes("available") ? "error" : ""}`}>{manualMessage}</div>}<form onSubmit={createManualDossier}><label>Manual dossier summary<textarea rows={5} value={manualSummary} minLength={20} onChange={event => setManualSummary(event.target.value)} required /></label><label>Safe conclusions<textarea rows={4} value={manualConclusions} minLength={10} onChange={event => setManualConclusions(event.target.value)} placeholder="One supported conclusion per line" required /></label><label>Unresolved questions / limits<textarea rows={3} value={manualQuestions} onChange={event => setManualQuestions(event.target.value)} placeholder="One limitation or open question per line" /></label><label>Alternative explanations / context<textarea rows={3} value={manualAlternatives} onChange={event => setManualAlternatives(event.target.value)} placeholder="One alternative interpretation per line" /></label><label>Source-quality notes<textarea rows={3} value={manualSourceNotes} onChange={event => setManualSourceNotes(event.target.value)} /></label><label>Prohibited overstatements<textarea rows={3} value={manualOverstatements} onChange={event => setManualOverstatements(event.target.value)} /></label><label>Optional claim statements<textarea rows={5} value={manualClaims} onChange={event => setManualClaims(event.target.value)} placeholder="One claim per line. Claims with an excerpt become supported; claims without one remain draft." /></label><label>Source snapshot for excerpt<select value={manualSnapshotId} disabled={!snapshotOptions.length} onChange={event => setManualSnapshotId(event.target.value)}><option value="">Select acquired source snapshot</option>{snapshotOptions.map(({ source, snapshot }) => <option key={snapshot.id} value={snapshot.id}>{source.title} · snapshot {snapshot.snapshot_number} · {snapshot.content_hash.slice(0, 10)}…</option>)}</select></label><label>Exact supporting excerpt<textarea rows={4} value={manualExactText} disabled={!manualSnapshotId} onChange={event => setManualExactText(event.target.value)} placeholder="Paste the exact source text that supports the optional claim lines." /></label><label><input type="checkbox" checked={manualCounterevidenceChecked} onChange={event => setManualCounterevidenceChecked(event.target.checked)} /> Counterevidence / limits were checked manually</label><label>Recovery review note<input value={manualReviewNote} minLength={10} onChange={event => setManualReviewNote(event.target.value)} required /></label><button type="submit" className="primary compact control-help" data-usage="Create a new in-review dossier from manually checked failed research. The original failed run remains in history." disabled={manualDisabled}>{manualBusy ? "Creating…" : "Create review dossier"}</button>{!snapshotOptions.length && <p className="muted">Source acquisition must have at least one immutable snapshot before manual recovery can create a dossier.</p>}</form></section>}
         </div>
       </div>
     </div>
@@ -896,6 +1005,10 @@ type ArchiveProfile = EditableProfile;
 
 function linesFromForm(data: FormData, name: string): string[] {
   return String(data.get(name) || "").split("\n").map(value => value.trim()).filter(Boolean);
+}
+
+function linesFromText(value: string): string[] {
+  return value.split("\n").map(item => item.trim()).filter(Boolean);
 }
 
 function commaListFromForm(data: FormData, name: string): string[] {
@@ -1329,6 +1442,12 @@ function ResearchPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { setDetail(null); setSelectedOpportunity(null); setVisibleOpportunityCount(20); }, [activeChannelId]);
   useEffect(() => {
+    setSelectedOpportunity(current => {
+      if (!current) return current;
+      return opportunities.find(item => item.id === current.id) || null;
+    });
+  }, [opportunities]);
+  useEffect(() => {
     if (!run) return;
     api<ResearchWorkflowLogEntry[]>(`/api/v1/research/runs/${encodeURIComponent(run.workflow_id)}/logs`)
       .then(entries => setWorkflowLogs(entries.map(entry => ({ at: entry.occurred_at, message: entry.message, level: entry.level }))))
@@ -1398,6 +1517,12 @@ function ResearchPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
       form.reset(); setMessage("Manual opportunity created as pending; it still requires reviewer shortlisting."); await refresh();
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Manual opportunity creation failed"); }
   }
+  async function manualDossierCreated(dossier: Dossier) {
+    setSelectedOpportunity(null);
+    setMessage(`Manual research dossier v${dossier.dossier_version} is ready for review.`);
+    await refresh();
+    await openDossier(dossier.id);
+  }
   async function reviewDossier(decision: "approved" | "rejected") {
     if (!detail) return;
     setDossierReviewPending(decision);
@@ -1451,7 +1576,7 @@ function ResearchPanel({ csrf, role, activeChannelId }: { csrf: string; role: Ro
     {(role === "admin" || role === "editor") && <details className="panel action-disclosure"><summary><span><small>Editor-originated idea</small><strong>Create a manual opportunity</strong><em>Add a hand-picked topic when discovery did not find it.</em></span><span className="chip">pending by default</span></summary><form onSubmit={createManualOpportunity}><label>Enabled subject<select name="subject_profile_id" required>{subjects.map(subject => <option key={subject.id} value={subject.id}>{subject.name}</option>)}</select></label><label>Title<input name="title" minLength={3} required /></label><label>Summary<textarea name="summary" rows={3} minLength={20} required /></label><label>Why does this video deserve to exist?<textarea name="editorial_rationale" rows={3} minLength={20} required /></label><label>Estimated model tokens<input name="tokens" type="number" min="0" defaultValue="0" /></label><button className="secondary" disabled={!subjects.length}>Create pending opportunity</button></form></details>}
     <div className={`research-grid ${scopedDossiers.length ? "" : "solo-primary"}`}><section className="panel"><div className="panel-title"><div><p className="eyebrow">Opportunity board</p><h2>Scored findings</h2></div><span className="chip">Showing {Math.min(visibleOpportunityCount, scopedOpportunities.length)} of {scopedOpportunities.length}</span></div><div className="card-list">{scopedOpportunities.slice(0, visibleOpportunityCount).map(item => <article className="opportunity-card" key={item.id}><div className="score-ring">{item.score ?? "—"}</div><div className="opportunity-card-body"><strong>{item.title}</strong><p>{item.summary}</p><small><strong>Why it deserves to exist:</strong> {item.editorial_rationale || "Required before shortlisting"}</small><div className="score-pills">{item.grouping_reason.filter(reason => reason.startsWith("classification: ")).map(reason => <span key={reason}>{reason.slice("classification: ".length)}</span>)}<span>{item.policy_snapshot.mode || "assisted"} policy</span><span>{item.source_count} source{item.source_count === 1 ? "" : "s"}</span><span>{item.snapshot_count} immutable snapshot{item.snapshot_count === 1 ? "" : "s"}</span>{item.research_state && <span>{item.research_state.replaceAll("_", " ").toLowerCase()}</span>}{Object.entries(item.score_components).slice(0, 3).map(([name, value]) => <span key={name}>{name.replaceAll("_", " ")} {value}</span>)}</div><div className="actions"><button type="button" className="secondary compact control-help" data-usage="Open the complete finding, original sources, score trace, policy gates and review controls without changing its status." aria-haspopup="dialog" aria-controls="opportunity-review-dialog" onClick={() => setSelectedOpportunity(item)}>Review finding</button></div></div><span className={`status ${item.decision === "approved" ? "good" : item.decision === "rejected" ? "bad" : "waiting"}`}>{item.decision}</span></article>)}{!scopedOpportunities.length && <p className="empty">No opportunities have been produced for this channel.</p>}</div>{visibleOpportunityCount < scopedOpportunities.length && <button className="secondary" onClick={() => setVisibleOpportunityCount(count => Math.min(count + 20, scopedOpportunities.length))}>Show 20 more ({scopedOpportunities.length - visibleOpportunityCount} remaining)</button>}</section>
       <section className="panel"><div className="panel-title"><div><p className="eyebrow">Review queue</p><h2>Research dossiers</h2></div><span className="chip">{scopedDossiers.length}</span></div><div className="card-list">{scopedDossiers.map(item => <button className="dossier-card" key={item.id} onClick={() => openDossier(item.id)}><span><strong>{item.executive_summary}</strong><small>Version {item.dossier_version} · {item.status} · readiness round {item.completion_evaluation.explanation_readiness?.enrichment_round ?? "legacy"}</small></span><span className={`status ${item.completion_evaluation.explanation_readiness?.ready ? "good" : "waiting"}`}>{item.completion_evaluation.explanation_readiness?.ready ? "Explanation ready" : "Needs evidence"}</span></button>)}{!scopedDossiers.length && <p className="empty">No dossier is ready for review for this channel.</p>}</div></section></div>
-    {selectedOpportunity && <OpportunityReviewDialog opportunity={selectedOpportunity} role={role} decisionReason={opportunityReason} rationale={opportunityRationale} onDecisionReasonChange={setOpportunityReason} onRationaleChange={setOpportunityRationale} onClose={() => setSelectedOpportunity(null)} onDecision={decideOpportunity} />}
+    {selectedOpportunity && <OpportunityReviewDialog opportunity={selectedOpportunity} role={role} csrf={csrf} decisionReason={opportunityReason} rationale={opportunityRationale} onDecisionReasonChange={setOpportunityReason} onRationaleChange={setOpportunityRationale} onClose={() => setSelectedOpportunity(null)} onDecision={decideOpportunity} onManualDossierCreated={manualDossierCreated} />}
     {detail?.ai_evidence_assessment && <section className="panel"><div className="panel-title"><div><p className="eyebrow">AI evidence review · advisory v{detail.ai_evidence_assessment.version}</p><h2>{detail.ai_evidence_assessment.abstained ? "Model abstained" : `${Math.round(detail.ai_evidence_assessment.confidence * 100)}% confidence`}</h2></div><span className="chip">human approval remains required</span></div><p className="muted">The review is bound to exact stored excerpts. It cannot approve claims or override deterministic dossier gates.</p><div className="conclusion-grid"><div><strong>Methodological limits</strong>{detail.ai_evidence_assessment.methodological_limits.map(value => <p key={value}>{value}</p>)}</div><div><strong>Missing counterevidence</strong>{detail.ai_evidence_assessment.counterevidence_gaps.map(value => <p key={value}>{value}</p>)}</div></div><details><summary>Structured claim and source assessments</summary><pre>{JSON.stringify({ claims: detail.ai_evidence_assessment.claim_assessments, sources: detail.ai_evidence_assessment.source_assessments, uncertainty: detail.ai_evidence_assessment.uncertainty }, null, 2)}</pre></details></section>}
     {detail && <section className="panel dossier-detail"><div className="panel-title"><div><p className="eyebrow">Claim ledger</p><h2>{detail.executive_summary}</h2></div><button className="secondary compact" onClick={() => setDetail(null)}>Close</button></div><ReadinessSummary dossier={detail} detailed />{(role === "admin" || role === "reviewer") && (dossierReviewed ? <div className={`notice ${detail.status === "rejected" ? "error" : ""}`} role="status"><strong>Dossier {detail.status}.</strong><p>The human review decision is recorded. Review controls are closed for this dossier version.</p></div> : <div className="review-bar"><label>Review comment<input value={reviewComment} onChange={event => setReviewComment(event.target.value)} minLength={3} disabled={dossierReviewPending !== null} /></label>{!detail.completion_evaluation.complete && <label>Reasoned completion override<input value={overrideReason} onChange={event => setOverrideReason(event.target.value)} minLength={20} disabled={dossierReviewPending !== null} /></label>}<button className="primary" disabled={dossierReviewPending !== null} onClick={() => reviewDossier("approved")}>{dossierReviewPending === "approved" ? "Approving…" : "Approve dossier"}</button><button className="secondary danger" disabled={dossierReviewPending !== null} onClick={() => reviewDossier("rejected")}>{dossierReviewPending === "rejected" ? "Rejecting…" : "Reject dossier"}</button></div>)}<SourceBrowser opportunityId={detail.opportunity_id} csrf={csrf} role={role} /><div className="conclusion-grid"><div><strong>Safe conclusions</strong>{detail.safe_conclusions.map(value => <p key={value}>{value}</p>)}</div><div><strong>Prohibited overstatements</strong>{detail.prohibited_overstatements.map(value => <p key={value}>{value}</p>)}</div></div><div className="claim-list">{detail.claims.map(claim => <article key={claim.id}><header><div><span className="chip">{claim.claim_type} · {claim.risk} risk</span><h3>{claim.normalized_statement}</h3><small>Explanation units: {claim.coverage_unit_ids.length ? claim.coverage_unit_ids.join(", ") : "none"}</small></div><div className="claim-status"><span className={`status ${claim.status === "supported" || claim.status === "approved" ? "good" : "waiting"}`}>{claim.status} · {claim.confidence}%</span>{(role === "admin" || role === "reviewer") && !dossierReviewed && <div><button className="secondary compact" onClick={() => reviewClaim(claim.id, claim.version, "approved")}>Approve</button><button className="secondary compact danger" onClick={() => reviewClaim(claim.id, claim.version, "rejected")}>Reject</button></div>}</div></header><div className="evidence-list">{claim.evidence.map((evidence, index) => <div key={`${evidence.snapshot.content_hash}-${index}`}><span className={`relation ${evidence.relationship}`}>{evidence.relationship}</span><blockquote>{evidence.exact_text}</blockquote><ExternalSourceLink url={evidence.source.canonical_url} title={evidence.source.title} /><code title={evidence.snapshot.content_hash}>{evidence.snapshot.content_hash.slice(0, 16)}…</code></div>)}</div></article>)}</div></section>}
   </>;

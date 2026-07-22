@@ -11,6 +11,8 @@ from pydantic import ValidationError
 from youtuber_api.schemas import (
     ChannelProfileWrite,
     FixtureResearchStart,
+    ManualDossierClaimWrite,
+    ManualDossierWrite,
     ManualOpportunityWrite,
     OpportunityListItem,
     SourceRelationshipWrite,
@@ -169,3 +171,34 @@ def test_source_relationship_endpoints_must_be_distinct() -> None:
             reason="The article directly identifies the same original record.",
             confidence=90,
         )
+
+
+def test_manual_dossier_schema_requires_reviewable_content_and_complete_evidence_pairs() -> None:
+    with pytest.raises(ValidationError, match="source_snapshot_id and exact_text"):
+        ManualDossierClaimWrite(
+            statement="A source-bound claim needs its exact excerpt.",
+            source_snapshot_id=uuid4(),
+        )
+    with pytest.raises(ValidationError, match="at least one safe conclusion"):
+        ManualDossierWrite(
+            expected_opportunity_version=1,
+            idempotency_key="manual-test",
+            executive_summary="A human reviewed recovery summary with enough detail.",
+            safe_conclusions=["   "],
+            review_note="Human reviewer checked failed research before dossier recovery.",
+        )
+    payload = ManualDossierWrite(
+        expected_opportunity_version=1,
+        idempotency_key="manual-test",
+        executive_summary="A human reviewed recovery summary with enough detail.",
+        safe_conclusions=["A source-supported conclusion is safe to review."],
+        review_note="Human reviewer checked failed research before dossier recovery.",
+        claims=[
+            ManualDossierClaimWrite(
+                statement="The source directly supports this manual recovery claim.",
+                source_snapshot_id=uuid4(),
+                exact_text="This is the exact source excerpt used for manual recovery.",
+            )
+        ],
+    )
+    assert payload.safe_conclusions == ["A source-supported conclusion is safe to review."]

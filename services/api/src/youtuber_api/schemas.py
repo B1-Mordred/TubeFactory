@@ -735,6 +735,80 @@ class ManualOpportunityWrite(StrictRequestModel):
     )
 
 
+class ManualDossierClaimWrite(StrictRequestModel):
+    statement: str = Field(min_length=10, max_length=2000)
+    claim_type: Literal["fact", "inference", "opinion"] = "fact"
+    confidence: int = Field(default=70, ge=0, le=100)
+    risk: Literal["low", "medium", "high"] = "medium"
+    central: bool = True
+    source_snapshot_id: UUID | None = None
+    exact_text: str | None = Field(default=None, min_length=10, max_length=4000)
+    relationship: Literal["supports", "contradicts", "context"] = "supports"
+    source_independent: bool = True
+    direct_evidence: bool = True
+    primary_source: bool = False
+    coverage_unit_ids: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("statement", "exact_text")
+    @classmethod
+    def stripped_manual_claim_text(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def evidence_pair_is_complete(self) -> "ManualDossierClaimWrite":
+        if not self.statement.strip():
+            raise ValueError("claim statement must be non-empty")
+        has_snapshot = self.source_snapshot_id is not None
+        has_excerpt = bool(self.exact_text and self.exact_text.strip())
+        if has_snapshot != has_excerpt:
+            raise ValueError("source_snapshot_id and exact_text must be supplied together")
+        return self
+
+
+class ManualDossierWrite(StrictRequestModel):
+    expected_opportunity_version: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=120, pattern=r"^[a-zA-Z0-9_.:-]+$")
+    executive_summary: str = Field(min_length=20, max_length=8000)
+    safe_conclusions: list[str] = Field(min_length=1, max_length=40)
+    unresolved_questions: list[str] = Field(default_factory=list, max_length=40)
+    alternative_explanations: list[str] = Field(default_factory=list, max_length=40)
+    source_quality_notes: list[str] = Field(default_factory=list, max_length=40)
+    prohibited_overstatements: list[str] = Field(default_factory=list, max_length=40)
+    proposed_angles: list[str] = Field(default_factory=list, max_length=20)
+    chronology: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
+    explanation_plan: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    counterevidence_search_completed: bool = False
+    review_note: str = Field(min_length=10, max_length=4000)
+    claims: list[ManualDossierClaimWrite] = Field(default_factory=list, max_length=80)
+
+    @field_validator(
+        "safe_conclusions",
+        "unresolved_questions",
+        "alternative_explanations",
+        "source_quality_notes",
+        "prohibited_overstatements",
+        "proposed_angles",
+    )
+    @classmethod
+    def stripped_manual_dossier_lists(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+    @field_validator("executive_summary", "review_note")
+    @classmethod
+    def stripped_manual_dossier_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def has_substantive_manual_content(self) -> "ManualDossierWrite":
+        if not self.executive_summary:
+            raise ValueError("executive_summary must be non-empty")
+        if not self.safe_conclusions:
+            raise ValueError("at least one safe conclusion is required")
+        if not self.review_note:
+            raise ValueError("review_note must be non-empty")
+        return self
+
+
 class OpportunityDecisionView(BaseModel):
     id: UUID
     decision: Literal["pending", "approved", "rejected", "deferred"]

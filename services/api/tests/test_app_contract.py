@@ -52,6 +52,7 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/research/sources/{source_id}/index" in paths
     assert "/api/v1/research/source-relationships" in paths
     assert "/api/v1/research/opportunities/{opportunity_id}/decision" in paths
+    assert "/api/v1/research/opportunities/{opportunity_id}/manual-dossier" in paths
     assert "/api/v1/research/opportunities" in paths
     assert "/api/v1/research/opportunities/archived" in paths
     assert "/api/v1/research/opportunities/archive-scored" in paths
