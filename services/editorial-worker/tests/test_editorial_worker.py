@@ -699,6 +699,41 @@ def test_script_plan_targets_a_margin_and_assigns_each_claim_once() -> None:
     assert sum(beat["target_words"] for beat in beats) >= 932
 
 
+def test_script_plan_skips_claimless_counterevidence_units() -> None:
+    limit_claim = str(uuid4())
+    context = {
+        "script_policy": {"target_word_range": [675, 1350]},
+        "structured_inputs": {
+            "claims": [
+                {
+                    "id": limit_claim,
+                    "central": False,
+                    "coverage_unit_ids": ["limits"],
+                }
+            ],
+            "explanation_plan": [
+                {"id": "limits", "role": "limits", "question": "Welche Grenzen sind belegt?", "essential": True},
+                {"id": "alternatives", "role": "alternatives", "question": "Welche Alternativen gibt es?", "essential": False},
+            ],
+        },
+    }
+
+    beats = _script_beats(context)
+
+    assert any(
+        beat["segment_type"] == "counterevidence"
+        and beat["allowed_claim_ids"] == [limit_claim]
+        for beat in beats
+    )
+    assert all(
+        not (
+            beat["segment_type"] == "counterevidence"
+            and not beat["allowed_claim_ids"]
+        )
+        for beat in beats
+    )
+
+
 def test_correction_plan_closes_length_and_missing_claim_deficits() -> None:
     present, missing = str(uuid4()), str(uuid4())
     base = {
@@ -737,6 +772,44 @@ def test_correction_plan_closes_length_and_missing_claim_deficits() -> None:
     assert missing in next(
         beat for beat in beats if beat["segment_type"] == "evidence"
     )["required_claim_ids"]
+
+
+def test_correction_plan_repairs_claimless_counterevidence_with_limit_claim() -> None:
+    limit_claim = str(uuid4())
+    context = {
+        "script_policy": {"target_word_range": [675, 1350]},
+        "structured_inputs": {
+            "claims": [
+                {
+                    "id": limit_claim,
+                    "normalized_statement": (
+                        "Die rückgewinnbare Lithiummenge hängt von Konzentration "
+                        "und Extraktionseffizienz ab."
+                    ),
+                    "central": False,
+                    "coverage_unit_ids": ["limits"],
+                    "evidence": [{"evidence_excerpt_id": str(uuid4())}],
+                }
+            ]
+        },
+    }
+    base = {
+        "segments": [
+            {
+                "segment_key": "07-counterevidence",
+                "segment_type": "counterevidence",
+                "presentation_purpose": "Grenze prüfen",
+                "narration": "Wir prüfen die freigegebenen Belege.",
+                "annotations": [{"claim_ids": []}],
+            }
+        ]
+    }
+
+    beat = _correction_script_beats(context, base, {"07-counterevidence"})[0]
+
+    assert beat["segment_type"] == "counterevidence"
+    assert beat["allowed_claim_ids"] == [limit_claim]
+    assert beat["required_claim_ids"] == [limit_claim]
 
 
 def test_correction_plan_does_not_reward_growth_without_a_global_deficit() -> None:

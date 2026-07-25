@@ -97,6 +97,9 @@ def _script_beats(context: dict[str, Any]) -> list[dict[str, Any]]:
     }
     for index, unit in enumerate(units, 1):
         unit_id = str(unit.get("id", f"unit-{index}"))
+        claim_ids = claims_by_unit.get(unit_id, [])
+        if not claim_ids:
+            continue
         beats.append(
             {
                 "segment_key": f"coverage-{index}",
@@ -104,7 +107,7 @@ def _script_beats(context: dict[str, Any]) -> list[dict[str, Any]]:
                 "purpose": str(unit.get("question") or "Erklärt den nächsten belegten Zusammenhang"),
                 "coverage_unit_id": unit_id,
                 "target_words": unit_words,
-                "allowed_claim_ids": claims_by_unit.get(unit_id, []),
+                "allowed_claim_ids": claim_ids,
             }
         )
     if not units:
@@ -423,6 +426,22 @@ def _correction_script_beats(
             for claim_id, owner in claim_owner.items()
             if owner == segment["segment_key"]
         ]
+        if segment_type == "counterevidence" and not owned:
+            borrowed = next(
+                (
+                    str(claim["id"])
+                    for claim in claims
+                    if {
+                        str(value)
+                        for value in claim.get("coverage_unit_ids", [])
+                    }
+                    & {"limits", "alternatives"}
+                    and claim.get("evidence")
+                ),
+                None,
+            )
+            if borrowed is not None:
+                owned.append(borrowed)
         words = len(str(segment["narration"]).split())
         owned_claims = [
             claim for claim in claims if str(claim["id"]) in set(owned)
@@ -583,7 +602,11 @@ async def _write_script_segments(
             segment_type == "counterevidence"
             and not beat.get("allowed_claim_ids")
         ):
-            generated_by_key[str(beat["segment_key"])] = _safe_counterevidence_segment()
+            generated_by_key[str(beat["segment_key"])] = (
+                _safe_counterevidence_segment()
+                if base_draft is not None
+                else _safe_uncertainty_segment()
+            )
         else:
             generated_by_key[str(beat["segment_key"])] = result["output"]["segment"]
     if first_result is None:
@@ -1387,16 +1410,19 @@ def _extractive_fallback_content(
             )
             continue
         if segment["segment_type"] == "thesis":
+            segment_type = segment["segment_type"]
             sentences = _safe_thesis_segment()["sentences"]
         elif segment["segment_type"] == "counterevidence":
-            sentences = (
-                [claim_sentence(claim) for claim in counter_claims]
-                if counter_claims
-                else _safe_counterevidence_segment()["sentences"]
-            )
+            segment_type = segment["segment_type"]
+            if counter_claims:
+                sentences = [claim_sentence(claim) for claim in counter_claims]
+            else:
+                sentences = [claim_sentence(claim) for claim in claims[:1]]
         elif segment["segment_type"] == "uncertainty":
+            segment_type = segment["segment_type"]
             sentences = _safe_uncertainty_segment()["sentences"]
         elif segment["segment_type"] == "call_to_action":
+            segment_type = segment["segment_type"]
             sentences = [
                 {
                     "text": "Prüfe die verlinkten Primärquellen und bilde dir eine eigene Einordnung.",
@@ -1412,6 +1438,7 @@ def _extractive_fallback_content(
                 },
             ]
         else:
+            segment_type = segment["segment_type"]
             sentences = [
                 claim_sentence(claim)
                 for claim in claim_selection.get(segment["segment_type"], claims[:1])
@@ -1437,7 +1464,7 @@ def _extractive_fallback_content(
                 )
         output.append(
             {
-                "segment_type": segment["segment_type"],
+                "segment_type": segment_type,
                 "presentation_purpose": (
                     "Ordnet diesen Erklärschritt anhand der Aussage ein: "
                     + str(sentences[0]["text"])[:240]

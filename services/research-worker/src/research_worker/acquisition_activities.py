@@ -110,8 +110,76 @@ _RELEVANCE_STOP_WORDS = {
     "von",
     "was",
     "wie",
+    "warum",
+    "wieso",
     "with",
+    "zusammenhang",
+    "zusammenhängen",
 }
+_BOOTSTRAP_QUERY_STOP_WORDS = (
+    _RELEVANCE_STOP_WORDS
+    - {"deutschland", "germany"}
+    | {
+        "alltag",
+        "alltagsnahen",
+        "andererseits",
+        "anschaulich",
+        "anschauliche",
+        "anspruchsvoll",
+        "belastbare",
+        "bootstrap",
+        "diskutiert",
+        "dossier",
+        "einfach",
+        "einfache",
+        "einfaches",
+        "einerseits",
+        "enthält",
+        "enthaelt",
+        "erklärthemen",
+        "erklärvideo",
+        "erklärvideos",
+        "erklären",
+        "erklärt",
+        "faktischsimpel",
+        "freigabe",
+        "funktionieren",
+        "funktioniert",
+        "gelöste",
+        "geloeste",
+        "geeignet",
+        "handverlesene",
+        "heißes",
+        "heisses",
+        "klaren",
+        "liefert",
+        "medizinische",
+        "möglich",
+        "moeglich",
+        "niedrig-riskante",
+        "öffentlich",
+        "politische",
+        "pfad",
+        "praktisch",
+        "quellen",
+        "quelle",
+        "rechtliche",
+        "regional",
+        "repräsentativer",
+        "script",
+        "snapshots",
+        "storyboard",
+        "technik",
+        "testfall",
+        "thema",
+        "themen",
+        "übergehen",
+        "visuell",
+        "workflow",
+        "zeitlose",
+        "zunehmend",
+    }
+)
 _SOCIAL_OR_EXPORT_HOSTS = {
     "bibsonomy.org",
     "www.bibsonomy.org",
@@ -348,6 +416,31 @@ def _append_negative_terms(query: str, negative_keywords: list[str]) -> str:
     return f"{query} {suffix}".strip()
 
 
+def _bootstrap_query_terms(value: str, *, limit: int) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in re.findall(r"[\wÄÖÜäöüß-]{5,}", value, flags=re.UNICODE):
+        normalized = term.casefold().strip("-")
+        if normalized in _BOOTSTRAP_QUERY_STOP_WORDS or normalized in seen:
+            continue
+        seen.add(normalized)
+        terms.append(term)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _relevant_seed_queries(
+    title: str, summary: str, seed_queries: list[str]
+) -> tuple[str, ...]:
+    opportunity_terms = _relevance_tokens(f"{title} {summary}")
+    relevant: list[str] = []
+    for seed in seed_queries:
+        if _relevance_tokens(seed) & opportunity_terms:
+            relevant.append(seed)
+    return tuple(relevant[:4])
+
+
 def _topic_source_bootstrap_queries(
     *,
     title: str,
@@ -366,30 +459,38 @@ def _topic_source_bootstrap_queries(
     """
 
     title = " ".join(title.split())
-    summary_terms = [
-        term
-        for term in re.findall(r"[\wÄÖÜäöüß-]{5,}", summary, flags=re.UNICODE)
-        if term.casefold() not in _RELEVANCE_STOP_WORDS
-    ][:6]
-    topic_terms = [
-        term
-        for term in re.findall(r"[\wÄÖÜäöüß-]{5,}", subject_topic, flags=re.UNICODE)
-        if term.casefold() not in _RELEVANCE_STOP_WORDS
-    ][:6]
-    context = " ".join(dict.fromkeys([*topic_terms, *summary_terms, *related_concepts[:3]]))
-    base = title or context or research_goal[:180]
+    summary = " ".join(summary.split())
+    title_terms = _bootstrap_query_terms(title, limit=5)
+    summary_terms = _bootstrap_query_terms(summary, limit=8)
+    topic_terms = _bootstrap_query_terms(subject_topic, limit=4)
+    goal_terms = _bootstrap_query_terms(research_goal, limit=4)
+    opportunity_terms = _relevance_tokens(f"{title} {summary}")
+    matching_related = [
+        concept
+        for concept in related_concepts
+        if _relevance_tokens(concept) & opportunity_terms
+    ][:3]
+    concept_terms = list(
+        dict.fromkeys([*title_terms, *summary_terms, *matching_related])
+    )
+    fallback_terms = list(dict.fromkeys([*topic_terms, *goal_terms, *summary_terms]))
+    concept = " ".join(concept_terms or fallback_terms)[:220]
+    focused = " ".join(
+        dict.fromkeys([*title_terms[:3], *summary_terms[:5], *matching_related[:2]])
+    )[:220]
     queries: list[str] = []
-    if base:
+    if concept:
         queries.extend(
             [
-                f'"{base}" Erklärung Quelle Forschung',
-                f"{base} offizielle Quelle Bericht Studie Daten",
-                f"{base} Hintergrund Funktionsweise Ursache Erklärung",
+                f"{concept} Forschung Bericht Daten Quelle",
+                f"{focused or concept} Funktionsweise Erklärung Hintergrund",
+                f"{focused or concept} Studie technische Dokumentation",
             ]
         )
-    if context and context.casefold() != base.casefold():
-        queries.append(f"{context} verständliche Erklärung vertrauenswürdige Quellen")
-    for seed in seed_queries[:4]:
+    context = " ".join(dict.fromkeys([*topic_terms, *goal_terms, *summary_terms[:3]]))[:220]
+    if context and context.casefold() != concept.casefold():
+        queries.append(f"{context} vertrauenswürdige Quellen")
+    for seed in _relevant_seed_queries(title, summary, seed_queries):
         queries.append(seed)
     return tuple(
         dict.fromkeys(

@@ -334,8 +334,8 @@ services:
       MINIO_SECRET_KEY_FILE: /run/secrets/minio_secret_key
       MINIO_BUCKET: production-artifacts
       SEARXNG_ENDPOINT: http://searxng:8080
-      SEARXNG_GENERAL_ENGINES: ${SEARXNG_GENERAL_ENGINES:-bing,qwant news,bing news}
-      SEARXNG_SCIENCE_ENGINES: ${SEARXNG_SCIENCE_ENGINES:-bing,arxiv,pubmed}
+      SEARXNG_GENERAL_ENGINES: ${SEARXNG_GENERAL_ENGINES:-duckduckgo,brave,wikipedia,bing news}
+      SEARXNG_SCIENCE_ENGINES: ${SEARXNG_SCIENCE_ENGINES:-google scholar,arxiv,pubmed,duckduckgo}
       FIRECRAWL_ENDPOINT: http://firecrawl-api:3002
       ACQUISITION_USER_AGENT: ${ACQUISITION_USER_AGENT:-EvidenceStudioResearch/0.1 (+self-hosted editorial research)}
       ACQUISITION_MAX_BYTES: ${ACQUISITION_MAX_BYTES:-10000000}

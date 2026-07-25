@@ -26,11 +26,11 @@ class Settings:
     minio_bucket: str = os.getenv("MINIO_BUCKET", "production-artifacts")
     searxng_endpoint: str = os.getenv("SEARXNG_ENDPOINT", "http://searxng:8080")
     searxng_general_engines: str = os.getenv(
-        "SEARXNG_GENERAL_ENGINES", "bing,qwant news,bing news"
+        "SEARXNG_GENERAL_ENGINES", "duckduckgo,brave,wikipedia,bing news"
     )
     searxng_science_engines: str = os.getenv(
         "SEARXNG_SCIENCE_ENGINES",
-        "bing,arxiv,pubmed",
+        "google scholar,arxiv,pubmed,duckduckgo",
     )
     openalex_endpoint: str = os.getenv(
         "OPENALEX_ENDPOINT", "https://api.openalex.org"

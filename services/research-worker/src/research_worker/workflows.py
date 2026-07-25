@@ -714,19 +714,33 @@ class LiveResearchDossierWorkflow:
         )
         self._state = "AI_EVIDENCE_REVIEW"
         self._progress = 92
-        assessment = await workflow.execute_activity(
-            "assess-dossier-evidence-with-ai",
-            {**request, "research_dossier_id": self._result["dossier_id"]},
-            task_queue="editorial-production-v2",
-            start_to_close_timeout=timedelta(minutes=35),
-            heartbeat_timeout=timedelta(minutes=1),
-            schedule_to_close_timeout=timedelta(minutes=45),
-            retry_policy=RetryPolicy(
-                initial_interval=timedelta(seconds=15),
-                maximum_interval=timedelta(minutes=2),
-                maximum_attempts=12,
-            ),
-        )
+        try:
+            assessment = await workflow.execute_activity(
+                "assess-dossier-evidence-with-ai",
+                {**request, "research_dossier_id": self._result["dossier_id"]},
+                task_queue="editorial-production-v2",
+                start_to_close_timeout=timedelta(minutes=35),
+                heartbeat_timeout=timedelta(minutes=1),
+                schedule_to_close_timeout=timedelta(minutes=45),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=15),
+                    maximum_interval=timedelta(minutes=2),
+                    maximum_attempts=2,
+                ),
+            )
+        except ActivityError as exc:
+            assessment = {
+                "abstained": True,
+                "confidence": 0.0,
+                "claim_assessments": [],
+                "source_assessments": [],
+                "methodological_limits": [],
+                "counterevidence_gaps": [],
+                "uncertainty": [
+                    "advisory AI evidence review unavailable; deterministic readiness result preserved"
+                ],
+                "error": str(exc)[:500],
+            }
         self._result = {**self._result, "ai_evidence_assessment": assessment}
         if self._result.get("completion_met") and self._result.get("automatic_script_request"):
             self._state = "HANDOFF_SCRIPT_GENERATION"
