@@ -7,9 +7,11 @@ from editorial_core.discovery import FindingCluster, SearchFinding, SubjectBrief
 from research_worker.acquisition import SearxngSearchResponse
 import research_worker.live_activities as live_module
 from research_worker.live_activities import (
+    _candidate_filter_kind,
     _finding_signature,
     _discovery_strategies,
     _is_explainer_candidate,
+    _is_misinformation_candidate,
     _matches_processed_claim,
     _publication_at,
     _score_live_cluster,
@@ -91,6 +93,106 @@ def test_all_explainer_targets_use_candidate_hygiene_filter() -> None:
     assert _uses_explainer_candidate_filter({"target": "simple_explainer"})
     assert _uses_explainer_candidate_filter({"target": "evidence_first_explainer"})
     assert not _uses_explainer_candidate_filter({"target": "news_commentary"})
+
+
+def test_explainer_filter_uses_editorial_format_not_only_target() -> None:
+    assert _uses_explainer_candidate_filter(
+        {
+            "format_policy": {"target": "standard"},
+            "editorial_profile": {"format": "einfaches_erklaervideo"},
+        }
+    )
+
+
+def test_manual_only_discovery_mode_disables_live_discovery() -> None:
+    assert (
+        _candidate_filter_kind(
+            {
+                "format_policy": {"target": "standard", "discovery_mode": "manual_only"},
+                "editorial_profile": {"format": "einfaches_erklaervideo"},
+            }
+        )
+        == "disabled"
+    )
+
+
+def test_explainer_filter_rejects_query_word_noise_from_observed_results() -> None:
+    strategy = {
+        "query": (
+            "Warum Batterien mit der Zeit schwächer werden einfach erklärt "
+            "-\"Kaufberatung\" -\"Preisvergleich\""
+        )
+    }
+
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://www.dwds.de/wb/warum",
+            "title": "warum – Schreibung, Definition, Bedeutung, Etymologie, Synonyme ...",
+            "summary": "warum Adv. ‘weshalb, aus welchem Grunde’.",
+        },
+        strategy,
+    )
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://www.ardmediathek.de/video/tatort-warum",
+            "title": "Tatort: Warum - hier anschauen - ARD Mediathek",
+            "summary": "Sie hat Todesangst. Doch warum?",
+        },
+        strategy,
+    )
+
+
+def test_explainer_filter_rejects_product_or_cost_articles() -> None:
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://www.gamestar.de/artikel/oled-monitor-test",
+            "title": "OLED-Monitore sind das Nonplusultra, doch in einer Disziplin tun sie sich schwer",
+            "summary": "Der Test zeigt, wie gut dieser Monitor funktioniert.",
+        },
+        {"query": "Wie OLED Displays funktionieren einfach erklärt"},
+    )
+    assert not _is_explainer_candidate(
+        {
+            "url": "https://www.capital.de/immobilien/waermepumpen-wartung-kosten",
+            "title": "Wärmepumpen-Wartung: Wie viel Geld der Service kostet",
+            "summary": "Ein Experte erklärt, wie oft Eigentümer ihre Anlage checken lassen.",
+        },
+        {"query": "Wie Wärmepumpen funktionieren einfach erklärt"},
+    )
+
+
+def test_misinformation_filter_rejects_generic_noise_but_keeps_claim_checks() -> None:
+    strategy = {
+        "query": (
+            "deutschsprachige Nachrichten Falschmeldung Faktencheck aktuell "
+            "-\"Satire\" -\"Meinung\""
+        )
+    }
+
+    assert not _is_misinformation_candidate(
+        {
+            "url": "https://de.wikipedia.org/wiki/YouTube",
+            "title": "YouTube – Wikipedia",
+            "summary": "YouTube ist ein Videoportal.",
+        },
+        strategy,
+    )
+    assert not _is_misinformation_candidate(
+        {
+            "url": "https://www.tagesschau.de/faktenfinder/desinformation-erkennen",
+            "title": "Wie Desinformation zu erkennen ist",
+            "summary": "Ein Leitfaden für Medienkompetenz.",
+        },
+        strategy,
+    )
+    assert _is_misinformation_candidate(
+        {
+            "url": "https://correctiv.org/faktencheck/2026/beispiel",
+            "title": "Faktencheck widerlegt falsche Behauptung zu aktuellen Gesundheitsdaten",
+            "summary": "Amtliche Zahlen korrigieren eine viral verbreitete Falschmeldung.",
+        },
+        strategy,
+    )
 
 
 @pytest.mark.parametrize(

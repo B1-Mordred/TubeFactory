@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from urllib.parse import urlsplit
 
 import asyncpg
+from editorial_core.operating_policy import evaluate_operating_policy
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -34,6 +35,13 @@ _EXPLAINER_SIGNAL = re.compile(
     r"konsens|why|how|explain\w*|study|research|evidence|impact)\b",
     re.IGNORECASE,
 )
+_MISINFORMATION_SIGNAL = re.compile(
+    r"\b(?:desinformation|falsch(?:e|er|es|en)?|falschmeldung|fake(?:\s|-)?news|"
+    r"irreführend\w*|widerleg\w*|faktencheck\w*|fact(?:\s|-)?check\w*|"
+    r"behaupt\w*|gerücht\w*|hoax|correct(?:ed|ion)?|retract(?:ed|ion)?|"
+    r"misleading|debunk\w*|false(?:hood)?)\b",
+    re.IGNORECASE,
+)
 _GENERIC_PLATFORM_DOMAINS = {
     "facebook.com",
     "www.facebook.com",
@@ -45,11 +53,94 @@ _GENERIC_PLATFORM_DOMAINS = {
     "www.youtube.com",
     "youtu.be",
 }
+_NOISE_DOMAIN_SUFFIXES = (
+    "adultforum.co",
+    "duden.de",
+    "dwds.de",
+    "languagetool.org",
+    "leo.org",
+    "satzbeispiele.de",
+    "scribbr.de",
+    "wiktionary.org",
+    "wikipedia.org",
+    "wortbedeutung.info",
+)
+_NOISE_TITLE = re.compile(
+    r"\b(?:rechtschreibung|schreibung|definition|bedeutung|etymologie|synonyme|"
+    r"komma|wiktionary|wikipedia|mediathek|tatort|ip-adresse|kostenlose?\s+rechtschreib|"
+    r"forum|adult|xnxx|testbericht|im\s+test|test\s+zeigt|preisvergleich|"
+    r"kaufberatung|wartungskosten|service\s+kostet|wie\s+viel\s+geld)\b",
+    re.IGNORECASE,
+)
+_MISINFORMATION_META_NOISE = re.compile(
+    r"\b(?:was\s+ist\s+desinformation|desinformation\s+erkennen|zu\s+erkennen|"
+    r"leitfaden|ratgeber|medienkompetenz|lexikon|glossar)\b",
+    re.IGNORECASE,
+)
 _INSTITUTIONAL_ANNOUNCEMENT = re.compile(
     r"\b(?:wissenschafts?preis|forschungspreis|award|auszeichnung|preisverleihung|"
     r"workshop(?:-reihe)?|veranstaltungsreihe|unterrichtsmaterial(?:ien)?|"
     r"pressegespräch|kooperationsvereinbarung|förderbescheid)\b",
     re.IGNORECASE,
+)
+_DISCOVERY_STOPWORDS = frozenset(
+    {
+        "aber",
+        "aktuell",
+        "aktuelle",
+        "aktueller",
+        "aktuelles",
+        "alle",
+        "auch",
+        "aus",
+        "bei",
+        "beim",
+        "eine",
+        "einem",
+        "einen",
+        "einer",
+        "eines",
+        "einfach",
+        "erklärt",
+        "erklaert",
+        "erklären",
+        "erklaeren",
+        "für",
+        "fuer",
+        "gibt",
+        "haben",
+        "kann",
+        "mit",
+        "oder",
+        "ohne",
+        "sich",
+        "sind",
+        "thema",
+        "themen",
+        "tun",
+        "und",
+        "vom",
+        "von",
+        "warum",
+        "was",
+        "welche",
+        "wie",
+        "wieso",
+        "wird",
+        "werden",
+        "zeit",
+        "zum",
+        "zur",
+        "the",
+        "and",
+        "for",
+        "how",
+        "why",
+        "what",
+        "explain",
+        "explained",
+        "simple",
+    }
 )
 
 
@@ -88,28 +179,136 @@ def _source_domains(findings: tuple[SearchFinding, ...]) -> set[str]:
     }
 
 
-def _is_explainer_candidate(item: dict[str, Any]) -> bool:
-    """Reject navigational/search noise for evidence-first explainer subjects."""
-
+def _hostname(value: str) -> str:
     try:
-        parts = urlsplit(str(item.get("url", "")))
+        return urlsplit(value).hostname or ""
     except ValueError:
-        return False
-    if (parts.hostname or "").casefold() in _GENERIC_PLATFORM_DOMAINS:
-        return False
+        return ""
+
+
+def _tokenize_relevance(value: str) -> frozenset[str]:
+    return frozenset(
+        token
+        for token in re.findall(r"[\w-]{3,}", value.casefold())
+        if token not in _DISCOVERY_STOPWORDS
+    )
+
+
+def _positive_query_text(strategy: dict[str, Any]) -> str:
+    query = str(strategy.get("query", ""))
+    query = re.sub(r'-"[^"]+"', " ", query)
+    query = re.sub(r"\b(?:OR|AND|NOT)\b", " ", query, flags=re.IGNORECASE)
+    return query
+
+
+def _query_overlap(item: dict[str, Any], strategy: dict[str, Any] | None) -> int:
+    if not strategy:
+        return 1
+    query_tokens = _tokenize_relevance(_positive_query_text(strategy))
+    if not query_tokens:
+        return 1
+    content_tokens = _tokenize_relevance(
+        f"{item.get('title', '')} {item.get('summary', '')}"
+    )
+    return len(query_tokens & content_tokens)
+
+
+def _is_noisy_search_result(item: dict[str, Any]) -> bool:
+    hostname = _hostname(str(item.get("url", ""))).casefold()
+    if not hostname:
+        return True
+    if hostname in _GENERIC_PLATFORM_DOMAINS:
+        return True
+    if any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in _NOISE_DOMAIN_SUFFIXES):
+        return True
     title = str(item.get("title", "")).strip()
     summary = str(item.get("summary", "")).strip()
     if not title or title.casefold() in {"youtube", "facebook", "instagram", "tiktok"}:
+        return True
+    return bool(_NOISE_TITLE.search(f"{title} {summary}"))
+
+
+def _is_explainer_candidate(item: dict[str, Any], strategy: dict[str, Any] | None = None) -> bool:
+    """Reject navigational/search noise for evidence-first explainer subjects."""
+
+    if _is_noisy_search_result(item):
         return False
+    if _query_overlap(item, strategy) < 1:
+        return False
+    title = str(item.get("title", "")).strip()
+    summary = str(item.get("summary", "")).strip()
     if _INSTITUTIONAL_ANNOUNCEMENT.search(f"{title} {summary}"):
         return False
     return bool(_EXPLAINER_SIGNAL.search(f"{title} {summary}"))
 
 
-def _uses_explainer_candidate_filter(format_policy: dict[str, Any]) -> bool:
-    """Apply discovery hygiene to every explainer format, not one legacy key."""
+def _is_misinformation_candidate(
+    item: dict[str, Any], strategy: dict[str, Any] | None = None
+) -> bool:
+    """Reject generic web pages before they become misinformation opportunities."""
 
-    return str(format_policy.get("target", "")).strip().casefold().endswith("explainer")
+    if _is_noisy_search_result(item):
+        return False
+    if _query_overlap(item, strategy) < 1:
+        return False
+    text = f"{item.get('title', '')} {item.get('summary', '')}"
+    if _MISINFORMATION_META_NOISE.search(text):
+        return False
+    return bool(_MISINFORMATION_SIGNAL.search(text))
+
+
+def _discovery_mode(format_policy: dict[str, Any]) -> str:
+    return str(format_policy.get("discovery_mode", "auto")).strip().casefold()
+
+
+def _profile_text(profile: dict[str, Any]) -> str:
+    return json.dumps(profile, ensure_ascii=False, sort_keys=True).casefold()
+
+
+def _uses_explainer_candidate_filter(profile: dict[str, Any]) -> bool:
+    """Apply discovery hygiene to every explainer profile, not one legacy target key."""
+
+    format_policy = profile.get("format_policy") if "format_policy" in profile else profile
+    format_policy = format_policy if isinstance(format_policy, dict) else {}
+    combined = _profile_text(profile)
+    target = str(format_policy.get("target", "")).strip().casefold()
+    editorial_format = str(
+        (profile.get("editorial_profile") or {}).get("format", "")
+        if isinstance(profile.get("editorial_profile"), dict)
+        else ""
+    ).casefold()
+    return (
+        target.endswith("explainer")
+        or "explainer" in target
+        or "explainer" in editorial_format
+        or "erklaervideo" in editorial_format
+        or "erklärvideo" in editorial_format
+        or "erklaervideo" in combined
+        or "erklärvideo" in combined
+    )
+
+
+def _uses_misinformation_candidate_filter(profile: dict[str, Any]) -> bool:
+    approval_profile = profile.get("approval_profile") or {}
+    sensitive_topics = approval_profile.get("sensitive_topics", [])
+    if "misinformation_fact_checking" in sensitive_topics:
+        return True
+    combined = _profile_text(profile)
+    return any(
+        signal in combined
+        for signal in ("misinformation", "falschinformation", "desinformation", "faktencheck")
+    )
+
+
+def _candidate_filter_kind(profile: dict[str, Any]) -> str:
+    format_policy = profile.get("format_policy") or {}
+    if _discovery_mode(format_policy) == "manual_only":
+        return "disabled"
+    if _uses_misinformation_candidate_filter(profile):
+        return "misinformation"
+    if _uses_explainer_candidate_filter(profile):
+        return "explainer"
+    return "general"
 
 
 def _discovery_strategies(plan: Any, format_policy: dict[str, Any]) -> list[dict[str, Any]]:
@@ -236,9 +435,14 @@ def _score_live_cluster(
         if cluster_domains
         else 0.0
     )
+    alignment_penalty = (
+        28
+        if topic_coverage < 0.08 and query_coverage < 0.08
+        else 14 if query_coverage < 0.08 else 0
+    )
 
     positive = {
-        "audience_fit": _clamped_score(30 + topic_coverage * 35 + query_coverage * 20 + rank_quality * 15),
+        "audience_fit": _clamped_score(18 + topic_coverage * 38 + query_coverage * 24 + rank_quality * 15),
         "evidence_potential": _clamped_score(
             24 + result_count * 9 + len(cluster_domains) * 12 + primary_count * 12 + specificity * 18
         ),
@@ -256,7 +460,9 @@ def _score_live_cluster(
     }
     risk_base = {"low": 12, "medium": 25, "high": 38}.get(subject_risk.casefold(), 25)
     penalties = {
-        "risk": _clamped_score(risk_base + (6 if published_dates and timeliness >= 85 else 0)),
+        "risk": _clamped_score(
+            risk_base + alignment_penalty + (6 if published_dates and timeliness >= 85 else 0)
+        ),
         "estimated_cost": _clamped_score(7 + result_count * 5 + specificity * 8 + primary_count * 3),
         "duplication": _clamped_score(maximum_prior_similarity * 70 + repeated_domain_ratio * 30),
     }
@@ -269,7 +475,7 @@ def _score_live_cluster(
         f"Educational value {positive['educational_value']}: {len(content_tokens)} distinct content terms; numerical specificity {'present' if has_number else 'absent'}.",
         f"Visual explainability {positive['visual_explainability']}: numerical signal {'present' if has_number else 'absent'}, date signal {'present' if has_date_language else 'absent'}.",
         f"Channel differentiation {positive['channel_differentiation']}: search purposes {', '.join(sorted(purposes)) or 'unavailable'}; topic coverage {topic_coverage:.0%}; domain rarity {domain_rarity:.0%}.",
-        f"Risk penalty {penalties['risk']}: subject risk is {subject_risk}; very recent material adds review pressure when applicable.",
+        f"Risk penalty {penalties['risk']}: subject risk is {subject_risk}; alignment penalty {alignment_penalty}; very recent material adds review pressure when applicable.",
         f"Cost penalty {penalties['estimated_cost']}: estimated from {result_count} source(s), content specificity and source type.",
         f"Duplication penalty {penalties['duplication']}: prior similarity {maximum_prior_similarity:.0%}; repeated-domain ratio {repeated_domain_ratio:.0%}.",
         f"Final weighted score {scored.total}/100. The complete component values, penalties and configured weights are stored immutably.",
@@ -285,7 +491,8 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
         subject = await connection.fetchrow(
             """SELECT id, topic, research_goal, seed_queries, related_concepts,
                       negative_keywords, languages, regions, source_requirements,
-                      domain_policy, opportunity_weights, freshness_policy, format_policy, risk
+                      domain_policy, opportunity_weights, freshness_policy, format_policy,
+                      editorial_profile, approval_profile, risk
                FROM subject_profiles
                WHERE id=$1 AND enabled=true AND deleted_at IS NULL""",
             UUID(str(request["subject_profile_id"])),
@@ -325,7 +532,22 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
             )
         )
         format_policy = _json(subject["format_policy"]) or {}
-        strategies = _discovery_strategies(plan, format_policy)
+        editorial_profile = _json(subject["editorial_profile"]) or {}
+        approval_profile = _json(subject["approval_profile"]) or {}
+        policy_snapshot = evaluate_operating_policy(
+            mode=str(approval_profile.get("mode", "assisted")),
+            risk=str(subject["risk"]),
+            sensitive_topics=approval_profile.get("sensitive_topics", []),
+        ).as_dict()
+        profile_context = {
+            "topic": subject["topic"],
+            "research_goal": subject["research_goal"],
+            "format_policy": format_policy,
+            "editorial_profile": editorial_profile,
+            "approval_profile": approval_profile,
+        }
+        discovery_disabled = _candidate_filter_kind(profile_context) == "disabled"
+        strategies = [] if discovery_disabled else _discovery_strategies(plan, format_policy)
         return {
             "subject_profile_id": str(subject["id"]),
             "topic": subject["topic"],
@@ -334,6 +556,10 @@ async def load_live_search_plan(request: dict[str, Any]) -> dict[str, Any]:
             "opportunity_weights": _json(subject["opportunity_weights"]) or {},
             "freshness_policy": _json(subject["freshness_policy"]) or {"lookback_days": 30},
             "format_policy": format_policy,
+            "editorial_profile": editorial_profile,
+            "approval_profile": approval_profile,
+            "policy_snapshot": policy_snapshot,
+            "discovery_disabled": discovery_disabled,
             "risk": subject["risk"],
         }
     finally:
@@ -423,8 +649,20 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
         for rank, item in enumerate(result_set.get("results", []), start=1)
     ]
     raw_findings = [item for item, _, _ in entries]
-    if _uses_explainer_candidate_filter(request.get("format_policy") or {}):
-        entries = [entry for entry in entries if _is_explainer_candidate(entry[0])]
+    profile_context = {
+        "topic": request.get("topic", ""),
+        "research_goal": request.get("research_goal", ""),
+        "format_policy": request.get("format_policy") or {},
+        "editorial_profile": request.get("editorial_profile") or {},
+        "approval_profile": request.get("approval_profile") or {},
+    }
+    filter_kind = _candidate_filter_kind(profile_context)
+    if filter_kind == "explainer":
+        entries = [entry for entry in entries if _is_explainer_candidate(entry[0], entry[1])]
+    elif filter_kind == "misinformation":
+        entries = [entry for entry in entries if _is_misinformation_candidate(entry[0], entry[1])]
+    elif filter_kind == "disabled":
+        entries = []
     eligible_findings = [item for item, _, _ in entries]
     findings = tuple(
         SearchFinding(
@@ -475,6 +713,7 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
             if existing:
                 return _json(existing)
             weights = request.get("opportunity_weights") or {}
+            policy_snapshot = request.get("policy_snapshot") or {}
             previously_processed_urls = set(
                 await connection.fetchval(
                     """SELECT coalesce(array_agg(DISTINCT sd.canonical_url), ARRAY[]::text[])
@@ -523,17 +762,19 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
                 await connection.execute(
                     """INSERT INTO opportunities
                     (id,version,created_at,updated_at,deleted_at,subject_profile_id,title,summary,
-                     decision,manual,grouping_reason,duplicate_of_id,estimated_cost,decided_by,
-                     decided_at,decision_reason)
-                    VALUES($1,1,$2,$2,NULL,$3,$4,$5,'pending',false,$6::jsonb,NULL,$7::jsonb,NULL,NULL,NULL)""",
+                     editorial_rationale,policy_snapshot,decision,manual,grouping_reason,
+                     duplicate_of_id,estimated_cost,decided_by,decided_at,decision_reason)
+                    VALUES($1,1,$2,$2,NULL,$3,$4,$5,'',$6::jsonb,'pending',false,$7::jsonb,
+                           NULL,$8::jsonb,NULL,NULL,NULL)""",
                     opportunity_id,
                     now,
                     subject_id,
                     representative.title[:300],
                     representative.summary or "Live discovery result awaiting editorial triage.",
+                    json.dumps(policy_snapshot),
                     json.dumps(
                         [
-                            "classification: potential misinformation",
+                            f"classification: {filter_kind} candidate",
                             *cluster.grouping_reasons,
                             f"{len(cluster.findings)} deduplicated result(s)",
                             f"{len(cluster_domains)} source domain(s)",
@@ -618,6 +859,8 @@ async def persist_live_opportunities(request: dict[str, Any]) -> dict[str, Any]:
             result = {
                 "opportunity_ids": opportunity_ids,
                 "search_strategy_count": len(result_sets),
+                "candidate_filter": filter_kind,
+                "discovery_disabled": bool(request.get("discovery_disabled")),
                 "raw_result_count": len(raw_findings),
                 "eligible_result_count": len(findings),
                 "relevance_rejected_count": len(raw_findings) - len(findings),
