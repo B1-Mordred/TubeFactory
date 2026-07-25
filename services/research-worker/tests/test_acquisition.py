@@ -17,6 +17,7 @@ from research_worker.acquisition_activities import (
     _registry_query_for_citation,
     _resolve_registry_candidate,
     _scholarly_work_identity,
+    _topic_source_bootstrap_queries,
 )
 from research_worker.acquisition import (
     CachedRobotsPolicy,
@@ -193,6 +194,44 @@ def test_generic_queries_and_classification_are_topic_agnostic() -> None:
     )
     assert relevant_score >= 0.18 and relevant_terms >= 2
     assert noise_score < 0.18 or noise_terms < 2
+
+
+def test_topic_source_bootstrap_queries_use_approved_topic_and_subject_context() -> None:
+    queries = _topic_source_bootstrap_queries(
+        title="Warum Batterien mit der Zeit schwächer werden",
+        summary="Lithium-Ionen-Akkus verlieren durch Alterung nutzbare Kapazität.",
+        subject_topic="Einfache Erklärvideos zu Technik und Wissenschaft",
+        research_goal="Verständliche Quellen für ein sachliches Erklärvideo finden.",
+        seed_queries=["Akkualterung Forschung Fraunhofer"],
+        related_concepts=["Lithium-Ionen-Akku", "Batteriechemie"],
+        negative_keywords=["Tatort"],
+    )
+
+    assert 1 <= len(queries) <= 6
+    assert any(
+        '"Warum Batterien mit der Zeit schwächer werden"' in query for query in queries
+    )
+    assert any("Technik" in query and "Wissenschaft" in query for query in queries)
+    assert any("Akkualterung Forschung Fraunhofer" in query for query in queries)
+    assert all('-"Tatort"' in query for query in queries)
+
+
+def test_topic_relevance_distinguishes_explainer_sources_from_generic_noise() -> None:
+    relevant_score, relevant_terms = _candidate_relevance(
+        "Warum Batterien mit der Zeit schwächer werden",
+        "Erklärung der chemischen und mechanischen Alterung von Lithium-Ionen-Akkus.",
+        "Warum Batterien altern und Kapazität verlieren",
+        "Lithium-Ionen-Akkus werden durch Ladezyklen, Temperatur und Nebenreaktionen schwächer.",
+    )
+    noise_score, noise_terms = _candidate_relevance(
+        "Warum Batterien mit der Zeit schwächer werden",
+        "Erklärung der chemischen und mechanischen Alterung von Lithium-Ionen-Akkus.",
+        "warum - Bedeutung und Grammatik",
+        "Wörterbuchdefinition mit Beispielen zur Verwendung des Wortes warum.",
+    )
+
+    assert relevant_score >= 0.32 and relevant_terms >= 2
+    assert noise_score < 0.32 or noise_terms < 2
 
 
 def test_generic_web_relevance_rejects_adjacent_generic_topic() -> None:

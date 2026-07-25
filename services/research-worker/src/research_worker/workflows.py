@@ -357,7 +357,7 @@ class SourceAcquisitionWorkflow:
         plan = await workflow.execute_activity(
             "load-approved-opportunity-sources",
             request,
-            start_to_close_timeout=timedelta(seconds=30),
+            start_to_close_timeout=timedelta(minutes=4),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
         self._state = "ACQUIRING"
@@ -465,6 +465,10 @@ class SourceAcquisitionWorkflow:
             "linked_primary_source_count": enrichment.get("linked_source_count", 0),
             "evidence_search_health": enrichment.get("search_health", []),
             "evidence_search_plan_id": evidence_search_plan.get("plan_id"),
+            "bootstrap_sources": bool(plan.get("bootstrap_sources")),
+            "bootstrap_linked_source_count": plan.get("bootstrap_linked_source_count", 0),
+            "bootstrap_queries": plan.get("bootstrap_queries", []),
+            "bootstrap_search_health": plan.get("bootstrap_search_health", []),
         }
         if request.get("auto_continue"):
             self._state = "STARTING_DOSSIER"

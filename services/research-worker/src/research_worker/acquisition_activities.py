@@ -123,6 +123,7 @@ _SOCIAL_OR_EXPORT_HOSTS = {
     "x.com",
 }
 _REVIEW_TITLE_TERMS = {"review", "overview", "literature", "vergleich", "meta-analysis"}
+_DEFAULT_SOURCE_LINK_LIMIT = 20
 
 
 class _AnchorParser(HTMLParser):
@@ -328,6 +329,75 @@ def _generic_evidence_queries(title: str, summary: str) -> tuple[str, ...]:
         f"{concept} {context} evidence documentation statistics Beleg Dokumentation Statistik",
         f"{concept} limitations risks correction critique counterevidence Grenzen Risiken Kritik Gegenbeleg",
     )
+
+
+def _json_list(value: Any) -> list[str]:
+    raw = _json(value) or []
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _append_negative_terms(query: str, negative_keywords: list[str]) -> str:
+    terms = [
+        f'-"{keyword}"'
+        for keyword in negative_keywords[:8]
+        if len(keyword) <= 80 and '"' not in keyword
+    ]
+    suffix = " ".join(terms)
+    return f"{query} {suffix}".strip()
+
+
+def _topic_source_bootstrap_queries(
+    *,
+    title: str,
+    summary: str,
+    subject_topic: str,
+    research_goal: str,
+    seed_queries: list[str],
+    related_concepts: list[str],
+    negative_keywords: list[str],
+) -> tuple[str, ...]:
+    """Build topic-specific source searches for curated/manual Opportunities.
+
+    These queries are used before any source snapshot exists. They intentionally
+    start from the human-approved Opportunity text, then add subject context so
+    hand-picked explainer topics are not forced through live-discovery seeds.
+    """
+
+    title = " ".join(title.split())
+    summary_terms = [
+        term
+        for term in re.findall(r"[\wÄÖÜäöüß-]{5,}", summary, flags=re.UNICODE)
+        if term.casefold() not in _RELEVANCE_STOP_WORDS
+    ][:6]
+    topic_terms = [
+        term
+        for term in re.findall(r"[\wÄÖÜäöüß-]{5,}", subject_topic, flags=re.UNICODE)
+        if term.casefold() not in _RELEVANCE_STOP_WORDS
+    ][:6]
+    context = " ".join(dict.fromkeys([*topic_terms, *summary_terms, *related_concepts[:3]]))
+    base = title or context or research_goal[:180]
+    queries: list[str] = []
+    if base:
+        queries.extend(
+            [
+                f'"{base}" Erklärung Quelle Forschung',
+                f"{base} offizielle Quelle Bericht Studie Daten",
+                f"{base} Hintergrund Funktionsweise Ursache Erklärung",
+            ]
+        )
+    if context and context.casefold() != base.casefold():
+        queries.append(f"{context} verständliche Erklärung vertrauenswürdige Quellen")
+    for seed in seed_queries[:4]:
+        queries.append(seed)
+    return tuple(
+        dict.fromkeys(
+            _append_negative_terms(query[:280], negative_keywords)
+            for query in queries
+            if query.strip()
+        )
+    )[:6]
 
 
 def _scholarly_work_identity(url: str, *, doi: str | None = None) -> str | None:
@@ -570,6 +640,8 @@ async def _generic_search_candidates(
                 {
                     "url": url,
                     "title": str(result["title"]),
+                    "snippet": str(result.get("summary", "")),
+                    "search_query": query,
                     "source_type": _classify_search_candidate(
                         url, str(result["title"]), str(result.get("summary", ""))
                     ),
@@ -609,13 +681,177 @@ async def _put_object(
     )
 
 
+def _source_manifest(rows: list[asyncpg.Record]) -> list[dict[str, str]]:
+    return [
+        {
+            "source_document_id": str(row["source_document_id"]),
+            "url": row["canonical_url"],
+            "title": row["title"],
+        }
+        for row in rows
+    ]
+
+
+async def _load_opportunity_source_rows(
+    connection: asyncpg.Connection,
+    opportunity_id: UUID,
+    *,
+    limit: int = 20,
+) -> list[asyncpg.Record]:
+    return list(
+        await connection.fetch(
+            """SELECT os.source_document_id, sd.canonical_url, sd.title
+               FROM opportunity_sources os
+               JOIN source_documents sd ON sd.id=os.source_document_id
+               WHERE os.opportunity_id=$1
+               ORDER BY os.result_rank, sd.canonical_url
+               LIMIT $2""",
+            opportunity_id,
+            limit,
+        )
+    )
+
+
+async def _existing_source_identities(
+    connection: asyncpg.Connection, opportunity_id: UUID
+) -> tuple[set[str], set[str]]:
+    existing_urls = set(
+        await connection.fetchval(
+            """SELECT coalesce(array_agg(sd.canonical_url), ARRAY[]::text[])
+               FROM opportunity_sources os
+               JOIN source_documents sd ON sd.id=os.source_document_id
+               WHERE os.opportunity_id=$1""",
+            opportunity_id,
+        )
+    )
+    existing_identities: set[str] = set()
+    existing_rows = await connection.fetch(
+        """SELECT sd.canonical_url,sd.reputation
+           FROM opportunity_sources os
+           JOIN source_documents sd ON sd.id=os.source_document_id
+           WHERE os.opportunity_id=$1""",
+        opportunity_id,
+    )
+    for existing in existing_rows:
+        reputation = _json(existing["reputation"]) or {}
+        identity = reputation.get("work_identity") or _scholarly_work_identity(
+            str(existing["canonical_url"])
+        )
+        if identity:
+            existing_identities.add(str(identity))
+    return existing_urls, existing_identities
+
+
+async def _persist_opportunity_source_candidates(
+    connection: asyncpg.Connection,
+    *,
+    opportunity_id: UUID,
+    candidates: list[dict[str, str]],
+    default_search_purpose: str,
+    lock_name: str,
+    bootstrap_sources: bool = False,
+    limit: int = _DEFAULT_SOURCE_LINK_LIMIT,
+) -> list[dict[str, str]]:
+    existing_urls, existing_identities = await _existing_source_identities(
+        connection, opportunity_id
+    )
+    now = datetime.now(timezone.utc)
+    linked: list[dict[str, str]] = []
+    async with connection.transaction():
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            lock_name,
+        )
+        next_rank = int(
+            await connection.fetchval(
+                """SELECT COALESCE(MAX(result_rank),0)+1
+                   FROM opportunity_sources WHERE opportunity_id=$1""",
+                opportunity_id,
+            )
+        )
+        for candidate in candidates[:limit]:
+            try:
+                canonical_url = canonicalize_url(candidate["url"])
+            except (KeyError, ValueError):
+                continue
+            if canonical_url in existing_urls:
+                continue
+            work_identity = candidate.get("work_identity") or _scholarly_work_identity(
+                canonical_url
+            )
+            if work_identity and work_identity in existing_identities:
+                continue
+            hostname = urlsplit(canonical_url).hostname or ""
+            title = str(candidate.get("title") or f"Source at {hostname}")[:1000]
+            source_id = await connection.fetchval(
+                """INSERT INTO source_documents
+                (id,version,created_at,updated_at,deleted_at,canonical_url,title,author,
+                 publisher,source_type,publication_at,event_at,reputation,domain)
+                VALUES($1,1,$2,$2,NULL,$3,$4,NULL,$5,$6,NULL,NULL,$7::jsonb,$8)
+                ON CONFLICT (canonical_url) DO UPDATE SET updated_at=source_documents.updated_at
+                RETURNING id""",
+                uuid4(),
+                now,
+                canonical_url,
+                title,
+                hostname,
+                candidate.get("source_type", "secondary"),
+                json.dumps(
+                    {
+                        "discovered_via": candidate.get(
+                            "resolution_strategy", "topic_source_bootstrap"
+                        ),
+                        "popularity_is_proof": False,
+                        "not_yet_acquired": True,
+                        "relevance_score": candidate.get("relevance_score"),
+                        "work_identity": work_identity,
+                        "source_role": candidate.get("source_role"),
+                        "bootstrap_sources": bootstrap_sources,
+                    }
+                ),
+                hostname,
+            )
+            link_id = await connection.fetchval(
+                """INSERT INTO opportunity_sources
+                (id,opportunity_id,source_document_id,search_purpose,search_query,
+                 result_rank,snippet,created_at)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                ON CONFLICT (opportunity_id,source_document_id) DO NOTHING
+                RETURNING id""",
+                uuid4(),
+                opportunity_id,
+                source_id,
+                str(candidate.get("search_purpose") or default_search_purpose)[:80],
+                str(candidate.get("search_query") or candidate.get("catalog_query") or ""),
+                next_rank,
+                str(candidate.get("snippet") or title),
+                now,
+            )
+            if link_id is None:
+                continue
+            existing_urls.add(canonical_url)
+            if work_identity:
+                existing_identities.add(work_identity)
+            linked.append(
+                {
+                    "source_document_id": str(source_id),
+                    "url": canonical_url,
+                    "title": title,
+                }
+            )
+            next_rank += 1
+    return linked
+
+
 @activity.defn(name="load-approved-opportunity-sources")
 async def load_approved_opportunity_sources(request: dict[str, Any]) -> dict[str, Any]:
     settings = Settings()
     connection = await asyncpg.connect(settings.database_dsn)
     try:
         opportunity = await connection.fetchrow(
-            """SELECT o.id, o.subject_profile_id, o.decision, s.domain_policy
+            """SELECT o.id, o.subject_profile_id, o.title, o.summary, o.editorial_rationale,
+                      o.decision, s.topic, s.research_goal, s.seed_queries,
+                      s.related_concepts, s.negative_keywords, s.languages, s.domain_policy
                FROM opportunities o
                JOIN subject_profiles s ON s.id=o.subject_profile_id
                WHERE o.id=$1 AND o.deleted_at IS NULL AND s.deleted_at IS NULL""",
@@ -627,32 +863,78 @@ async def load_approved_opportunity_sources(request: dict[str, Any]) -> dict[str
             raise ApplicationError(
                 "opportunity must be approved before source acquisition", non_retryable=True
             )
-        rows = await connection.fetch(
-            """SELECT os.source_document_id, sd.canonical_url, sd.title
-               FROM opportunity_sources os
-               JOIN source_documents sd ON sd.id=os.source_document_id
-               WHERE os.opportunity_id=$1
-               ORDER BY os.result_rank, sd.canonical_url
-               LIMIT 20""",
-            opportunity["id"],
-        )
+        rows = await _load_opportunity_source_rows(connection, opportunity["id"])
+        bootstrap_sources = False
         if not rows:
-            raise ApplicationError(
-                "approved opportunity has no linked source candidates", non_retryable=True
+            if not request.get("bootstrap_sources"):
+                raise ApplicationError(
+                    "approved opportunity has no linked source candidates", non_retryable=True
+                )
+            bootstrap_sources = True
+            languages = _json_list(opportunity["languages"]) or ["all"]
+            planned_queries = _topic_source_bootstrap_queries(
+                title=str(opportunity["title"]),
+                summary=" ".join(
+                    [
+                        str(opportunity["summary"] or ""),
+                        str(opportunity["editorial_rationale"] or ""),
+                    ]
+                ),
+                subject_topic=str(opportunity["topic"] or ""),
+                research_goal=str(opportunity["research_goal"] or ""),
+                seed_queries=_json_list(opportunity["seed_queries"]),
+                related_concepts=_json_list(opportunity["related_concepts"]),
+                negative_keywords=_json_list(opportunity["negative_keywords"]),
             )
-        return {
+            candidates, search_health = await _generic_search_candidates(
+                settings,
+                title=str(opportunity["title"]),
+                summary=" ".join(
+                    [
+                        str(opportunity["summary"] or ""),
+                        str(opportunity["editorial_rationale"] or ""),
+                        str(opportunity["topic"] or ""),
+                        str(opportunity["research_goal"] or ""),
+                    ]
+                ),
+                language=str(languages[0]),
+                domain_policy=DomainPolicy.from_mapping(_json(opportunity["domain_policy"])),
+                planned_queries=planned_queries,
+            )
+            for candidate in candidates:
+                candidate.setdefault("resolution_strategy", "topic_source_bootstrap")
+                candidate.setdefault("search_purpose", "topic source bootstrap")
+            linked = await _persist_opportunity_source_candidates(
+                connection,
+                opportunity_id=opportunity["id"],
+                candidates=candidates,
+                default_search_purpose="topic source bootstrap",
+                lock_name=f"research.topic_source_bootstrap:{opportunity['id']}",
+                bootstrap_sources=True,
+                limit=12,
+            )
+            rows = await _load_opportunity_source_rows(connection, opportunity["id"])
+            if not rows:
+                raise ApplicationError(
+                    "approved opportunity has no linked source candidates and bootstrap "
+                    "discovery found no usable public sources",
+                    non_retryable=True,
+                )
+        else:
+            search_health = []
+            linked = []
+            planned_queries = ()
+        result = {
             "opportunity_id": str(opportunity["id"]),
             "subject_profile_id": str(opportunity["subject_profile_id"]),
             "domain_policy": _json(opportunity["domain_policy"]) or {"allow": [], "block": []},
-            "sources": [
-                {
-                    "source_document_id": str(row["source_document_id"]),
-                    "url": row["canonical_url"],
-                    "title": row["title"],
-                }
-                for row in rows
-            ],
+            "sources": _source_manifest(rows),
+            "bootstrap_sources": bootstrap_sources,
+            "bootstrap_linked_source_count": len(linked),
+            "bootstrap_queries": list(planned_queries),
+            "bootstrap_search_health": search_health,
         }
+        return result
     finally:
         await connection.close()
 
@@ -924,30 +1206,6 @@ async def discover_linked_primary_sources(request: dict[str, Any]) -> dict[str, 
         )
         if context is None:
             raise ApplicationError("opportunity does not exist", non_retryable=True)
-        existing_urls = set(
-            await connection.fetchval(
-                """SELECT coalesce(array_agg(sd.canonical_url), ARRAY[]::text[])
-                   FROM opportunity_sources os
-                   JOIN source_documents sd ON sd.id=os.source_document_id
-                   WHERE os.opportunity_id=$1""",
-                opportunity_id,
-            )
-        )
-        existing_identities: set[str] = set()
-        existing_rows = await connection.fetch(
-            """SELECT sd.canonical_url,sd.reputation
-               FROM opportunity_sources os
-               JOIN source_documents sd ON sd.id=os.source_document_id
-               WHERE os.opportunity_id=$1""",
-            opportunity_id,
-        )
-        for existing in existing_rows:
-            reputation = _json(existing["reputation"]) or {}
-            identity = reputation.get("work_identity") or _scholarly_work_identity(
-                str(existing["canonical_url"])
-            )
-            if identity:
-                existing_identities.add(str(identity))
         candidates: list[dict[str, str]] = []
         for snapshot in snapshots:
             if str(snapshot.get("content_type", "")).split(";", 1)[0] not in {
@@ -1008,96 +1266,20 @@ async def discover_linked_primary_sources(request: dict[str, Any]) -> dict[str, 
             if (resolved := _public_api_candidate(candidate)) is not None
         )
 
-        now = datetime.now(timezone.utc)
-        linked: list[dict[str, str]] = []
-        async with connection.transaction():
-            await connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtext($1))",
-                f"research.citation_enrichment:{opportunity_id}",
+        for candidate in candidates:
+            candidate.setdefault(
+                "search_purpose",
+                "generic evidence enrichment"
+                if candidate.get("resolution_strategy") == "generic_evidence_search"
+                else "linked primary evidence",
             )
-            next_rank = int(
-                await connection.fetchval(
-                    """SELECT COALESCE(MAX(result_rank),0)+1
-                       FROM opportunity_sources WHERE opportunity_id=$1""",
-                    opportunity_id,
-                )
-            )
-            for candidate in candidates:
-                if candidate["url"] in existing_urls:
-                    continue
-                work_identity = candidate.get("work_identity") or _scholarly_work_identity(
-                    candidate["url"]
-                )
-                if work_identity and work_identity in existing_identities:
-                    continue
-                hostname = urlsplit(candidate["url"]).hostname or ""
-                source_id = await connection.fetchval(
-                    """INSERT INTO source_documents
-                    (id,version,created_at,updated_at,deleted_at,canonical_url,title,author,
-                     publisher,source_type,publication_at,event_at,reputation,domain)
-                    VALUES($1,1,$2,$2,NULL,$3,$4,NULL,$5,$6,NULL,NULL,$7::jsonb,$8)
-                    ON CONFLICT (canonical_url) DO UPDATE SET updated_at=source_documents.updated_at
-                    RETURNING id""",
-                    uuid4(),
-                    now,
-                    candidate["url"],
-                    candidate["title"],
-                    hostname,
-                    candidate.get("source_type", "secondary"),
-                    json.dumps(
-                        {
-                            "discovered_via": candidate.get(
-                                "resolution_strategy", "linked_primary_citation"
-                            ),
-                            "popularity_is_proof": False,
-                            "not_yet_acquired": True,
-                            "relevance_score": candidate.get("relevance_score"),
-                            "work_identity": work_identity,
-                            "source_role": candidate.get("source_role"),
-                        }
-                    ),
-                    hostname,
-                )
-                link_id = await connection.fetchval(
-                    """INSERT INTO opportunity_sources
-                    (id,opportunity_id,source_document_id,search_purpose,search_query,
-                     result_rank,snippet,created_at)
-                    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-                    ON CONFLICT (opportunity_id,source_document_id) DO NOTHING
-                    RETURNING id""",
-                    uuid4(),
-                    opportunity_id,
-                    source_id,
-                    (
-                        "generic evidence enrichment"
-                        if candidate.get("resolution_strategy") == "generic_evidence_search"
-                        else "linked primary evidence"
-                    ),
-                    json.dumps(
-                        {
-                            "strategy": candidate.get(
-                                "resolution_strategy", "linked_primary_citation"
-                            ),
-                            "relevance_score": candidate.get("relevance_score"),
-                        }
-                    ),
-                    next_rank,
-                    candidate["title"],
-                    now,
-                )
-                if link_id is None:
-                    continue
-                existing_urls.add(candidate["url"])
-                if work_identity:
-                    existing_identities.add(work_identity)
-                linked.append(
-                    {
-                        "source_document_id": str(source_id),
-                        "url": candidate["url"],
-                        "title": candidate["title"],
-                    }
-                )
-                next_rank += 1
+        linked = await _persist_opportunity_source_candidates(
+            connection,
+            opportunity_id=opportunity_id,
+            candidates=candidates,
+            default_search_purpose="linked primary evidence",
+            lock_name=f"research.citation_enrichment:{opportunity_id}",
+        )
         return {
             "sources": linked,
             "linked_source_count": len(linked),

@@ -534,21 +534,23 @@ async def start_acquisition_run(
             OpportunitySourceModel.opportunity_id == opportunity.id
         )
     )
-    if not source_count:
-        raise HTTPException(status_code=409, detail="Opportunity has no linked source candidates")
+    bootstrap_sources = not bool(source_count)
     workflow_id = f"source-acquisition-{payload.idempotency_key}"
+    workflow_request = {
+        "workflow_id": workflow_id,
+        "idempotency_key": payload.idempotency_key,
+        "opportunity_id": str(opportunity.id),
+        "actor_id": str(actor.id),
+        "correlation_id": request.state.correlation_id,
+    }
+    if bootstrap_sources:
+        workflow_request["bootstrap_sources"] = True
     gateway = _gateway(request)
     await _start_tracked_workflow(
         session,
         gateway,
         workflow_type="source-acquisition",
-        workflow_request={
-            "workflow_id": workflow_id,
-            "idempotency_key": payload.idempotency_key,
-            "opportunity_id": str(opportunity.id),
-            "actor_id": str(actor.id),
-            "correlation_id": request.state.correlation_id,
-        },
+        workflow_request=workflow_request,
         actor=actor,
         correlation_id=request.state.correlation_id,
     )
@@ -559,7 +561,11 @@ async def start_acquisition_run(
         target_type="temporal_workflow",
         target_id=workflow_id,
         correlation_id=request.state.correlation_id,
-        context={"opportunity_id": str(opportunity.id), "source_count": source_count},
+        context={
+            "opportunity_id": str(opportunity.id),
+            "source_count": source_count,
+            "bootstrap_sources": bootstrap_sources,
+        },
     )
     await session.commit()
     return await _workflow_view(session, gateway, workflow_id)
@@ -1470,36 +1476,45 @@ async def decide_opportunity(
                 OpportunitySourceModel.opportunity_id == opportunity.id
             )
         )
-        if not source_count:
-            continuation = AutomaticContinuation(
-                state="awaiting_input",
-                action="source_acquisition",
-                message="Approval is recorded, but this opportunity has no linked source candidates.",
-            )
-        else:
-            idempotency_key = f"approval-{opportunity.id.hex}-v{opportunity.version}"
-            workflow_id = f"source-acquisition-{idempotency_key}"
-            _, reconciled = await _start_tracked_workflow(
-                session,
-                _gateway(request),
-                workflow_type="source-acquisition",
-                workflow_request={
-                    "workflow_id": workflow_id,
-                    "idempotency_key": idempotency_key,
-                    "opportunity_id": str(opportunity.id),
-                    "actor_id": str(actor.id),
-                    "correlation_id": request.state.correlation_id,
-                    "auto_continue": True,
-                },
-                actor=actor,
-                correlation_id=request.state.correlation_id,
-            )
-            continuation = AutomaticContinuation(
-                state="reconciled" if reconciled else "started",
-                action="source_acquisition_and_dossier",
-                workflow_id=workflow_id,
-                message="Source acquisition started and will continue automatically into dossier generation.",
-            )
+        bootstrap_sources = not bool(source_count)
+        idempotency_key = f"approval-{opportunity.id.hex}-v{opportunity.version}"
+        workflow_id = f"source-acquisition-{idempotency_key}"
+        workflow_request = {
+            "workflow_id": workflow_id,
+            "idempotency_key": idempotency_key,
+            "opportunity_id": str(opportunity.id),
+            "actor_id": str(actor.id),
+            "correlation_id": request.state.correlation_id,
+            "auto_continue": True,
+        }
+        if bootstrap_sources:
+            workflow_request["bootstrap_sources"] = True
+        _, reconciled = await _start_tracked_workflow(
+            session,
+            _gateway(request),
+            workflow_type="source-acquisition",
+            workflow_request=workflow_request,
+            actor=actor,
+            correlation_id=request.state.correlation_id,
+        )
+        continuation = AutomaticContinuation(
+            state="reconciled" if reconciled else "started",
+            action=(
+                "source_bootstrap_acquisition_and_dossier"
+                if bootstrap_sources
+                else "source_acquisition_and_dossier"
+            ),
+            workflow_id=workflow_id,
+            message=(
+                "Source discovery/acquisition started from the approved topic and will "
+                "continue automatically into dossier generation."
+                if bootstrap_sources
+                else (
+                    "Source acquisition started and will continue automatically into "
+                    "dossier generation."
+                )
+            ),
+        )
         await append_audit(
             session,
             action=f"automation.opportunity_{continuation.state}",
@@ -1507,7 +1522,11 @@ async def decide_opportunity(
             target_type="opportunity",
             target_id=str(opportunity.id),
             correlation_id=request.state.correlation_id,
-            context=continuation.model_dump(mode="json"),
+            context={
+                **continuation.model_dump(mode="json"),
+                "source_count": source_count,
+                "bootstrap_sources": bootstrap_sources,
+            },
         )
     await session.commit()
     return OpportunityDecisionView(
