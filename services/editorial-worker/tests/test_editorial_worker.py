@@ -581,9 +581,9 @@ def test_extractive_fallback_uses_exact_approved_claim_text_and_evidence() -> No
             "title": "Explainer",
             "segments": [
                 {
-                    "segment_key": "07-conclusion",
-                    "segment_type": "conclusion",
-                    "presentation_purpose": "Conclude",
+                    "segment_key": "05-evidence",
+                    "segment_type": "evidence",
+                    "presentation_purpose": "Explain",
                     "annotations": [],
                 }
             ],
@@ -593,7 +593,7 @@ def test_extractive_fallback_uses_exact_approved_claim_text_and_evidence() -> No
     content = _extractive_fallback_content(
         {"structured_inputs": {"claims": [approved]}},
         checked,
-        ("07-conclusion",),
+        ("05-evidence",),
     )
 
     sentences = content["segments"][0]["sentences"]
@@ -643,6 +643,117 @@ def test_extractive_fallback_pads_local_quality_segments_without_internal_langua
     assert len(narration.split()) >= 45
     assert approved["normalized_statement"] in narration
     assert "freigegeben" not in narration.lower()
+
+
+def test_extractive_fallback_avoids_repeating_selected_role_blocks() -> None:
+    def approved_claim(statement: str, coverage_unit_id: str) -> dict:
+        return {
+            "id": str(uuid4()),
+            "normalized_statement": statement,
+            "claim_type": "fact",
+            "central": True,
+            "coverage_unit_ids": [coverage_unit_id],
+            "evidence": [{"evidence_excerpt_id": str(uuid4())}],
+        }
+
+    mechanism = approved_claim(
+        "Ein Prototyp wird an eine bestehende Geothermie-Bohrung angeschlossen.",
+        "mechanism",
+    )
+    evidence = approved_claim(
+        "Heimische Lithiumgewinnung könnte Deutschland unabhängiger von Importen machen.",
+        "evidence",
+    )
+    limit = approved_claim(
+        "Die Schätzung hängt von Konzentration, Effizienz, Geschwindigkeit und Extraktionsmittel ab.",
+        "limits",
+    )
+    open_question = approved_claim(
+        "Die Forschung entwickelt Verfahren, die Lithiumproduktion und geothermische Nutzung kombinieren.",
+        "open_questions",
+    )
+    checked = {
+        "draft": {
+            "title": "Explainer",
+            "segments": [
+                {
+                    "segment_key": "04-evidence",
+                    "segment_type": "evidence",
+                    "presentation_purpose": "Existing evidence",
+                    "annotations": [
+                        {
+                            "text": mechanism["normalized_statement"],
+                            "kind": "fact",
+                            "claim_ids": [mechanism["id"]],
+                            "evidence_excerpt_id": mechanism["evidence"][0]["evidence_excerpt_id"],
+                        }
+                    ],
+                },
+                {
+                    "segment_key": "05-evidence",
+                    "segment_type": "evidence",
+                    "presentation_purpose": "More evidence",
+                    "annotations": [],
+                },
+                {
+                    "segment_key": "06-counterevidence",
+                    "segment_type": "counterevidence",
+                    "presentation_purpose": "First limit",
+                    "annotations": [],
+                },
+                {
+                    "segment_key": "07-counterevidence",
+                    "segment_type": "counterevidence",
+                    "presentation_purpose": "Second limit",
+                    "annotations": [],
+                },
+                {
+                    "segment_key": "09-uncertainty",
+                    "segment_type": "uncertainty",
+                    "presentation_purpose": "Open question",
+                    "annotations": [],
+                },
+                {
+                    "segment_key": "10-conclusion",
+                    "segment_type": "conclusion",
+                    "presentation_purpose": "Conclusion",
+                    "annotations": [],
+                },
+            ],
+        }
+    }
+
+    content = _extractive_fallback_content(
+        {
+            "structured_inputs": {
+                "title": "Explainer",
+                "claims": [mechanism, evidence, limit, open_question],
+            }
+        },
+        checked,
+        (
+            "05-evidence",
+            "06-counterevidence",
+            "07-counterevidence",
+            "09-uncertainty",
+            "10-conclusion",
+        ),
+    )
+
+    sentence_texts = [
+        sentence["text"]
+        for segment in content["segments"]
+        for sentence in segment["sentences"]
+        if len(sentence["text"].split()) >= 7
+    ]
+    counter_segments = [
+        segment for segment in content["segments"] if segment["segment_type"] == "counterevidence"
+    ]
+
+    assert len(sentence_texts) == len(set(sentence_texts))
+    assert counter_segments[0]["sentences"][0]["text"] != counter_segments[1]["sentences"][0]["text"]
+    assert counter_segments[0]["sentences"][0]["claim_ids"]
+    assert counter_segments[1]["sentences"][0]["claim_ids"]
 
 
 def test_safe_counterevidence_makes_no_factual_assertion() -> None:
@@ -980,6 +1091,9 @@ def test_local_quality_codes_are_eligible_for_extractive_fallback() -> None:
 
     assert '"weak_explainer_filler_phrase"' in source
     assert '"segment_below_role_minimum"' in source
+    assert '"repeated_sentence"' in source
+    assert '"material_narration_repetition"' in source
+    assert '"material_repetition"' in source
 
 
 def test_correction_plan_does_not_reward_growth_without_a_global_deficit() -> None:

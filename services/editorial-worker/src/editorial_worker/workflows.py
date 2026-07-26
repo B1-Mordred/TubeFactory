@@ -1545,7 +1545,7 @@ def _correction_batches(segment_keys: tuple[str, ...]) -> tuple[tuple[str, ...],
 def _extractive_fallback_content(
     context: dict[str, Any], checked: dict[str, Any], segment_keys: tuple[str, ...]
 ) -> dict[str, Any]:
-    """Replace repeatedly rejected prose with approved claim text, never a paraphrase."""
+    """Replace repeatedly rejected prose with source-bound, non-repeating segments."""
 
     selected = set(segment_keys)
     claims = [
@@ -1555,18 +1555,33 @@ def _extractive_fallback_content(
             key=lambda item: not bool(item.get("central")),
         )
         if claim.get("evidence")
-    ][:3]
+    ]
     counter_claims = [
         claim
         for claim in context["structured_inputs"]["claims"]
         if {str(value) for value in claim.get("coverage_unit_ids", [])}
-        & {"limits", "alternatives"}
+        & {"limits", "alternatives", "open_questions"}
         and claim.get("evidence")
-    ][:4]
+    ]
+    used_claim_ids: set[str] = set()
+    used_sentence_keys: set[str] = set()
 
-    def claim_sentence(claim: dict[str, Any]) -> dict[str, Any]:
+    def sentence_key(text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip().casefold())
+
+    def remember(sentences: list[dict[str, Any]]) -> None:
+        for sentence in sentences:
+            key = sentence_key(str(sentence.get("text", "")))
+            if key:
+                used_sentence_keys.add(key)
+            used_claim_ids.update(str(value) for value in sentence.get("claim_ids", []))
+
+    def claim_sentence(claim: dict[str, Any], *, opener: str = "") -> dict[str, Any]:
+        text = str(claim["normalized_statement"])
+        if opener:
+            text = opener.rstrip() + " " + text
         return {
-            "text": str(claim["normalized_statement"]),
+            "text": text,
             "kind": "fact" if claim.get("claim_type") == "fact" else "inference",
             "claim_ids": [str(claim["id"])],
             "evidence_excerpt_ids": [
@@ -1574,140 +1589,229 @@ def _extractive_fallback_content(
             ],
         }
 
+    def choose_claim(preferred_units: set[str]) -> dict[str, Any] | None:
+        preferred = [
+            claim
+            for claim in claims
+            if {str(value) for value in claim.get("coverage_unit_ids", [])}
+            & preferred_units
+        ]
+        for claim in [*preferred, *claims]:
+            claim_id = str(claim.get("id"))
+            if claim_id not in used_claim_ids:
+                return claim
+        return preferred[0] if preferred else (claims[0] if claims else None)
+
     def word_count(sentences: list[dict[str, Any]]) -> int:
         return sum(len(str(sentence.get("text", "")).split()) for sentence in sentences)
+
+    def bridge_candidates(segment_type: str) -> list[dict[str, Any]]:
+        if segment_type == "counterevidence":
+            return [
+                {
+                    "text": (
+                        "Diese Einschränkung ist für die Einordnung wichtig, weil sie "
+                        "zeigt, dass technische Machbarkeit und verlässlicher praktischer "
+                        "Ertrag nicht dasselbe sind."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+                {
+                    "text": (
+                        "Für das Publikum ist genau dieser Unterschied entscheidend: "
+                        "Ein Verfahren kann plausibel sein, während Menge, Tempo und "
+                        "Einsatzbedingungen weiterhin die eigentliche Hürde bilden."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+                {
+                    "text": (
+                        "So wird aus der Gegenperspektive kein Widerspruch zur Idee, "
+                        "sondern ein Maßstab dafür, wie vorsichtig man das Potenzial "
+                        "bewerten sollte."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+            ]
+        if segment_type == "uncertainty":
+            return _safe_uncertainty_segment()["sentences"] + [
+                {
+                    "text": (
+                        "Eine gute Erklärung benennt diese offenen Punkte, ohne daraus "
+                        "eine größere Gewissheit zu machen, als die Quellen hergeben."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                }
+            ]
+        if segment_type == "conclusion":
+            return [
+                {
+                    "text": (
+                        "Am Ende bleibt eine vorsichtige, aber verständliche Einordnung: "
+                        "Das Thema verbindet Energieversorgung, Rohstoffbedarf und "
+                        "technische Entwicklung, ohne dass daraus automatisch ein "
+                        "sicheres Ergebnis folgt."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+                {
+                    "text": (
+                        "Die Erklärung sollte deshalb nicht mit einem einfachen Ja oder "
+                        "Nein enden, sondern mit der Frage, welche Bedingungen erfüllt "
+                        "sein müssen, damit aus Forschung belastbare Praxis wird."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+            ]
+        if segment_type == "call_to_action":
+            return [
+                {
+                    "text": (
+                        "Prüfe die verlinkten Primärquellen Satz für Satz: Welche "
+                        "Aussage ist direkt belegt, welche ist Einordnung, und welche "
+                        "offene Frage wäre eine gute nächste FaktischSimpel-Folge?"
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                }
+            ]
+        title = str(context.get("structured_inputs", {}).get("title") or "Explainer")
+        if segment_type == "hook":
+            return _safe_hook_segment(title)["sentences"]
+        if segment_type == "thesis":
+            return _safe_thesis_segment()["sentences"]
+        return [
+            {
+                "text": (
+                    "Dieser Abschnitt bleibt bewusst eng an einem belegten Punkt und "
+                    "ordnet ihn als nächsten Erklärschritt ein."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "So entsteht zusätzlicher Nutzen für das Publikum, ohne bereits "
+                    "erklärte Aussagen nur noch einmal zu wiederholen."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+        ]
 
     def ensure_minimum(
         sentences: list[dict[str, Any]], segment_type: str
     ) -> list[dict[str, Any]]:
         minimum = _EXPLAINER_ROLE_MINIMUM_WORDS.get(segment_type, 35)
-        if word_count(sentences) >= minimum:
-            return sentences
-        title = str(context.get("structured_inputs", {}).get("title") or "Explainer")
-        bridges = {
-            "hook": _safe_hook_segment(title)["sentences"],
-            "thesis": _safe_thesis_segment()["sentences"],
-            "counterevidence": _safe_counterevidence_segment()["sentences"],
-            "uncertainty": _safe_uncertainty_segment()["sentences"],
-            "call_to_action": [
-                {
-                    "text": "Prüfe die verlinkten Primärquellen und bilde dir eine eigene Einordnung.",
-                    "kind": "editorial",
-                    "claim_ids": [],
-                    "evidence_excerpt_ids": [],
-                },
-                {
-                    "text": "Welche offene Frage sollen wir als Nächstes Schritt für Schritt erklären?",
-                    "kind": "editorial",
-                    "claim_ids": [],
-                    "evidence_excerpt_ids": [],
-                },
-            ],
-        }
-        fallback = bridges.get(
-            segment_type,
-            [
-                {
-                    "text": (
-                        "Diese Aussage ist der sichere Anker für diesen Abschnitt. "
-                        "Sie hilft, den nächsten Erklärschritt einzuordnen, ohne "
-                        "zusätzliche Zahlen, Erfolgsversprechen oder Standortannahmen "
-                        "in den Text einzubauen."
-                    ),
-                    "kind": "editorial",
-                    "claim_ids": [],
-                    "evidence_excerpt_ids": [],
-                },
-                {
-                    "text": (
-                        "So bleibt der Abschnitt nützlich für das Publikum und zugleich "
-                        "klar an das geprüfte Material gebunden."
-                    ),
-                    "kind": "editorial",
-                    "claim_ids": [],
-                    "evidence_excerpt_ids": [],
-                },
-            ],
-        )
         output = [*sentences]
-        for sentence in fallback:
+        local_keys = {sentence_key(str(item.get("text", ""))) for item in output}
+        for sentence in bridge_candidates(segment_type):
             if word_count(output) >= minimum:
                 break
+            key = sentence_key(str(sentence.get("text", "")))
+            if key in used_sentence_keys or key in local_keys:
+                continue
             output.append(sentence)
+            local_keys.add(key)
         return output
 
-    claim_selection = {
-        "hook": claims[:1],
-        "thesis": claims[:1],
-        "context": claims[1:2] or claims[:1],
-        "evidence": claims,
-        "uncertainty": claims[:1],
-        "conclusion": claims,
+    preferred_units = {
+        "context": {"foundation", "mechanism"},
+        "evidence": {"evidence", "mechanism", "foundation"},
+        "counterevidence": {"limits", "alternatives", "open_questions"},
+        "uncertainty": {"open_questions", "limits"},
     }
     output = []
     for segment in checked["draft"]["segments"]:
         if segment["segment_key"] not in selected:
+            copied_sentences = [
+                {
+                    "text": annotation["text"],
+                    "kind": (
+                        annotation["kind"]
+                        if annotation["kind"] in {"fact", "inference", "editorial"}
+                        else "inference"
+                    ),
+                    "claim_ids": [str(value) for value in annotation.get("claim_ids", [])],
+                    "evidence_excerpt_ids": (
+                        [str(annotation["evidence_excerpt_id"])]
+                        if annotation.get("evidence_excerpt_id")
+                        else []
+                    ),
+                }
+                for annotation in segment["annotations"]
+            ]
+            remember(copied_sentences)
             output.append(
                 {
                     "segment_type": segment["segment_type"],
                     "presentation_purpose": segment["presentation_purpose"],
                     "claim_ids": [],
                     "evidence_excerpt_ids": [],
-                    "sentences": [
-                        {
-                            "text": annotation["text"],
-                            "kind": (
-                                annotation["kind"]
-                                if annotation["kind"] in {"fact", "inference", "editorial"}
-                                else "inference"
-                            ),
-                            "claim_ids": [str(value) for value in annotation["claim_ids"]],
-                            "evidence_excerpt_ids": (
-                                [str(annotation["evidence_excerpt_id"])]
-                                if annotation.get("evidence_excerpt_id")
-                                else []
-                            ),
-                        }
-                        for annotation in segment["annotations"]
-                    ],
+                    "sentences": copied_sentences,
                 }
             )
             continue
-        if segment["segment_type"] == "thesis":
-            segment_type = segment["segment_type"]
+        segment_type = segment["segment_type"]
+        if segment_type == "thesis":
             sentences = _safe_thesis_segment()["sentences"]
-        elif segment["segment_type"] == "counterevidence":
-            segment_type = segment["segment_type"]
-            if counter_claims:
-                sentences = [claim_sentence(claim) for claim in counter_claims]
+        elif segment_type == "counterevidence":
+            claim = next(
+                (
+                    claim
+                    for claim in counter_claims
+                    if str(claim.get("id")) not in used_claim_ids
+                ),
+                None,
+            ) or choose_claim(preferred_units["counterevidence"])
+            if claim:
+                opener = (
+                    "Als Gegenperspektive zählt hier vor allem:"
+                    if str(claim.get("id")) in used_claim_ids
+                    else ""
+                )
+                sentences = [claim_sentence(claim, opener=opener)]
             else:
-                sentences = [claim_sentence(claim) for claim in claims[:1]]
-        elif segment["segment_type"] == "uncertainty":
-            segment_type = segment["segment_type"]
-            sentences = _safe_uncertainty_segment()["sentences"]
-        elif segment["segment_type"] == "call_to_action":
-            segment_type = segment["segment_type"]
-            sentences = [
-                {
-                    "text": "Prüfe die verlinkten Primärquellen Satz für Satz: Welche Aussage ist direkt belegt, welche ist Einordnung, und welche offene Frage wäre eine gute nächste FaktischSimpel-Folge?",
-                    "kind": "editorial",
-                    "claim_ids": [],
-                    "evidence_excerpt_ids": [],
-                },
-                {
-                    "text": "Welche offene Frage sollen wir als Nächstes Schritt für Schritt erklären?",
-                    "kind": "editorial",
-                    "claim_ids": [],
-                    "evidence_excerpt_ids": [],
-                },
-            ]
+                sentences = []
+        elif segment_type == "uncertainty":
+            claim = choose_claim(preferred_units["uncertainty"])
+            sentences = [claim_sentence(claim)] if claim and str(claim.get("id")) not in used_claim_ids else []
+        elif segment_type == "call_to_action":
+            sentences = []
+        elif segment_type == "conclusion":
+            sentences = []
         else:
-            segment_type = segment["segment_type"]
-            sentences = [
-                claim_sentence(claim)
-                for claim in claim_selection.get(segment["segment_type"], claims[:1])
-            ]
-            if segment["segment_type"] == "hook":
+            chosen: list[dict[str, Any]] = []
+            temporarily_reserved: set[str] = set()
+            for _ in range(2 if segment_type == "evidence" else 1):
+                claim = choose_claim(
+                    preferred_units.get(segment_type, {"evidence", "mechanism"})
+                )
+                claim_id = str(claim.get("id")) if claim else ""
+                if claim is None or claim_id in {str(item.get("id")) for item in chosen}:
+                    break
+                chosen.append(claim)
+                if claim_id not in used_claim_ids:
+                    used_claim_ids.add(claim_id)
+                    temporarily_reserved.add(claim_id)
+            used_claim_ids.difference_update(temporarily_reserved)
+            sentences = [claim_sentence(claim) for claim in chosen]
+            if segment_type == "hook":
                 sentences.insert(
                     0,
                     {
@@ -1717,16 +1821,20 @@ def _extractive_fallback_content(
                         "evidence_excerpt_ids": [],
                     },
                 )
-            if segment["segment_type"] == "conclusion":
-                sentences.append(
-                    {
-                        "text": "Damit lassen sich die wichtigsten Zusammenhänge und ihre Grenzen gemeinsam einordnen.",
-                        "kind": "editorial",
-                        "claim_ids": [],
-                        "evidence_excerpt_ids": [],
-                    }
-                )
-        sentences = ensure_minimum(sentences, str(segment["segment_type"]))
+        sentences = ensure_minimum(sentences, str(segment_type))
+        if not sentences:
+            sentences = [
+                {
+                    "text": (
+                        "Dieser Abschnitt ergänzt die Erklärung mit einer vorsichtigen "
+                        "Einordnung, ohne zusätzliche unbelegte Details einzuführen."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                }
+            ]
+        remember(sentences)
         output.append(
             {
                 "segment_type": segment_type,
@@ -1826,6 +1934,10 @@ async def _refine_script_with_verifier(
             "unsupported_source_gap",
             "weak_explainer_filler_phrase",
             "segment_below_role_minimum",
+            "repeated_sentence",
+            "repeated_claim_set_within_segment",
+            "material_narration_repetition",
+            "material_repetition",
         }
         segment_keys = (
             _correction_segment_keys(
