@@ -39,6 +39,7 @@ from editorial_worker.workflows import (
     ScriptGenerationWorkflow,
     ScriptRegenerationWorkflow,
     _additional_instructions,
+    _correction_batches,
     _correction_script_beats,
     _correction_segment_keys,
     _compact_generated_segment,
@@ -370,8 +371,32 @@ def test_call_to_action_uses_minimal_editorial_input_without_claim_payload() -> 
     full = {
         "title": "A sourced explainer",
         "channel": {"name": "FaktischSimpel"},
-        "dossier": {"unresolved_questions": ["What remains open?"]},
-        "claims": [{"id": "allowed", "large": "evidence payload"}, {"id": "other", "large": "other evidence"}],
+        "dossier": {
+            "executive_summary": "A compact source brief.",
+            "safe_conclusions": ["Only the approved statement is safe."],
+            "prohibited_overstatements": ["Do not promise certainty."],
+            "unresolved_questions": ["What remains open?"],
+        },
+        "claims": [
+            {
+                "id": "allowed",
+                "normalized_statement": "The approved record supports this statement.",
+                "claim_type": "fact",
+                "central": True,
+                "coverage_unit_ids": ["mechanism"],
+                "evidence": [
+                    {
+                        "evidence_excerpt_id": "excerpt-1",
+                        "relationship": "supports",
+                        "primary_source": True,
+                        "source_title": "Primary source",
+                        "canonical_url": "https://example.test/source",
+                        "exact_text": "The approved record supports this statement.",
+                    }
+                ],
+            },
+            {"id": "other", "large": "other evidence"},
+        ],
         "disputed_claims": [{"large": "counterevidence payload"}],
     }
 
@@ -385,6 +410,13 @@ def test_call_to_action_uses_minimal_editorial_input_without_claim_payload() -> 
             "target_words": 90,
             "allowed_claim_ids": ["allowed"],
             "required_claim_ids": ["allowed"],
+            "role_minimum_words": 45,
+            "current_segment": {
+                "segment_key": "04-evidence",
+                "word_count": 16,
+                "narration": "Old segment text.",
+            },
+            "neighbor_context": [{"segment_key": "03-context"}],
         },
         4,
     )
@@ -395,8 +427,23 @@ def test_call_to_action_uses_minimal_editorial_input_without_claim_payload() -> 
         "What remains open?"
     ]
     assert evidence["claims"] == [full["claims"][0]]
+    assert evidence["dossier"]["executive_summary"] == "A compact source brief."
+    assert evidence["claim_evidence_packet"][0]["exact_evidence"][0] == {
+        "evidence_excerpt_id": "excerpt-1",
+        "relationship": "supports",
+        "primary_source": True,
+        "source_title": "Primary source",
+        "canonical_url": "https://example.test/source",
+        "exact_text": "The approved record supports this statement.",
+    }
     assert evidence["requested_segment"]["required_claim_ids"] == ["allowed"]
     assert evidence["requested_segment"]["minimum_words"] == 81
+    assert "du musst wissen" in evidence["requested_segment"]["forbidden_phrases"]
+    assert evidence["requested_segment"]["role_minimum_words"] == 45
+    assert evidence["requested_segment"]["current_segment"]["word_count"] == 16
+    assert evidence["requested_segment"]["neighbor_context"] == [
+        {"segment_key": "03-context"}
+    ]
 
 
 def test_partial_chunk_generation_requires_an_existing_base_draft() -> None:
@@ -520,6 +567,13 @@ def test_verifier_feedback_is_deduplicated_and_keeps_review_as_quoted_data() -> 
     assert json.loads(encoded) == [issue]
 
 
+def test_correction_batches_focus_one_segment_at_a_time() -> None:
+    assert _correction_batches(("02-thesis", "07-counterevidence")) == (
+        ("02-thesis",),
+        ("07-counterevidence",),
+    )
+
+
 def test_extractive_fallback_uses_exact_approved_claim_text_and_evidence() -> None:
     approved = claim()
     checked = {
@@ -549,6 +603,46 @@ def test_extractive_fallback_uses_exact_approved_claim_text_and_evidence() -> No
         approved["evidence"][0]["evidence_excerpt_id"]
     ]
     assert sentences[-1]["kind"] == "editorial"
+
+
+def test_extractive_fallback_pads_local_quality_segments_without_internal_language() -> None:
+    approved = {
+        "id": str(uuid4()),
+        "normalized_statement": (
+            "Lithium aus Thermalwasser hängt stark von Konzentration und "
+            "Extraktionsverfahren ab."
+        ),
+        "claim_type": "fact",
+        "central": False,
+        "coverage_unit_ids": ["limits"],
+        "evidence": [{"evidence_excerpt_id": str(uuid4())}],
+    }
+    checked = {
+        "draft": {
+            "title": "Explainer",
+            "segments": [
+                {
+                    "segment_key": "07-counterevidence",
+                    "segment_type": "counterevidence",
+                    "presentation_purpose": "Grenze prüfen",
+                    "annotations": [],
+                }
+            ],
+        }
+    }
+
+    content = _extractive_fallback_content(
+        {"structured_inputs": {"title": "Explainer", "claims": [approved]}},
+        checked,
+        ("07-counterevidence",),
+    )
+
+    narration = " ".join(
+        sentence["text"] for sentence in content["segments"][0]["sentences"]
+    )
+    assert len(narration.split()) >= 45
+    assert approved["normalized_statement"] in narration
+    assert "freigegeben" not in narration.lower()
 
 
 def test_safe_counterevidence_makes_no_factual_assertion() -> None:
@@ -872,6 +966,20 @@ def test_correction_plan_repairs_claimless_counterevidence_with_limit_claim() ->
     assert beat["segment_type"] == "counterevidence"
     assert beat["allowed_claim_ids"] == [limit_claim]
     assert beat["required_claim_ids"] == [limit_claim]
+    assert beat["role_minimum_words"] == 45
+    assert beat["target_words"] >= 45
+    assert beat["minimum_words"] >= 45
+    assert beat["current_segment"]["segment_key"] == "07-counterevidence"
+    assert beat["current_segment"]["word_count"] == 5
+
+
+def test_local_quality_codes_are_eligible_for_extractive_fallback() -> None:
+    source = inspect.getsource(__import__(
+        "editorial_worker.workflows", fromlist=["_refine_script_with_verifier"]
+    )._refine_script_with_verifier)
+
+    assert '"weak_explainer_filler_phrase"' in source
+    assert '"segment_below_role_minimum"' in source
 
 
 def test_correction_plan_does_not_reward_growth_without_a_global_deficit() -> None:

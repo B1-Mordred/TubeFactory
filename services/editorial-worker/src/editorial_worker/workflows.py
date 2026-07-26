@@ -32,6 +32,32 @@ _SCRIPT_IMPORT_INSTRUCTION = (
     "when required by requested_segment.required_claim_ids or needed to close an essential "
     "explanation gap."
 )
+_WEAK_EXPLAINER_PHRASES = (
+    "du musst wissen",
+    "man muss wissen",
+    "du wirst am ende verstehen",
+    "ich hoffe",
+    "wir hoffen",
+    "was bedeutet das konkret",
+    "dieser überblick hat dir geholfen",
+)
+_EXPLAINER_ROLE_MINIMUM_WORDS = {
+    "hook": 35,
+    "thesis": 45,
+    "context": 35,
+    "evidence": 45,
+    "counterevidence": 45,
+    "uncertainty": 45,
+    "conclusion": 45,
+    "call_to_action": 25,
+}
+
+
+def _role_minimum_words(policy: dict[str, Any], segment_type: str) -> int:
+    word_range = policy.get("target_word_range") or [0, 20_000]
+    if int(word_range[0]) < 600:
+        return 0
+    return _EXPLAINER_ROLE_MINIMUM_WORDS.get(segment_type, 35)
 
 
 def _script_target_words(policy: dict[str, Any]) -> int:
@@ -131,6 +157,7 @@ def _script_beats(context: dict[str, Any]) -> list[dict[str, Any]]:
         required = [value for value in allowed if value not in assigned][:capacity]
         beat["allowed_claim_ids"] = allowed
         beat["required_claim_ids"] = required
+        beat["role_minimum_words"] = _role_minimum_words(policy, str(beat["segment_type"]))
         assigned.update(required)
     remaining = [str(item["id"]) for item in claims if str(item["id"]) not in assigned]
     evidence_beats = [beat for beat in beats if beat["segment_type"] == "evidence"]
@@ -150,6 +177,7 @@ def _script_beats(context: dict[str, Any]) -> list[dict[str, Any]]:
         if claim_id not in beat["allowed_claim_ids"]:
             beat["allowed_claim_ids"].append(claim_id)
         beat["required_claim_ids"].append(claim_id)
+        beat["role_minimum_words"] = _role_minimum_words(policy, str(beat["segment_type"]))
     return beats
 
 
@@ -163,13 +191,13 @@ def _safe_hook_segment(title: str) -> dict[str, Any]:
         "evidence_excerpt_ids": [],
         "sentences": [
             {
-                "text": f'Was steckt hinter „{title}“ – und was lässt sich dazu tatsächlich belegen?',
+                "text": f'Was steckt hinter „{title}“ – und warum ist die einfache Antwort hier wahrscheinlich zu kurz?',
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
             },
             {
-                "text": "Wir gehen die Frage Schritt für Schritt anhand der verlinkten Primärquellen durch.",
+                "text": "Wir gehen die Frage Schritt für Schritt durch, trennen belegte Aussagen von Einordnung und achten darauf, aus einem interessanten Ansatz kein größeres Versprechen zu machen, als die Quellen tragen.",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
@@ -188,13 +216,13 @@ def _safe_thesis_segment() -> dict[str, Any]:
         "evidence_excerpt_ids": [],
         "sentences": [
             {
-                "text": "Wir bauen die Erklärung in klaren Schritten auf.",
+                "text": "Die Leitfrage ist: Was ist an diesem Thema tatsächlich belegt, und welche Einordnung folgt daraus?",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
             },
             {
-                "text": "Zuerst klären wir die technische Grundlage, vergleichen dann die Lösungswege und ordnen am Ende Grenzen und offene Fragen ein.",
+                "text": "Wir bauen die Erklärung in drei Schritten auf: zuerst die Grundlage, dann die belegten Verfahren oder Zusammenhänge, danach Grenzen und offene Fragen. So bleibt klar, wo gesichertes Material endet und wo vorsichtige Bewertung beginnt.",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
@@ -213,13 +241,13 @@ def _safe_uncertainty_segment() -> dict[str, Any]:
         "evidence_excerpt_ids": [],
         "sentences": [
             {
-                "text": "Wie weit reichen die belegten Aussagen – und wo würde eine weitergehende Deutung beginnen?",
+                "text": "An dieser Stelle wird wichtig, die Grenze zwischen belegter Aussage und weitergehender Deutung sauber zu ziehen.",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
             },
             {
-                "text": "Was sich daraus nicht direkt ableiten lässt, bleibt als offene Frage klar gekennzeichnet.",
+                "text": "Wenn eine Quelle einen Mechanismus, einen Test oder ein Potenzial beschreibt, folgt daraus noch nicht automatisch, wie groß der praktische Effekt überall sein wird. Genau solche Punkte bleiben als offene Fragen gekennzeichnet, statt sie zu einfachen Gewissheiten zu machen.",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
@@ -241,25 +269,19 @@ def _safe_counterevidence_segment() -> dict[str, Any]:
         "evidence_excerpt_ids": [],
         "sentences": [
             {
-                "text": "An dieser Stelle wechseln wir die Perspektive.",
+                "text": "An dieser Stelle wechseln wir die Perspektive und fragen, welche Einschränkung die Einordnung vorsichtiger macht.",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
             },
             {
-                "text": "Welche Gegenpositionen lassen sich anhand freigegebener Belege tatsächlich prüfen?",
+                "text": "Nicht jede interessante technische Möglichkeit wird dadurch schon zu einem verlässlichen Ergebnis. Für ein gutes Erklärvideo reicht deshalb kein einzelner positiver Hinweis; wir müssen auch betrachten, welche Bedingungen, Grenzen oder Unsicherheiten die Aussage einordnen.",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
             },
             {
-                "text": "Dafür trennen wir belegte Aussagen von möglichen Einwänden.",
-                "kind": "editorial",
-                "claim_ids": [],
-                "evidence_excerpt_ids": [],
-            },
-            {
-                "text": "Danach kehren wir zu den belegten Kernaussagen zurück.",
+                "text": "Danach lässt sich besser beurteilen, was aus dem Material wirklich folgt und was nur eine naheliegende, aber noch nicht ausreichend abgesicherte Erwartung wäre.",
                 "kind": "editorial",
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
@@ -319,6 +341,54 @@ def _single_segment_routes(
     return output
 
 
+def _claim_evidence_packet(claim: dict[str, Any]) -> dict[str, Any]:
+    """Small source-bound packet for one allowed claim."""
+
+    return {
+        "id": str(claim.get("id", "")),
+        "normalized_statement": str(claim.get("normalized_statement", "")),
+        "claim_type": str(claim.get("claim_type", "")),
+        "central": bool(claim.get("central")),
+        "coverage_unit_ids": [str(value) for value in claim.get("coverage_unit_ids", [])],
+        "exact_evidence": [
+            {
+                "evidence_excerpt_id": str(item.get("evidence_excerpt_id", "")),
+                "relationship": str(item.get("relationship", "")),
+                "primary_source": bool(item.get("primary_source")),
+                "source_title": str(item.get("source_title", "")),
+                "canonical_url": str(item.get("canonical_url", "")),
+                "exact_text": str(item.get("exact_text", "")),
+            }
+            for item in claim.get("evidence", [])[:3]
+        ],
+    }
+
+
+def _segment_focus_packet(segment: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not segment:
+        return None
+    return {
+        "segment_key": str(segment.get("segment_key", "")),
+        "segment_type": str(segment.get("segment_type", "")),
+        "presentation_purpose": str(segment.get("presentation_purpose", "")),
+        "word_count": len(str(segment.get("narration", "")).split()),
+        "narration": str(segment.get("narration", "")),
+        "annotations": [
+            {
+                "text": str(annotation.get("text", "")),
+                "kind": str(annotation.get("kind", "")),
+                "claim_ids": [str(value) for value in annotation.get("claim_ids", [])],
+                "evidence_excerpt_id": (
+                    str(annotation.get("evidence_excerpt_id"))
+                    if annotation.get("evidence_excerpt_id")
+                    else None
+                ),
+            }
+            for annotation in segment.get("annotations", [])
+        ],
+    }
+
+
 def _script_segment_inputs(
     structured_inputs: dict[str, Any], beat: dict[str, Any] | str, position: int
 ) -> dict[str, Any]:
@@ -344,16 +414,32 @@ def _script_segment_inputs(
         ),
         "allowed_claim_ids": beat["allowed_claim_ids"],
         "required_claim_ids": beat.get("required_claim_ids", []),
+        "role_minimum_words": beat.get("role_minimum_words", 0),
+        "forbidden_phrases": list(_WEAK_EXPLAINER_PHRASES),
+        "current_segment": beat.get("current_segment"),
+        "neighbor_context": beat.get("neighbor_context", []),
     }
     if segment_type != "call_to_action":
         allowed = set(requested["allowed_claim_ids"])
+        claims = [
+            claim
+            for claim in structured_inputs.get("claims", [])
+            if str(claim.get("id")) in allowed
+        ]
         return {
-            **structured_inputs,
-            "claims": [
-                claim
-                for claim in structured_inputs.get("claims", [])
-                if str(claim.get("id")) in allowed
-            ],
+            "title": structured_inputs["title"],
+            "channel": structured_inputs.get("channel", {}),
+            "dossier": {
+                key: structured_inputs.get("dossier", {}).get(key)
+                for key in (
+                    "executive_summary",
+                    "safe_conclusions",
+                    "prohibited_overstatements",
+                    "unresolved_questions",
+                )
+            },
+            "claims": claims,
+            "claim_evidence_packet": [_claim_evidence_packet(claim) for claim in claims],
             "requested_segment": requested,
         }
     dossier = structured_inputs.get("dossier", {})
@@ -387,7 +473,8 @@ def _correction_script_beats(
         return []
     all_segments = list(base_draft["segments"])
     current_words = sum(len(str(item["narration"]).split()) for item in all_segments)
-    desired_words = _script_target_words(context.get("script_policy", {}))
+    policy = context.get("script_policy", {})
+    desired_words = _script_target_words(policy)
     deficit_share = max(
         0,
         (desired_words - current_words + len(selected_segments) - 1)
@@ -413,8 +500,12 @@ def _correction_script_beats(
             claim_owner[str(claim["id"])] = representative_owner
     beats: list[dict[str, Any]] = []
     type_positions: dict[str, int] = {}
+    segment_index = {
+        str(segment["segment_key"]): index for index, segment in enumerate(all_segments)
+    }
     for segment in selected_segments:
         segment_type = str(segment["segment_type"])
+        role_minimum = _role_minimum_words(policy, segment_type)
         type_positions[segment_type] = type_positions.get(segment_type, 0) + 1
         purpose = str(segment["presentation_purpose"])
         if segment_type == "uncertainty":
@@ -457,12 +548,21 @@ def _correction_script_beats(
                 for existing in distinct_concepts
             ):
                 distinct_concepts.append(claim)
-        target_words = max(30, words + deficit_share)
+        target_words = max(30, role_minimum, words + deficit_share)
         if deficit_share == 0 and distinct_concepts:
-            target_words = min(
-                target_words,
-                max(35, 32 * len(distinct_concepts)),
+            target_words = max(
+                role_minimum,
+                min(
+                    target_words,
+                    max(35, 32 * len(distinct_concepts)),
+                ),
             )
+        position = segment_index[str(segment["segment_key"])]
+        neighbors = [
+            all_segments[index]
+            for index in (position - 1, position + 1)
+            if 0 <= index < len(all_segments)
+        ]
         beats.append(
             {
                 "segment_key": segment["segment_key"],
@@ -471,11 +571,21 @@ def _correction_script_beats(
                 "target_words": target_words,
                 "allowed_claim_ids": list(owned),
                 "required_claim_ids": owned,
+                "role_minimum_words": role_minimum,
+                "current_segment": _segment_focus_packet(segment),
+                "neighbor_context": [
+                    {
+                        "segment_key": str(neighbor.get("segment_key", "")),
+                        "segment_type": str(neighbor.get("segment_type", "")),
+                        "narration_preview": str(neighbor.get("narration", ""))[:360],
+                    }
+                    for neighbor in neighbors
+                ],
                 "maximum_sentences": max(2, len(distinct_concepts) + 1),
                 "minimum_words": (
-                    1
+                    max(1, role_minimum)
                     if deficit_share == 0
-                    else max(1, round(target_words * 0.9))
+                    else max(1, role_minimum, round(target_words * 0.9))
                 ),
             }
         )
@@ -530,13 +640,15 @@ def _correction_script_beats(
             remaining_deficit -= addition
     for beat in beats:
         target_words = int(beat["target_words"])
+        role_minimum = int(beat.get("role_minimum_words", 0))
         if hard_minimum_words > 0:
             beat["minimum_words"] = max(
                 int(beat.get("minimum_words", 1)),
+                role_minimum,
                 max(1, round(target_words * 0.9)),
             )
         else:
-            beat["minimum_words"] = max(1, int(beat.get("minimum_words", 1)))
+            beat["minimum_words"] = max(1, role_minimum, int(beat.get("minimum_words", 1)))
         beat["maximum_sentences"] = max(
             int(beat.get("maximum_sentences", 2)),
             max(2, round(target_words / 45)),
@@ -1114,42 +1226,23 @@ def _local_script_quality_issues(
         normalized_narration = re.sub(
             r"\s+", " ", str(segment.get("narration", "")).strip().casefold()
         )
-        if policy and int(word_range[0]) >= 600:
-            minimum_segment_words = {
-                "hook": 35,
-                "thesis": 45,
-                "context": 35,
-                "evidence": 45,
-                "counterevidence": 45,
-                "uncertainty": 45,
-                "conclusion": 45,
-                "call_to_action": 25,
-            }.get(segment_type, 35)
-            if segment_words < minimum_segment_words:
-                issues.append(
-                    {
-                        "code": "segment_below_role_minimum",
-                        "message": (
-                            f"The {segment_type} segment has {segment_words} words; "
-                            f"this explainer role needs at least {minimum_segment_words} "
-                            "words to provide distinct audience value."
-                        ),
-                        "severity": "error",
-                        "statement": str(segment.get("narration", ""))[:500],
-                        "segment_key": segment_key,
-                    }
-                )
-        weak_phrase_markers = (
-            "du musst wissen",
-            "man muss wissen",
-            "du wirst am ende verstehen",
-            "ich hoffe",
-            "wir hoffen",
-            "was bedeutet das konkret",
-            "dieser überblick hat dir geholfen",
-        )
+        minimum_segment_words = _role_minimum_words(policy, segment_type) if policy else 0
+        if minimum_segment_words and segment_words < minimum_segment_words:
+            issues.append(
+                {
+                    "code": "segment_below_role_minimum",
+                    "message": (
+                        f"The {segment_type} segment has {segment_words} words; "
+                        f"this explainer role needs at least {minimum_segment_words} "
+                        "words to provide distinct audience value."
+                    ),
+                    "severity": "error",
+                    "statement": str(segment.get("narration", ""))[:500],
+                    "segment_key": segment_key,
+                }
+            )
         matched_weak_phrase = next(
-            (marker for marker in weak_phrase_markers if marker in normalized_narration),
+            (marker for marker in _WEAK_EXPLAINER_PHRASES if marker in normalized_narration),
             None,
         )
         if matched_weak_phrase:
@@ -1443,6 +1536,12 @@ def _verifier_correction_instruction(
     )
 
 
+def _correction_batches(segment_keys: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    """Keep correction prompts small enough for local models to follow."""
+
+    return tuple((segment_key,) for segment_key in segment_keys)
+
+
 def _extractive_fallback_content(
     context: dict[str, Any], checked: dict[str, Any], segment_keys: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -1474,6 +1573,68 @@ def _extractive_fallback_content(
                 str(claim["evidence"][0]["evidence_excerpt_id"])
             ],
         }
+
+    def word_count(sentences: list[dict[str, Any]]) -> int:
+        return sum(len(str(sentence.get("text", "")).split()) for sentence in sentences)
+
+    def ensure_minimum(
+        sentences: list[dict[str, Any]], segment_type: str
+    ) -> list[dict[str, Any]]:
+        minimum = _EXPLAINER_ROLE_MINIMUM_WORDS.get(segment_type, 35)
+        if word_count(sentences) >= minimum:
+            return sentences
+        title = str(context.get("structured_inputs", {}).get("title") or "Explainer")
+        bridges = {
+            "hook": _safe_hook_segment(title)["sentences"],
+            "thesis": _safe_thesis_segment()["sentences"],
+            "counterevidence": _safe_counterevidence_segment()["sentences"],
+            "uncertainty": _safe_uncertainty_segment()["sentences"],
+            "call_to_action": [
+                {
+                    "text": "Prüfe die verlinkten Primärquellen und bilde dir eine eigene Einordnung.",
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+                {
+                    "text": "Welche offene Frage sollen wir als Nächstes Schritt für Schritt erklären?",
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+            ],
+        }
+        fallback = bridges.get(
+            segment_type,
+            [
+                {
+                    "text": (
+                        "Diese Aussage ist der sichere Anker für diesen Abschnitt. "
+                        "Sie hilft, den nächsten Erklärschritt einzuordnen, ohne "
+                        "zusätzliche Zahlen, Erfolgsversprechen oder Standortannahmen "
+                        "in den Text einzubauen."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+                {
+                    "text": (
+                        "So bleibt der Abschnitt nützlich für das Publikum und zugleich "
+                        "klar an das geprüfte Material gebunden."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
+            ],
+        )
+        output = [*sentences]
+        for sentence in fallback:
+            if word_count(output) >= minimum:
+                break
+            output.append(sentence)
+        return output
 
     claim_selection = {
         "hook": claims[:1],
@@ -1528,7 +1689,7 @@ def _extractive_fallback_content(
             segment_type = segment["segment_type"]
             sentences = [
                 {
-                    "text": "Prüfe die verlinkten Primärquellen und bilde dir eine eigene Einordnung.",
+                    "text": "Prüfe die verlinkten Primärquellen Satz für Satz: Welche Aussage ist direkt belegt, welche ist Einordnung, und welche offene Frage wäre eine gute nächste FaktischSimpel-Folge?",
                     "kind": "editorial",
                     "claim_ids": [],
                     "evidence_excerpt_ids": [],
@@ -1565,6 +1726,7 @@ def _extractive_fallback_content(
                         "evidence_excerpt_ids": [],
                     }
                 )
+        sentences = ensure_minimum(sentences, str(segment["segment_type"]))
         output.append(
             {
                 "segment_type": segment_type,
@@ -1602,48 +1764,49 @@ async def _refine_script_with_verifier(
         )
         if not segment_keys:
             break
-        latest_writer = await _write_script_segments(
-            context,
-            common,
-            operational_instruction=_verifier_correction_instruction(
-                verifier["output"], segment_keys, attempt
-            ),
-            selected_segment_keys=segment_keys,
-            base_draft=checked["draft"],
-        )
-        assembled = await workflow.execute_activity(
-            "assemble-script-draft",
-            {
-                "content_draft": latest_writer["output"],
-                "default_title": context["structured_inputs"]["title"],
-                "approved_claim_ids": context["approved_claim_ids"],
-                "evidence_claim_ids_by_id": context["evidence_claim_ids_by_id"],
-            },
-            start_to_close_timeout=timedelta(seconds=45),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        )
-        merged = await workflow.execute_activity(
-            "merge-script-regeneration",
-            {
-                "current_draft": checked["draft"],
-                "generated_draft": assembled["draft"],
-                "selected_segment_keys": list(segment_keys),
-            },
-            start_to_close_timeout=timedelta(seconds=45),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        )
-        checked = await workflow.execute_activity(
-            "verify-script-draft",
-            {
-                "draft": merged["draft"],
-                "approved_claim_ids": context["approved_claim_ids"],
-                "central_claim_ids": context["central_claim_ids"],
-                "evidence_text_by_id": context["evidence_text_by_id"],
-                "evidence_claim_ids_by_id": context["evidence_claim_ids_by_id"],
-            },
-            start_to_close_timeout=timedelta(seconds=45),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        )
+        for focused_segment_keys in _correction_batches(segment_keys):
+            latest_writer = await _write_script_segments(
+                context,
+                common,
+                operational_instruction=_verifier_correction_instruction(
+                    verifier["output"], focused_segment_keys, attempt
+                ),
+                selected_segment_keys=focused_segment_keys,
+                base_draft=checked["draft"],
+            )
+            assembled = await workflow.execute_activity(
+                "assemble-script-draft",
+                {
+                    "content_draft": latest_writer["output"],
+                    "default_title": context["structured_inputs"]["title"],
+                    "approved_claim_ids": context["approved_claim_ids"],
+                    "evidence_claim_ids_by_id": context["evidence_claim_ids_by_id"],
+                },
+                start_to_close_timeout=timedelta(seconds=45),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+            merged = await workflow.execute_activity(
+                "merge-script-regeneration",
+                {
+                    "current_draft": checked["draft"],
+                    "generated_draft": assembled["draft"],
+                    "selected_segment_keys": list(focused_segment_keys),
+                },
+                start_to_close_timeout=timedelta(seconds=45),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+            checked = await workflow.execute_activity(
+                "verify-script-draft",
+                {
+                    "draft": merged["draft"],
+                    "approved_claim_ids": context["approved_claim_ids"],
+                    "central_claim_ids": context["central_claim_ids"],
+                    "evidence_text_by_id": context["evidence_text_by_id"],
+                    "evidence_claim_ids_by_id": context["evidence_claim_ids_by_id"],
+                },
+                start_to_close_timeout=timedelta(seconds=45),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
         verifier = await _verify_script_with_ai(
             context,
             common,
@@ -1661,6 +1824,8 @@ async def _refine_script_with_verifier(
             "missing_evidence_excerpt",
             "uncertainty_requires_exact_claim",
             "unsupported_source_gap",
+            "weak_explainer_filler_phrase",
+            "segment_below_role_minimum",
         }
         segment_keys = (
             _correction_segment_keys(
