@@ -583,6 +583,7 @@ async def _write_script_segments(
         if operational_instruction:
             chunk_instruction += " " + operational_instruction
         result: dict[str, Any] | None = None
+        contract_satisfied = False
         for generation_attempt in range(1, 4):
             attempt_instruction = chunk_instruction
             if generation_attempt > 1:
@@ -633,10 +634,21 @@ async def _write_script_segments(
                 )
             )
             if not missing_required and output_words >= minimum_words:
+                contract_satisfied = True
                 break
         if result is None:
             raise RuntimeError("script chunk generation returned no model result")
         first_result = first_result or result
+        if not contract_satisfied and base_draft is not None:
+            # A selected regeneration may improve only the chunks it can rewrite
+            # without weakening evidence or format contracts. If the model keeps
+            # undershooting after bounded retries, preserve the immutable parent
+            # segment instead of accepting degraded short prose.
+            continue
+        if not contract_satisfied:
+            raise RuntimeError(
+                "script chunk generation failed required claim or word contract"
+            )
         if (
             segment_type == "counterevidence"
             and not beat.get("allowed_claim_ids")

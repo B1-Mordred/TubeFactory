@@ -407,6 +407,8 @@ def test_partial_chunk_generation_requires_an_existing_base_draft() -> None:
     assert "partial script chunk generation requires a base draft" in source
     assert "generated_by_key.get" in source
     assert 'segment["annotations"]' in source
+    assert "if not contract_satisfied and base_draft is not None" in source
+    assert "preserve the immutable parent" in source
 
 
 def test_verifier_correction_boundary_is_ordered_bounded_and_lock_aware() -> None:
