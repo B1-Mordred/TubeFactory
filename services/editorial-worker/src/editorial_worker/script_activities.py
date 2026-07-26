@@ -945,7 +945,10 @@ async def persist_script_verification(request: dict[str, Any]) -> dict[str, Any]
                     "script changed before verified version persistence", non_retryable=True
                 )
             version_id = uuid4()
-            next_number = current["version_number"] + 1
+            next_number = await connection.fetchval(
+                "SELECT COALESCE(MAX(version_number),0)+1 FROM script_versions WHERE script_id=$1",
+                script_id,
+            )
             report = {
                 "valid": valid,
                 "deterministic": deterministic,
@@ -1101,7 +1104,10 @@ async def persist_script_regeneration(request: dict[str, Any]) -> dict[str, Any]
                     non_retryable=True,
                 )
             version_id = uuid4()
-            next_number = current["version_number"] + 1
+            next_number = await connection.fetchval(
+                "SELECT COALESCE(MAX(version_number),0)+1 FROM script_versions WHERE script_id=$1",
+                script_id,
+            )
             issues = list(deterministic["issues"])
             if deterministic["valid"] and not verifier.valid:
                 issues.append(

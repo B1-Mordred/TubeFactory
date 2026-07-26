@@ -907,7 +907,12 @@ async def edit_script_version(
         evidence_text_by_id=evidence_text,
         evidence_claim_ids_by_id=evidence_claims,
     )
-    next_number = parent.version_number + 1
+    next_number = int(
+        await session.scalar(
+            select(func.coalesce(func.max(ScriptVersionModel.version_number), 0) + 1)
+            .where(ScriptVersionModel.script_id == script.id)
+        )
+    )
     version_id = uuid4()
     now = datetime.now(timezone.utc)
     document = {

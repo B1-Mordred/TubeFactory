@@ -445,6 +445,7 @@ def _correction_script_beats(
             )
             if borrowed is not None:
                 owned.append(borrowed)
+                claim_owner.setdefault(borrowed, segment["segment_key"])
         words = len(str(segment["narration"]).split())
         owned_claims = [
             claim for claim in claims if str(claim["id"]) in set(owned)

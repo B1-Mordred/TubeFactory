@@ -1,9 +1,11 @@
+import inspect
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
 from youtuber_api.main import app
+from youtuber_api.routers.editorial import edit_script_version
 from youtuber_api.schemas import (
     AllOpportunityArchiveWrite,
     ExistingResearchScriptImportStart,
@@ -102,6 +104,12 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/optimization/budgets/{scope}" in paths
     assert "/api/v1/optimization/budget-usage" in paths
     assert "/api/v1/optimization/operational-evidence" in paths
+
+
+def test_manual_script_edits_allocate_after_preserved_candidates() -> None:
+    source = inspect.getsource(edit_script_version)
+
+    assert "func.max(ScriptVersionModel.version_number)" in source
 
 
 def test_scored_opportunity_archive_requires_an_explicit_reason() -> None:

@@ -277,6 +277,7 @@ def test_regeneration_persists_the_verifier_decision_without_a_second_manual_run
     assert '"independent_verifier": verifier.model_dump' in persistence_source
     assert "if current_version_updated:" in persistence_source
     assert '"current_version_updated": current_version_updated' in persistence_source
+    assert "MAX(version_number)" in persistence_source
 
 
 def test_blocked_regeneration_is_preserved_without_becoming_current() -> None:
