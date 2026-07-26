@@ -1074,6 +1074,7 @@ def _local_script_quality_issues(
     for segment in checked["draft"]["segments"]:
         segment_key = str(segment["segment_key"])
         segment_type = str(segment["segment_type"])
+        segment_words = len(str(segment.get("narration", "")).split())
         linked_claim_ids = {
             str(claim_id)
             for annotation in segment["annotations"]
@@ -1113,6 +1114,57 @@ def _local_script_quality_issues(
         normalized_narration = re.sub(
             r"\s+", " ", str(segment.get("narration", "")).strip().casefold()
         )
+        if policy and int(word_range[0]) >= 600:
+            minimum_segment_words = {
+                "hook": 35,
+                "thesis": 45,
+                "context": 35,
+                "evidence": 45,
+                "counterevidence": 45,
+                "uncertainty": 45,
+                "conclusion": 45,
+                "call_to_action": 25,
+            }.get(segment_type, 35)
+            if segment_words < minimum_segment_words:
+                issues.append(
+                    {
+                        "code": "segment_below_role_minimum",
+                        "message": (
+                            f"The {segment_type} segment has {segment_words} words; "
+                            f"this explainer role needs at least {minimum_segment_words} "
+                            "words to provide distinct audience value."
+                        ),
+                        "severity": "error",
+                        "statement": str(segment.get("narration", ""))[:500],
+                        "segment_key": segment_key,
+                    }
+                )
+        weak_phrase_markers = (
+            "du musst wissen",
+            "man muss wissen",
+            "du wirst am ende verstehen",
+            "ich hoffe",
+            "wir hoffen",
+            "was bedeutet das konkret",
+            "dieser überblick hat dir geholfen",
+        )
+        matched_weak_phrase = next(
+            (marker for marker in weak_phrase_markers if marker in normalized_narration),
+            None,
+        )
+        if matched_weak_phrase:
+            issues.append(
+                {
+                    "code": "weak_explainer_filler_phrase",
+                    "message": (
+                        f"The phrase '{matched_weak_phrase}' is generic filler. "
+                        "Explain the idea directly in natural spoken German."
+                    ),
+                    "severity": "error",
+                    "statement": str(segment.get("narration", ""))[:500],
+                    "segment_key": segment_key,
+                }
+            )
         meta_markers = (
             "freigegebene claims",
             "freigegebenen claims",

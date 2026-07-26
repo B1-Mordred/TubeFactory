@@ -680,7 +680,56 @@ def test_local_quality_gate_enforces_configured_explanation_length_and_density()
         "narration_below_format_minimum",
         "duration_below_format_minimum",
         "evidence_density_below_format_minimum",
+        "segment_below_role_minimum",
     }
+
+
+def test_local_quality_gate_rejects_filler_phrases_and_too_short_beats() -> None:
+    checked = {
+        "draft": {
+            "segments": [
+                {
+                    "segment_key": "02-thesis",
+                    "segment_type": "thesis",
+                    "narration": (
+                        "Du wirst am Ende verstehen, warum das Thema wichtig ist."
+                    ),
+                    "duration_seconds": 12,
+                    "annotations": [
+                        {
+                            "text": "Du wirst am Ende verstehen, warum das Thema wichtig ist.",
+                            "kind": "editorial",
+                            "claim_ids": [],
+                        }
+                    ],
+                },
+                {
+                    "segment_key": "07-counterevidence",
+                    "segment_type": "counterevidence",
+                    "narration": (
+                        "Man muss wissen, dass die Menge nicht von einem Faktor abhängt."
+                    ),
+                    "duration_seconds": 8,
+                    "annotations": [
+                        {
+                            "text": "Man muss wissen, dass die Menge nicht von einem Faktor abhängt.",
+                            "kind": "editorial",
+                            "claim_ids": [],
+                        }
+                    ],
+                },
+            ]
+        }
+    }
+
+    issues = _local_script_quality_issues(
+        checked,
+        {"script_policy": {"target_word_range": [675, 1350]}},
+    )
+
+    codes = [issue["code"] for issue in issues]
+    assert codes.count("weak_explainer_filler_phrase") == 2
+    assert codes.count("segment_below_role_minimum") == 2
 
 
 def test_script_plan_targets_a_margin_and_assigns_each_claim_once() -> None:
