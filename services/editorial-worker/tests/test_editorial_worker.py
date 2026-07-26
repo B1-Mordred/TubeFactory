@@ -30,6 +30,7 @@ from editorial_worker.storyboard_activities import (
 from editorial_worker.script_activities import (
     _attach_imported_script,
     _assemble_script_draft,
+    _regeneration_advances_current,
     merge_script_regeneration,
     persist_script_regeneration,
 )
@@ -274,6 +275,14 @@ def test_regeneration_persists_the_verifier_decision_without_a_second_manual_run
     assert '"verifier_model_id": verifier["model_id"]' in workflow_source
     assert 'status = "verified" if final_valid else "blocked"' in persistence_source
     assert '"independent_verifier": verifier.model_dump' in persistence_source
+    assert "if current_version_updated:" in persistence_source
+    assert '"current_version_updated": current_version_updated' in persistence_source
+
+
+def test_blocked_regeneration_is_preserved_without_becoming_current() -> None:
+    assert _regeneration_advances_current("verified")
+    assert not _regeneration_advances_current("blocked")
+    assert not _regeneration_advances_current("draft")
 
 
 def test_writer_chunk_schema_is_derived_without_mutating_active_route() -> None:
@@ -386,6 +395,7 @@ def test_call_to_action_uses_minimal_editorial_input_without_claim_payload() -> 
     ]
     assert evidence["claims"] == [full["claims"][0]]
     assert evidence["requested_segment"]["required_claim_ids"] == ["allowed"]
+    assert evidence["requested_segment"]["minimum_words"] == 81
 
 
 def test_partial_chunk_generation_requires_an_existing_base_draft() -> None:
@@ -835,6 +845,49 @@ def test_correction_plan_does_not_reward_growth_without_a_global_deficit() -> No
     beat = _correction_script_beats(context, base, {"04-evidence"})[0]
 
     assert beat["target_words"] == 35
+
+
+def test_correction_plan_preserves_format_floor_during_full_polish() -> None:
+    claim_ids = [str(uuid4()) for _ in range(3)]
+    base = {
+        "segments": [
+            {
+                "segment_key": f"{index + 1:02d}-evidence",
+                "segment_type": "evidence",
+                "presentation_purpose": "Explain a distinct evidence concept",
+                "narration": "word " * 400,
+                "annotations": [{"claim_ids": [claim_id]}],
+            }
+            for index, claim_id in enumerate(claim_ids)
+        ]
+    }
+    context = {
+        "script_policy": {"target_word_range": [810, 1350]},
+        "structured_inputs": {
+            "claims": [
+                {
+                    "id": claim_id,
+                    "normalized_statement": f"Distinct evidence concept {index}.",
+                    "coverage_unit_ids": ["mechanism"],
+                }
+                for index, claim_id in enumerate(claim_ids)
+            ]
+        },
+    }
+
+    beats = _correction_script_beats(
+        context,
+        base,
+        {segment["segment_key"] for segment in base["segments"]},
+    )
+
+    assert sum(beat["target_words"] for beat in beats) >= _script_target_words(
+        context["script_policy"]
+    )
+    assert sum(beat["minimum_words"] for beat in beats) >= round(
+        _script_target_words(context["script_policy"]) * 0.9
+    )
+    assert all(beat["minimum_words"] > 1 for beat in beats)
 
 
 def test_correction_plan_sizes_rewrites_by_distinct_evidence_concepts() -> None:

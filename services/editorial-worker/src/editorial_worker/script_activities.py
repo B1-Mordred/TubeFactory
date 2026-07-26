@@ -29,6 +29,12 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _regeneration_advances_current(status: str) -> bool:
+    """Only independently verified regenerated drafts may replace the active script."""
+
+    return status == "verified"
+
+
 def _attach_imported_script(
     context: dict[str, Any], request: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1078,7 +1084,8 @@ async def persist_script_regeneration(request: dict[str, Any]) -> dict[str, Any]
                     "idempotent_replay": True,
                 }
             current = await connection.fetchrow(
-                """SELECT s.current_version_id,sv.version_number,sv.content_hash
+                """SELECT s.current_version_id,s.status AS script_status,
+                          sv.version_number,sv.content_hash
                    FROM scripts s JOIN script_versions sv ON sv.id=s.current_version_id
                    WHERE s.id=$1 FOR UPDATE OF s""",
                 script_id,
@@ -1181,14 +1188,16 @@ async def persist_script_regeneration(request: dict[str, Any]) -> dict[str, Any]
                             annotation.kind,
                             now,
                         )
-            await connection.execute(
-                """UPDATE scripts SET current_version_id=$1,status=$2,version=version+1,
-                   updated_at=$3 WHERE id=$4""",
-                version_id,
-                status,
-                now,
-                script_id,
-            )
+            current_version_updated = _regeneration_advances_current(status)
+            if current_version_updated:
+                await connection.execute(
+                    """UPDATE scripts SET current_version_id=$1,status=$2,version=version+1,
+                       updated_at=$3 WHERE id=$4""",
+                    version_id,
+                    status,
+                    now,
+                    script_id,
+                )
             await append_audit(
                 connection,
                 action=(
@@ -1208,6 +1217,12 @@ async def persist_script_regeneration(request: dict[str, Any]) -> dict[str, Any]
                     "coverage_percent": deterministic["coverage_percent"],
                     "segment_keys": request["selected_segment_keys"],
                     "instruction": request["instruction"],
+                    "current_version_updated": current_version_updated,
+                    "active_current_version_id": (
+                        str(version_id)
+                        if current_version_updated
+                        else request["parent_version_id"]
+                    ),
                     "import": request.get("import_metadata"),
                 },
             )
@@ -1220,6 +1235,12 @@ async def persist_script_regeneration(request: dict[str, Any]) -> dict[str, Any]
                 "coverage_percent": deterministic["coverage_percent"],
                 "issue_count": len(issues),
                 "selected_segment_keys": request["selected_segment_keys"],
+                "current_version_updated": current_version_updated,
+                "active_current_version_id": (
+                    str(version_id)
+                    if current_version_updated
+                    else request["parent_version_id"]
+                ),
                 "idempotent_replay": False,
             }
     finally:

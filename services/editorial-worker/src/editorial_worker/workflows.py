@@ -339,6 +339,9 @@ def _script_segment_inputs(
         "purpose": beat["purpose"],
         "coverage_unit_id": beat.get("coverage_unit_id"),
         "target_words": beat["target_words"],
+        "minimum_words": beat.get(
+            "minimum_words", max(1, round(float(beat["target_words"]) * 0.9))
+        ),
         "allowed_claim_ids": beat["allowed_claim_ids"],
         "required_claim_ids": beat.get("required_claim_ids", []),
     }
@@ -503,6 +506,40 @@ def _correction_script_beats(
         if claim_id not in target["allowed_claim_ids"]:
             target["allowed_claim_ids"].append(claim_id)
         target["required_claim_ids"].append(claim_id)
+    policy = context.get("script_policy", {})
+    word_range = policy.get("target_word_range") or [0, 20_000]
+    hard_minimum_words = max(0, int(word_range[0]))
+    if hard_minimum_words > 0 and beats:
+        unselected_words = sum(
+            len(str(segment["narration"]).split())
+            for segment in all_segments
+            if segment["segment_key"] not in selected_segment_keys
+        )
+        required_total_words = max(hard_minimum_words, desired_words)
+        projected_total_words = unselected_words + sum(
+            int(beat["target_words"]) for beat in beats
+        )
+        remaining_deficit = max(0, required_total_words - projected_total_words)
+        for index, beat in enumerate(beats):
+            if remaining_deficit <= 0:
+                break
+            remaining_beats = len(beats) - index
+            addition = (remaining_deficit + remaining_beats - 1) // remaining_beats
+            beat["target_words"] = int(beat["target_words"]) + addition
+            remaining_deficit -= addition
+    for beat in beats:
+        target_words = int(beat["target_words"])
+        if hard_minimum_words > 0:
+            beat["minimum_words"] = max(
+                int(beat.get("minimum_words", 1)),
+                max(1, round(target_words * 0.9)),
+            )
+        else:
+            beat["minimum_words"] = max(1, int(beat.get("minimum_words", 1)))
+        beat["maximum_sentences"] = max(
+            int(beat.get("maximum_sentences", 2)),
+            max(2, round(target_words / 45)),
+        )
     return beats
 
 
@@ -537,7 +574,8 @@ async def _write_script_segments(
             "reuse a factual block from another segment. Use only requested_segment.allowed_claim_ids. "
             "Use every requested_segment.required_claim_ids at least once. When two required "
             "claims express the same fact, explain the fact once and attach both claim IDs to "
-            "that sentence instead of repeating it. Aim for requested_segment.target_words "
+            "that sentence instead of repeating it. Write at least requested_segment.minimum_words "
+            "words and aim for requested_segment.target_words "
             "without workflow commentary, padding, or unsupported detail. In German, use "
             "established German terminology and spell technical terms consistently."
         )
@@ -550,7 +588,7 @@ async def _write_script_segments(
                 attempt_instruction += (
                     f" Contract retry {generation_attempt}: the previous response omitted "
                     "required claim IDs or undershot the word target. Include every required "
-                    "ID in an accurate sentence and reach at least 90 percent of target_words."
+                    "ID in an accurate sentence and reach requested_segment.minimum_words."
                 )
             result = await workflow.execute_activity(
                 "invoke-editorial-model",
