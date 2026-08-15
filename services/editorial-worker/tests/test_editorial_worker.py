@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+import editorial_worker.workflows as editorial_workflows
 from editorial_core.editorial import (
     ScriptSegmentDraft,
     StatementAnnotation,
@@ -245,6 +246,16 @@ def test_initial_generation_never_reads_regeneration_only_fields() -> None:
     assert "context[\"instruction\"]" in regeneration_source
     assert "base_draft=context[\"current_draft\"]" in regeneration_source
     assert "issue_scope_segment_keys" in regeneration_source
+
+
+def test_editorial_model_activities_are_tightly_bounded() -> None:
+    source = inspect.getsource(editorial_workflows)
+
+    assert "start_to_close_timeout=timedelta(minutes=35)" not in source
+    assert "_EDITORIAL_MODEL_ACTIVITY_TIMEOUT = timedelta(minutes=12)" in source
+    assert "_EDITORIAL_MODEL_RETRY = RetryPolicy(maximum_attempts=1)" in source
+    assert source.count("start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT") == 6
+    assert source.count("retry_policy=_EDITORIAL_MODEL_RETRY") == 6
 
 
 def test_existing_research_import_uses_normal_verification_and_persistence() -> None:

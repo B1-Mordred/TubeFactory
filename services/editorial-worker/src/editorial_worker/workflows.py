@@ -16,6 +16,8 @@ _MODEL_RETRY = RetryPolicy(
     maximum_interval=timedelta(seconds=15),
     maximum_attempts=3,
 )
+_EDITORIAL_MODEL_ACTIVITY_TIMEOUT = timedelta(minutes=12)
+_EDITORIAL_MODEL_RETRY = RetryPolicy(maximum_attempts=1)
 _DB_RETRY = RetryPolicy(maximum_attempts=5)
 _SCRIPT_SEGMENT_TYPES = (
     "hook", "thesis", "context", "evidence", "counterevidence",
@@ -721,8 +723,8 @@ async def _write_script_segments(
                         context, "script_writer", attempt_instruction
                     ),
                 },
-                start_to_close_timeout=timedelta(minutes=35),
-                retry_policy=_MODEL_RETRY,
+                start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
+                retry_policy=_EDITORIAL_MODEL_RETRY,
             )
             output_segment = result["output"]["segment"]
             if beat.get("maximum_sentences") is not None:
@@ -903,8 +905,8 @@ async def _verify_script_with_ai(
                 ),
             ),
         },
-        start_to_close_timeout=timedelta(minutes=35),
-        retry_policy=_MODEL_RETRY,
+        start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
+        retry_policy=_EDITORIAL_MODEL_RETRY,
     )
     editorial_statements = [
         {
@@ -947,8 +949,8 @@ async def _verify_script_with_ai(
                 ),
             ),
         },
-        start_to_close_timeout=timedelta(minutes=35),
-        retry_policy=_MODEL_RETRY,
+        start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
+        retry_policy=_EDITORIAL_MODEL_RETRY,
     )
     factual_statements = _factual_audit_statements(
         context,
@@ -985,8 +987,8 @@ async def _verify_script_with_ai(
                 ),
             ),
         },
-        start_to_close_timeout=timedelta(minutes=35),
-        retry_policy=_MODEL_RETRY,
+        start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
+        retry_policy=_EDITORIAL_MODEL_RETRY,
     )
     primary_output = {
         **primary["output"],
@@ -2824,8 +2826,8 @@ class StoryboardGenerationWorkflow:
                     context, "storyboard"
                 ),
             },
-            start_to_close_timeout=timedelta(minutes=35),
-            retry_policy=_MODEL_RETRY,
+            start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
+            retry_policy=_EDITORIAL_MODEL_RETRY,
         )
         self._state = "ASSEMBLING_SCENES"
         self._progress = 60
@@ -2933,8 +2935,8 @@ class SceneAlternativeGenerationWorkflow:
                     ),
                 ),
             },
-            start_to_close_timeout=timedelta(minutes=35),
-            retry_policy=_MODEL_RETRY,
+            start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
+            retry_policy=_EDITORIAL_MODEL_RETRY,
         )
         self._state = "VALIDATING_ALTERNATIVE"
         self._progress = 70
