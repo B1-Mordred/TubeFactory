@@ -25,7 +25,7 @@ unchanged and continue to require dossier claims and verifier gates.
 - [x] (2026-08-15 14:38Z) Added UI paste/import, preview, and direct-mode review affordances.
 - [x] (2026-08-15 14:41Z) Ran targeted parser/API/worker/web validation.
 - [x] (2026-08-15 14:49Z) Deployed the change to the live `youtuber` compose project that owns the active data and `:8090`.
-- [ ] Commit, push, and check CI.
+- [x] (2026-08-15 14:50Z) Committed, pushed `dev`, and verified GitHub Actions CI passed.
 
 ## Surprises & Discoveries
 
@@ -65,8 +65,8 @@ The direct scripted-video path is implemented and deployed to the live local
 TubeFactory stack. Container validation passed for API route/schema
 registration, direct parser/import smoke checks, editorial worker tests, web
 TypeScript, Python syntax/import checks, migration application, service health,
-LAN Caddy routing, and browser hydration to the login screen. Commit, push, and
-CI verification remain.
+LAN Caddy routing, and browser hydration to the login screen. The implementation
+was committed and pushed to `origin/dev`; GitHub Actions CI passed.
 
 ## Context and Orientation
 
