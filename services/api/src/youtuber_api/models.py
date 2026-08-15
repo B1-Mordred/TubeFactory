@@ -619,15 +619,39 @@ class AIUsageRecordModel(Base):
 class ScriptModel(VersionedModelMixin, Base):
     __tablename__ = "scripts"
 
-    opportunity_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("opportunities.id"))
-    research_dossier_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("research_dossiers.id"), unique=True
+    opportunity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("opportunities.id"), nullable=True
     )
+    research_dossier_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("research_dossiers.id"), unique=True, nullable=True
+    )
+    production_brief_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("production_briefs.id"), unique=True, nullable=True
+    )
+    source_kind: Mapped[str] = mapped_column(String(40), default="research_dossier")
     status: Mapped[str] = mapped_column(String(30))
     current_version_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("script_versions.id", ondelete="RESTRICT", use_alter=True),
     )
+    created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+
+
+class ProductionBriefModel(VersionedModelMixin, Base):
+    __tablename__ = "production_briefs"
+    __table_args__ = (UniqueConstraint("workflow_id", name="uq_production_brief_workflow"),)
+
+    channel_profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("channel_profiles.id")
+    )
+    title: Mapped[str] = mapped_column(String(300))
+    source_kind: Mapped[str] = mapped_column(String(40))
+    source_text: Mapped[str] = mapped_column(Text)
+    source_text_hash: Mapped[str] = mapped_column(String(64))
+    parse_report: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(30))
+    workflow_id: Mapped[str] = mapped_column(String(240))
+    correlation_id: Mapped[str] = mapped_column(String(160))
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
 
 

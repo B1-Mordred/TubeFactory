@@ -246,16 +246,19 @@ async def load_storyboard_generation_context(request: dict[str, Any]) -> dict[st
     try:
         script = await connection.fetchrow(
             """SELECT s.id,s.status,s.current_version_id,sv.id AS script_version_id,
+                      s.source_kind,s.production_brief_id,
                       sv.version_number,sv.status AS version_status,sv.title,sv.content_hash,
                       sv.coverage_percent,sv.total_duration_seconds,
+                      sv.verification_report,pb.parse_report AS production_parse_report,
                       cp.id AS channel_profile_id,cp.name AS channel_name,
                       cp.editorial_rules AS channel_editorial_rules
                FROM scripts s
                JOIN script_versions sv ON sv.id=s.current_version_id
-               JOIN research_dossiers d ON d.id=s.research_dossier_id
-               JOIN opportunities o ON o.id=d.opportunity_id
-               JOIN subject_profiles sp ON sp.id=o.subject_profile_id
-               JOIN channel_profiles cp ON cp.id=sp.channel_profile_id
+               LEFT JOIN research_dossiers d ON d.id=s.research_dossier_id
+               LEFT JOIN opportunities o ON o.id=d.opportunity_id
+               LEFT JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               LEFT JOIN production_briefs pb ON pb.id=s.production_brief_id
+               JOIN channel_profiles cp ON cp.id=COALESCE(sp.channel_profile_id,pb.channel_profile_id)
                WHERE s.id=$1 AND s.deleted_at IS NULL""",
             script_id,
         )
@@ -339,6 +342,53 @@ async def load_storyboard_generation_context(request: dict[str, Any]) -> dict[st
             )
         if not segments:
             raise ApplicationError("approved script has no immutable segments", non_retryable=True)
+        direct_storyboard_scenes: list[dict[str, Any]] = []
+        if script["source_kind"] == "direct_scripted_video":
+            report = script["verification_report"]
+            if isinstance(report, str):
+                report = json.loads(report)
+            parse_report = script["production_parse_report"]
+            if isinstance(parse_report, str):
+                parse_report = json.loads(parse_report)
+            templates = (
+                (report or {}).get("direct_storyboard", {}).get("scenes")
+                or (parse_report or {}).get("direct_storyboard", {}).get("scenes")
+                or []
+            )
+            segment_by_key = {item["segment_key"]: item for item in segments}
+            for template in templates:
+                segment = segment_by_key.get(str(template.get("segment_key")))
+                if segment is None:
+                    raise ApplicationError(
+                        "direct storyboard template references an unknown script segment",
+                        non_retryable=True,
+                    )
+                scene_key = str(template.get("scene_key") or template.get("segment_key"))
+                direct_storyboard_scenes.append(
+                    {
+                        "scene_id": str(uuid5(NAMESPACE_URL, f"{script_version_id}:{scene_key}")),
+                        "order": int(template["order"]),
+                        "purpose": str(template["purpose"]),
+                        "narration_segment_ids": [segment["id"]],
+                        "claim_ids": [],
+                        "duration": float(segment["duration_seconds"]),
+                        "visual_type": str(template["visual_type"]),
+                        "visual_brief": str(template["visual_brief"]),
+                        "on_screen_text": [str(value) for value in template.get("on_screen_text", [])],
+                        "citation_style": str(template["citation_style"]),
+                        "source_ids": [],
+                        "asset_requests": list(template.get("asset_requests", [])),
+                        "transition": str(template["transition"]),
+                        "music_sfx_policy": str(template["music_sfx_policy"]),
+                        "synthetic_media_flag": bool(template["synthetic_media_flag"]),
+                        "accessibility_notes": str(template["accessibility_notes"]),
+                    }
+                )
+            if not direct_storyboard_scenes:
+                raise ApplicationError(
+                    "direct scripted-video script has no imported storyboard templates",
+                    non_retryable=True,
+                )
         routes = await load_task_routes(connection, "storyboard")
         channel_workflow = channel_workflow_context(script["channel_editorial_rules"])
         return {
@@ -369,6 +419,9 @@ async def load_storyboard_generation_context(request: dict[str, Any]) -> dict[st
             "segment_narrations": {item["id"]: item["narration"] for item in segments},
             "allowed_claim_ids": {key: sorted(value) for key, value in allowed_claim_ids.items()},
             "allowed_source_ids": {key: sorted(value) for key, value in allowed_source_ids.items()},
+            "source_kind": script["source_kind"],
+            "evidence_required": script["source_kind"] != "direct_scripted_video",
+            "direct_storyboard_scenes": direct_storyboard_scenes,
         }
     finally:
         await connection.close()
@@ -386,6 +439,7 @@ async def load_scene_alternative_context(request: dict[str, Any]) -> dict[str, A
                       sbv.version_number AS storyboard_version,sbv.script_version_id,
                       sv.title,sv.content_hash AS script_content_hash,
                       sv.coverage_percent,sv.total_duration_seconds,
+                      s.source_kind,
                       sc.current_version_id AS scene_version_id,sc.locked,
                       scv.version_number AS scene_version,scv.scene_order,
                       scv.scene_spec,scv.content_hash AS scene_content_hash,
@@ -395,10 +449,11 @@ async def load_scene_alternative_context(request: dict[str, Any]) -> dict[str, A
                JOIN storyboard_versions sbv ON sbv.id=sb.current_version_id
                JOIN script_versions sv ON sv.id=sbv.script_version_id
                JOIN scripts s ON s.id=sb.script_id
-               JOIN research_dossiers d ON d.id=s.research_dossier_id
-               JOIN opportunities o ON o.id=d.opportunity_id
-               JOIN subject_profiles sp ON sp.id=o.subject_profile_id
-               JOIN channel_profiles cp ON cp.id=sp.channel_profile_id
+               LEFT JOIN research_dossiers d ON d.id=s.research_dossier_id
+               LEFT JOIN opportunities o ON o.id=d.opportunity_id
+               LEFT JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               LEFT JOIN production_briefs pb ON pb.id=s.production_brief_id
+               JOIN channel_profiles cp ON cp.id=COALESCE(sp.channel_profile_id,pb.channel_profile_id)
                JOIN scenes sc ON sc.storyboard_id=sb.id
                JOIN scene_versions scv ON scv.id=sc.current_version_id
                WHERE sb.id=$1 AND sc.id=$2 AND sb.deleted_at IS NULL

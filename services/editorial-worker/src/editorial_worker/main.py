@@ -31,6 +31,7 @@ from editorial_worker.script_activities import (
     load_script_regeneration_context,
     load_script_verification_context,
     merge_script_regeneration,
+    persist_direct_scripted_video_import,
     persist_script_regeneration,
     persist_script_result,
     persist_script_verification,
@@ -46,6 +47,7 @@ from editorial_worker.storyboard_activities import (
     validate_storyboard_activity,
 )
 from editorial_worker.workflows import (
+    DirectScriptedVideoImportWorkflow,
     ExistingResearchScriptImportWorkflow,
     SceneAlternativeGenerationWorkflow,
     ScriptGenerationWorkflow,
@@ -83,6 +85,7 @@ async def run() -> None:
         task_queue=settings.task_queue,
         workflows=[
             ProviderModelDiscoveryWorkflow,
+            DirectScriptedVideoImportWorkflow,
             ExistingResearchScriptImportWorkflow,
             ScriptGenerationWorkflow,
             ScriptRegenerationWorkflow,
@@ -102,6 +105,7 @@ async def run() -> None:
             assess_dossier_evidence_with_ai,
             load_script_generation_context,
             load_script_regeneration_context,
+            persist_direct_scripted_video_import,
             assemble_script_draft,
             invoke_editorial_model,
             merge_script_regeneration,

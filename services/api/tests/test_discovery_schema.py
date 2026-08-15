@@ -66,6 +66,7 @@ def test_discovery_models_are_registered() -> None:
         "task_model_assignments",
         "prompt_templates",
         "ai_usage_records",
+        "production_briefs",
         "scripts",
         "script_versions",
         "script_segments",

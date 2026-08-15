@@ -1276,6 +1276,58 @@ class ExistingResearchScriptImportStart(StrictRequestModel):
         return normalized
 
 
+class DirectScriptedVideoPreviewStart(StrictRequestModel):
+    title: str = Field(min_length=1, max_length=300)
+    master_script: str = Field(min_length=200, max_length=100_000)
+    target_wpm_min: int = Field(default=108, ge=60, le=220)
+    target_wpm_max: int = Field(default=116, ge=60, le=220)
+
+    @field_validator("title", "master_script")
+    @classmethod
+    def nonempty_direct_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must contain non-whitespace text")
+        return normalized
+
+    @model_validator(mode="after")
+    def ordered_wpm(self) -> "DirectScriptedVideoPreviewStart":
+        if self.target_wpm_min > self.target_wpm_max:
+            raise ValueError("target_wpm_min must be less than or equal to target_wpm_max")
+        return self
+
+
+class DirectScriptedVideoImportStart(DirectScriptedVideoPreviewStart):
+    channel_profile_id: UUID
+    sensitivity: Literal["public", "internal", "sensitive", "restricted"] = "internal"
+    idempotency_key: str = Field(
+        min_length=8, max_length=120, pattern=r"^[a-zA-Z0-9_.:-]+$"
+    )
+
+
+class DirectScriptedVideoPreviewScene(BaseModel):
+    scene_key: str
+    order: int
+    title: str
+    duration_seconds: float
+    word_count: int
+    placeholder_tokens: list[str]
+    on_screen_text: list[str]
+    assets: list[str]
+    approval_note: str
+
+
+class DirectScriptedVideoPreviewView(BaseModel):
+    title: str
+    scene_count: int
+    total_duration_seconds: float
+    word_count: int
+    target_wpm_min: int
+    target_wpm_max: int
+    placeholder_tokens: list[str]
+    scenes: list[DirectScriptedVideoPreviewScene]
+
+
 class StoryboardGenerationStart(StrictRequestModel):
     script_version_id: UUID
     sensitivity: Literal["public", "internal", "sensitive", "restricted"] = "internal"
@@ -1556,7 +1608,12 @@ class RenderApprovalWrite(StrictRequestModel):
 
 class ScriptSummaryView(BaseModel):
     id: UUID
-    dossier_id: UUID
+    dossier_id: UUID | None
+    opportunity_id: UUID | None = None
+    production_brief_id: UUID | None = None
+    channel_profile_id: UUID | None = None
+    source_kind: str = "research_dossier"
+    evidence_required: bool = True
     status: str
     version: int
     current_version_id: UUID

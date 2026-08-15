@@ -8,6 +8,7 @@ from youtuber_api.main import app
 from youtuber_api.routers.editorial import edit_script_version
 from youtuber_api.schemas import (
     AllOpportunityArchiveWrite,
+    DirectScriptedVideoImportStart,
     ExistingResearchScriptImportStart,
     ScoredOpportunityArchiveWrite,
 )
@@ -69,6 +70,8 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/prompt-templates/{template_key}" in paths
     assert "/api/v1/editorial/script-runs" in paths
     assert "/api/v1/editorial/script-import-runs" in paths
+    assert "/api/v1/editorial/direct-scripted-video-preview" in paths
+    assert "/api/v1/editorial/direct-scripted-video-runs" in paths
     assert "/api/v1/editorial/runs/{workflow_id}/events" in paths
     assert "/api/v1/editorial/runs/{workflow_id}/cancel" in paths
     assert "/api/v1/editorial/runs/{workflow_id}/retry" in paths
@@ -121,6 +124,16 @@ def test_scored_opportunity_archive_requires_an_explicit_reason() -> None:
         reason="Remove obsolete discovery findings before a clean acceptance run.",
     )
     assert payload.reason.startswith("Remove obsolete")
+
+
+def test_direct_scripted_video_import_rejects_short_idempotency_key() -> None:
+    with pytest.raises(ValidationError):
+        DirectScriptedVideoImportStart(
+            channel_profile_id=uuid4(),
+            title="Direct script",
+            master_script="S01 | 00:00–00:10 | Short\nVoiceover: " + "word " * 50,
+            idempotency_key="short",
+        )
 
 
 def test_systemwide_opportunity_archive_requires_an_explicit_reason() -> None:

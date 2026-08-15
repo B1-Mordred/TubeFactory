@@ -17,6 +17,11 @@ from editorial_core.editorial import (
     narration_sentences,
     verify_script_draft,
 )
+from editorial_core.direct_scripted_video import (
+    direct_import_report,
+    direct_script_draft_document,
+    parse_direct_scripted_video,
+)
 from editorial_core.explanation_readiness import explanation_policy
 from editorial_worker.config import Settings
 from editorial_worker.channel_workflow import channel_workflow_context
@@ -98,6 +103,184 @@ def _core_segments(draft: ScriptDraft) -> tuple[ScriptSegmentDraft, ...]:
         )
         for segment in draft.segments
     )
+
+
+@activity.defn(name="persist-direct-scripted-video-import")
+async def persist_direct_scripted_video_import(request: dict[str, Any]) -> dict[str, Any]:
+    settings = Settings()
+    workflow_id = str(request["workflow_id"])
+    actor_id = UUID(str(request["actor_id"]))
+    channel_profile_id = UUID(str(request["channel_profile_id"]))
+    parsed = parse_direct_scripted_video(
+        str(request["master_script"]),
+        title=str(request["title"]),
+        target_wpm_min=int(request.get("target_wpm_min", 108)),
+        target_wpm_max=int(request.get("target_wpm_max", 116)),
+    )
+    draft = ScriptDraft.model_validate(direct_script_draft_document(parsed))
+    report = direct_import_report(parsed)
+    source_hash = hashlib.sha256(parsed.source_text.encode()).hexdigest()
+    document = draft.model_dump(mode="json")
+    content_hash = hashlib.sha256(_canonical(document).encode()).hexdigest()
+    now = datetime.now(timezone.utc)
+    connection = await asyncpg.connect(settings.database_dsn)
+    try:
+        async with connection.transaction():
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"direct-scripted-video:{workflow_id}",
+            )
+            existing = await connection.fetchrow(
+                """SELECT sv.id AS script_version_id,sv.script_id,sv.version_number,
+                          sv.status,sv.content_hash,s.status AS script_status,
+                          s.production_brief_id
+                   FROM script_versions sv JOIN scripts s ON s.id=sv.script_id
+                   WHERE sv.workflow_id=$1""",
+                workflow_id,
+            )
+            if existing:
+                return {
+                    "script_id": str(existing["script_id"]),
+                    "script_version_id": str(existing["script_version_id"]),
+                    "production_brief_id": str(existing["production_brief_id"]),
+                    "version_number": existing["version_number"],
+                    "status": existing["script_status"],
+                    "content_hash": existing["content_hash"],
+                    "coverage_percent": 0,
+                    "placeholder_tokens": report["placeholder_tokens"],
+                    "idempotent_replay": True,
+                }
+            channel = await connection.fetchrow(
+                "SELECT id FROM channel_profiles WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
+                channel_profile_id,
+            )
+            if channel is None:
+                raise ApplicationError(
+                    "direct scripted-video import requires an active channel profile",
+                    non_retryable=True,
+                )
+            production_brief_id = uuid4()
+            script_id = uuid4()
+            script_version_id = uuid4()
+            await connection.execute(
+                """INSERT INTO production_briefs
+                   (id,version,created_at,updated_at,deleted_at,channel_profile_id,title,
+                    source_kind,source_text,source_text_hash,parse_report,status,
+                    workflow_id,correlation_id,created_by)
+                   VALUES($1,1,$2,$2,NULL,$3,$4,'direct_scripted_video',$5,$6,$7::jsonb,
+                          'imported',$8,$9,$10)""",
+                production_brief_id,
+                now,
+                channel_profile_id,
+                parsed.title,
+                parsed.source_text,
+                source_hash,
+                json.dumps(parsed.preview()),
+                workflow_id,
+                request["correlation_id"],
+                actor_id,
+            )
+            await connection.execute(
+                """INSERT INTO scripts
+                   (id,version,created_at,updated_at,deleted_at,opportunity_id,
+                    research_dossier_id,production_brief_id,source_kind,status,
+                    current_version_id,created_by)
+                   VALUES($1,1,$2,$2,NULL,NULL,NULL,$3,'direct_scripted_video',
+                          'verified',NULL,$4)""",
+                script_id,
+                now,
+                production_brief_id,
+                actor_id,
+            )
+            await connection.execute(
+                """INSERT INTO script_versions
+                   (id,script_id,version_number,status,title,total_duration_seconds,
+                    writer_model_id,verifier_model_id,writer_prompt_id,verifier_prompt_id,
+                    verification_report,coverage_percent,content_hash,parent_version_id,
+                    workflow_id,correlation_id,created_by,created_at)
+                   VALUES($1,$2,1,'verified',$3,$4,NULL,NULL,NULL,NULL,$5::jsonb,
+                          0,$6,NULL,$7,$8,$9,$10)""",
+                script_version_id,
+                script_id,
+                draft.title,
+                sum(item.duration_seconds for item in draft.segments),
+                json.dumps(report),
+                content_hash,
+                workflow_id,
+                request["correlation_id"],
+                actor_id,
+                now,
+            )
+            for order, segment in enumerate(draft.segments, start=1):
+                segment_id = uuid4()
+                segment_document = segment.model_dump(mode="json")
+                await connection.execute(
+                    """INSERT INTO script_segments
+                       (id,script_version_id,segment_key,segment_order,segment_type,narration,
+                        presentation_purpose,duration_seconds,citation_display,annotations,
+                        locked,content_hash,created_at)
+                       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13)""",
+                    segment_id,
+                    script_version_id,
+                    segment.segment_key,
+                    order,
+                    segment.segment_type,
+                    segment.narration,
+                    segment.presentation_purpose,
+                    segment.duration_seconds,
+                    json.dumps(segment.citation_display),
+                    json.dumps([item.model_dump(mode="json") for item in segment.annotations]),
+                    segment.locked,
+                    hashlib.sha256(_canonical(segment_document).encode()).hexdigest(),
+                    now,
+                )
+            await connection.execute(
+                "UPDATE scripts SET current_version_id=$1 WHERE id=$2",
+                script_version_id,
+                script_id,
+            )
+            await connection.execute(
+                """INSERT INTO workflow_transitions
+                   (id,aggregate_type,aggregate_id,from_stage,to_stage,reason,actor_id,
+                    correlation_id,occurred_at)
+                   VALUES($1,'script',$2,NULL,'VERIFIED',$3,$4,$5,$6)""",
+                uuid4(),
+                script_id,
+                "direct scripted-video structure imported without evidence verification",
+                actor_id,
+                request["correlation_id"],
+                now,
+            )
+            await append_audit(
+                connection,
+                action="script.direct_scripted_video_imported",
+                actor_id=actor_id,
+                target_type="script_version",
+                target_id=str(script_version_id),
+                correlation_id=request["correlation_id"],
+                context={
+                    "script_id": str(script_id),
+                    "production_brief_id": str(production_brief_id),
+                    "source_text_hash": source_hash,
+                    "content_hash": content_hash,
+                    "scene_count": parsed.scene_count,
+                    "placeholder_tokens": report["placeholder_tokens"],
+                    "evidence_required": False,
+                },
+            )
+            return {
+                "script_id": str(script_id),
+                "script_version_id": str(script_version_id),
+                "production_brief_id": str(production_brief_id),
+                "version_number": 1,
+                "status": "verified",
+                "content_hash": content_hash,
+                "coverage_percent": 0,
+                "placeholder_tokens": report["placeholder_tokens"],
+                "idempotent_replay": False,
+            }
+    finally:
+        await connection.close()
 
 
 def _assemble_script_draft(request: dict[str, Any]) -> ScriptDraft:
@@ -672,8 +855,9 @@ async def persist_script_result(request: dict[str, Any]) -> dict[str, Any]:
             await connection.execute(
                 """INSERT INTO scripts
                    (id,version,created_at,updated_at,deleted_at,opportunity_id,
-                    research_dossier_id,status,current_version_id,created_by)
-                   VALUES($1,1,$2,$2,NULL,$3,$4,$5,NULL,$6)""",
+                    research_dossier_id,production_brief_id,source_kind,status,
+                    current_version_id,created_by)
+                   VALUES($1,1,$2,$2,NULL,$3,$4,NULL,'research_dossier',$5,NULL,$6)""",
                 script_id,
                 now,
                 dossier["opportunity_id"],

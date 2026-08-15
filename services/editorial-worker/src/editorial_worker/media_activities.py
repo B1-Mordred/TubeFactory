@@ -122,16 +122,18 @@ async def load_media_production_context(request: dict[str, Any]) -> dict[str, An
     try:
         storyboard = await connection.fetchrow(
             """SELECT bv.id,bv.storyboard_id,bv.script_version_id,bv.version_number,bv.status,
-                      bv.content_hash,s.opportunity_id,cp.id AS channel_profile_id,cp.name AS channel_name,
+                      bv.content_hash,s.opportunity_id,s.source_kind,s.production_brief_id,
+                      cp.id AS channel_profile_id,cp.name AS channel_name,
                       cp.version AS channel_profile_version,cp.brand_kit,
                       cp.default_render_settings,sv.verification_report
                FROM storyboard_versions bv
                JOIN storyboards b ON b.id=bv.storyboard_id
                JOIN scripts s ON s.id=b.script_id
                JOIN script_versions sv ON sv.id=bv.script_version_id
-               JOIN opportunities o ON o.id=s.opportunity_id
-               JOIN subject_profiles sp ON sp.id=o.subject_profile_id
-               JOIN channel_profiles cp ON cp.id=sp.channel_profile_id
+               LEFT JOIN opportunities o ON o.id=s.opportunity_id
+               LEFT JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               LEFT JOIN production_briefs pb ON pb.id=s.production_brief_id
+               JOIN channel_profiles cp ON cp.id=COALESCE(sp.channel_profile_id,pb.channel_profile_id)
                WHERE bv.id=$1 AND b.status='approved' AND b.current_version_id=bv.id""",
             UUID(str(request["storyboard_version_id"])),
         )
@@ -181,6 +183,8 @@ async def load_media_production_context(request: dict[str, Any]) -> dict[str, An
         claim_count = await connection.fetchval("SELECT count(*) FROM script_segments seg JOIN segment_claims sc ON sc.script_segment_id=seg.id WHERE seg.script_version_id=$1", storyboard["script_version_id"])
         supported_count = await connection.fetchval("SELECT count(DISTINCT sc.id) FROM script_segments seg JOIN segment_claims sc ON sc.script_segment_id=seg.id JOIN claim_evidence ce ON ce.claim_id=sc.claim_id AND ce.relationship='supports' WHERE seg.script_version_id=$1", storyboard["script_version_id"])
         brand = normalize_brand_kit(_json(storyboard["brand_kit"]), channel_name=storyboard["channel_name"])
+        verification_report = _json(storyboard["verification_report"])
+        evidence_required = bool(verification_report.get("evidence_required", True))
         return {
             "workflow_id": request["workflow_id"], "production_id": str(_production_id(request["workflow_id"])),
             "actor_id": request["actor_id"], "correlation_id": request["correlation_id"],
@@ -189,11 +193,13 @@ async def load_media_production_context(request: dict[str, Any]) -> dict[str, An
             "channel_profile_id": str(storyboard["channel_profile_id"]),
             "channel_profile_version": storyboard["channel_profile_version"],
             "channel_name": storyboard["channel_name"],
+            "source_kind": storyboard["source_kind"],
+            "evidence_required": evidence_required,
             "render_tier": request["render_tier"], "width": request["width"], "height": request["height"], "fps": request["fps"],
             "brand": brand,
             "brand_hash": canonical_hash(brand),
             "render_policy": _json(storyboard["default_render_settings"]),
-            "verification_report": _json(storyboard["verification_report"]),
+            "verification_report": verification_report,
             "comfy_workflow": {
                 **{key: workflow[key] for key in ("workflow_key", "version_number", "purpose", "content_hash")},
                 **{key: _json(workflow[key]) for key in ("api_workflow", "required_nodes", "required_models", "typed_inputs", "output_contract")},
@@ -645,7 +651,7 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     video_asset = _asset(workflow_id=context["workflow_id"], key=f"render:{context['render_tier']}", production_id=production_id, kind=tier_kind, body=final_video, mime="video/mp4", object_key=video_key, width=context["width"], height=context["height"], duration=narration["duration_seconds"], licence={"status": "cleared", "basis": "assembled_from_cleared_assets", "synthetic": True}, provenance={"engine": engine, "engine_version": engine_version, "composition": composition, "props_hash": canonical_hash(props), "ffmpeg": "5.1.9", "storyboard_hash": context["storyboard_hash"]})
     thumb_asset = _asset(workflow_id=context["workflow_id"], key="thumbnail", production_id=production_id, kind="thumbnail", body=thumbnail, mime="image/jpeg", object_key=thumb_key, width=context["width"], height=context["height"], licence=video_asset["licence"], provenance={"ffmpeg": "5.1.9", "source_render_hash": video_asset["content_hash"]})
     all_assets = [*scene_result["assets"], *narration["assets"], video_asset, thumb_asset]
-    manifest = {"schema_version": "1.0", "production_id": str(production_id), "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_tier": context["render_tier"], "brand": {"channel_profile_id": context["channel_profile_id"], "channel_profile_version": context["channel_profile_version"], "brand_hash": context["brand_hash"], "brand_kit": brand_kit}, "scenes": [{"scene_version_id": item["id"], "scene_hash": item["content_hash"], "production_duration_seconds": item["duration_seconds"], "storyboard_duration_seconds": item.get("storyboard_duration_seconds", item["duration_seconds"]), "scene_spec": item["scene_spec"]} for item in context["scenes"]], "narration": narration["narration"], "captions": [item for item in all_assets if item["asset_kind"].startswith("caption_")], "chapters": narration["chapters"], "sources": context["sources"], "assets": [{key: item[key] for key in ("id", "asset_kind", "object_key", "content_hash", "mime_type", "licence", "generation_provenance")} for item in all_assets], "render": {"asset_id": video_asset["id"], "content_hash": video_asset["content_hash"], "engine": engine, "engine_version": engine_version, "composition": composition, "settings": props, "probe": probe}}
+    manifest = {"schema_version": "1.0", "production_id": str(production_id), "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_tier": context["render_tier"], "source": {"source_kind": context.get("source_kind", "research_dossier"), "evidence_required": context.get("evidence_required", True)}, "brand": {"channel_profile_id": context["channel_profile_id"], "channel_profile_version": context["channel_profile_version"], "brand_hash": context["brand_hash"], "brand_kit": brand_kit}, "scenes": [{"scene_version_id": item["id"], "scene_hash": item["content_hash"], "production_duration_seconds": item["duration_seconds"], "storyboard_duration_seconds": item.get("storyboard_duration_seconds", item["duration_seconds"]), "scene_spec": item["scene_spec"]} for item in context["scenes"]], "narration": narration["narration"], "captions": [item for item in all_assets if item["asset_kind"].startswith("caption_")], "chapters": narration["chapters"], "sources": context["sources"], "assets": [{key: item[key] for key in ("id", "asset_kind", "object_key", "content_hash", "mime_type", "licence", "generation_provenance")} for item in all_assets], "render": {"asset_id": video_asset["id"], "content_hash": video_asset["content_hash"], "engine": engine, "engine_version": engine_version, "composition": composition, "settings": props, "probe": probe}}
     manifest_body = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     manifest_key = f"productions/{production_id}/production-manifest.json"
     await _put(minio, settings.minio_bucket, manifest_key, manifest_body, "application/json")
@@ -669,6 +675,7 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     expired_sources = [item for item in context["sources"] if (now - datetime.fromisoformat(item["retrieved_at"])).days > freshness_days]
     verification_issues = (context.get("verification_report") or {}).get("issues", [])
     contradiction_issues = [item for item in verification_issues if "contradict" in str(item.get("code", "")).lower()]
+    evidence_required = bool(context.get("evidence_required", True))
     caption_overflow = [item["segment_key"] for item in context["segments"] if len(item["narration"]) > caption_max_characters]
     caption_rate = max((len(item["narration"].split()) / max(0.1, float(item["duration_seconds"])) for item in context["segments"]), default=0.0)
     silence_ratio = scan["silence_seconds"] / max(0.1, probed_duration)
@@ -682,9 +689,11 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
                JOIN storyboard_versions bv ON bv.id=mp.storyboard_version_id
                JOIN storyboards b ON b.id=bv.storyboard_id
                JOIN scripts s ON s.id=b.script_id
-               JOIN opportunities o ON o.id=s.opportunity_id
-               JOIN subject_profiles sp ON sp.id=o.subject_profile_id
-               WHERE sp.channel_profile_id=$1 AND mp.id<>$2 AND ma.asset_kind='visual'""",
+               LEFT JOIN opportunities o ON o.id=s.opportunity_id
+               LEFT JOIN subject_profiles sp ON sp.id=o.subject_profile_id
+               LEFT JOIN production_briefs pb ON pb.id=s.production_brief_id
+               WHERE COALESCE(sp.channel_profile_id,pb.channel_profile_id)=$1
+                 AND mp.id<>$2 AND ma.asset_kind='visual'""",
             UUID(context["channel_profile_id"]), production_id,
         )
         prior_hashes = {row["content_hash"] for row in prior_rows}
@@ -695,15 +704,15 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     findings = [
         {"code": "media_decodable", "verdict": "pass" if has_video and has_audio else "fail", "message": "ffprobe found video and audio streams." if has_video and has_audio else "Render is corrupt or is missing a required stream.", "override_policy": "never", "details": {"has_video": has_video, "has_audio": has_audio}},
         {"code": "timing_alignment", "verdict": "pass" if abs(probed_duration - expected_duration) <= 1 else "fail", "message": "Render timing matches the approved storyboard." if abs(probed_duration - expected_duration) <= 1 else "Render duration diverges from storyboard timing.", "override_policy": "never", "details": {"expected_seconds": expected_duration, "actual_seconds": probed_duration}},
-        {"code": "claim_evidence_coverage", "verdict": "pass" if context["claims"]["total"] == context["claims"]["supported"] else "fail", "message": "Every narrated claim has supporting evidence." if context["claims"]["total"] == context["claims"]["supported"] else "One or more narrated claims lack supporting evidence.", "override_policy": "never", "details": context["claims"]},
+        {"code": "claim_evidence_coverage", "verdict": "pass" if (not evidence_required or context["claims"]["total"] == context["claims"]["supported"]) else "fail", "message": "Evidence coverage is not applicable for direct scripted-video input." if not evidence_required else ("Every narrated claim has supporting evidence." if context["claims"]["total"] == context["claims"]["supported"] else "One or more narrated claims lack supporting evidence."), "override_policy": "never", "details": {**context["claims"], "evidence_required": evidence_required}},
         {"code": "asset_licences", "verdict": "pass" if licences_clear else "fail", "message": "Every production asset has a cleared licence basis." if licences_clear else "An asset licence is unresolved.", "override_policy": "never", "details": {"asset_count": len(all_assets)}},
         {"code": "captions_present", "verdict": "pass" if len(caption_assets) == 2 else "fail", "message": "SRT and WebVTT captions are present." if len(caption_assets) == 2 else "Required caption formats are missing.", "override_policy": "never", "details": {"formats": [item["mime_type"] for item in caption_assets]}},
-        {"code": "contradictions_and_freshness", "verdict": "pass" if not contradiction_issues and not expired_sources else "fail", "message": "No unresolved contradiction omissions or expired evidence snapshots were found." if not contradiction_issues and not expired_sources else "Contradiction review or source freshness requires attention.", "override_policy": "reasoned", "details": {"contradiction_issues": contradiction_issues, "expired_source_ids": [item["id"] for item in expired_sources], "freshness_days": freshness_days}},
+        {"code": "contradictions_and_freshness", "verdict": "pass" if (not evidence_required or (not contradiction_issues and not expired_sources)) else "fail", "message": "Evidence freshness is not applicable for direct scripted-video input." if not evidence_required else ("No unresolved contradiction omissions or expired evidence snapshots were found." if not contradiction_issues and not expired_sources else "Contradiction review or source freshness requires attention."), "override_policy": "reasoned", "details": {"contradiction_issues": contradiction_issues, "expired_source_ids": [item["id"] for item in expired_sources], "freshness_days": freshness_days, "evidence_required": evidence_required}},
         {"code": "audio_levels", "verdict": "pass" if minimum_mean_volume <= scan["mean_volume_db"] <= maximum_mean_volume and scan["max_volume_db"] <= maximum_peak_volume else "fail", "message": "Audio loudness and peak levels are within channel thresholds." if minimum_mean_volume <= scan["mean_volume_db"] <= maximum_mean_volume and scan["max_volume_db"] <= maximum_peak_volume else "Audio is too quiet, too loud, or clipping.", "override_policy": "never", "details": {**scan, "mean_volume_range_db": [minimum_mean_volume, maximum_mean_volume], "maximum_peak_volume_db": maximum_peak_volume}},
         {"code": "audio_silence", "verdict": "pass" if silence_ratio <= maximum_silence_ratio else "fail", "message": "No excessive silence was detected." if silence_ratio <= maximum_silence_ratio else "Excessive silence was detected in the mastered audio.", "override_policy": "reasoned", "details": {"silence_ratio": silence_ratio, "maximum_silence_ratio": maximum_silence_ratio}},
         {"code": "black_and_frozen_frames", "verdict": "fail" if scan["black_segments"] else ("warn" if scan["freeze_segments"] else "pass"), "message": "No black or frozen frame runs were detected." if not scan["black_segments"] and not scan["freeze_segments"] else "Black or frozen frame runs require visual review.", "override_policy": "reasoned", "details": {"black_segments": scan["black_segments"], "freeze_segments": scan["freeze_segments"]}},
         {"code": "caption_readability_and_sync", "verdict": "fail" if abs(narration["duration_seconds"] - probed_duration) > 1 else ("warn" if caption_overflow or caption_rate > caption_max_words_per_second else "pass"), "message": "Caption timing, line length and reading rate are within thresholds." if not caption_overflow and caption_rate <= caption_max_words_per_second and abs(narration["duration_seconds"] - probed_duration) <= 1 else "Caption timing or readability requires review.", "override_policy": "reasoned", "details": {"overflow_segment_keys": caption_overflow, "maximum_words_per_second": caption_rate, "threshold_words_per_second": caption_max_words_per_second, "sync_delta_seconds": abs(narration["duration_seconds"] - probed_duration)}},
-        {"code": "chapters_sources_accessibility", "verdict": "pass" if narration["chapters"] and context["sources"] and all(scene["scene_spec"].get("accessibility_notes") for scene in context["scenes"]) else "fail", "message": "Chapters, source list and scene accessibility notes are present.", "override_policy": "reasoned", "details": {"chapters": len(narration["chapters"]), "sources": len(context["sources"])}},
+        {"code": "chapters_sources_accessibility", "verdict": "pass" if narration["chapters"] and (context["sources"] or not evidence_required) and all(scene["scene_spec"].get("accessibility_notes") for scene in context["scenes"]) else "fail", "message": "Chapters and scene accessibility notes are present; source list is not applicable." if not evidence_required and narration["chapters"] else "Chapters, source list and scene accessibility notes are present.", "override_policy": "reasoned", "details": {"chapters": len(narration["chapters"]), "sources": len(context["sources"]), "evidence_required": evidence_required}},
         {"code": "synthetic_disclosure", "verdict": "pass" if not synthetic_assets or disclosed else "fail", "message": "Synthetic visual and narration disclosure is recorded in the manifest and description." if not synthetic_assets or disclosed else "Synthetic assets exist without the required disclosure.", "override_policy": "reasoned", "details": {"disclosed": disclosed, "synthetic_asset_count": len(synthetic_assets)}},
         {"code": "repeated_asset_similarity", "verdict": "warn" if len({item["content_hash"] for item in scene_result["assets"]}) < len(scene_result["assets"]) else "pass", "message": "Scene asset hashes were checked for exact repetition.", "override_policy": "reasoned", "details": {"scene_assets": len(scene_result["assets"]), "unique_hashes": len({item["content_hash"] for item in scene_result["assets"]})}},
         {"code": "prior_video_similarity", "verdict": "warn" if prior_overlap else "pass", "message": "Scene asset hashes were compared with prior channel productions.", "override_policy": "reasoned", "details": {"overlapping_asset_hashes": prior_overlap, "prior_asset_hashes": len(prior_hashes)}},

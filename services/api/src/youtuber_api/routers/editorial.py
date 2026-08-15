@@ -23,6 +23,7 @@ from editorial_core.editorial import (
     validate_storyboard,
     verify_script_draft,
 )
+from editorial_core.direct_scripted_video import parse_direct_scripted_video
 from youtuber_api.audit import append_audit
 from youtuber_api.db import get_session
 from youtuber_api.editorial_gateway import TemporalEditorialGateway
@@ -36,6 +37,7 @@ from youtuber_api.models import (
     EvidenceExcerptModel,
     MediaProductionModel,
     OpportunityModel,
+    ProductionBriefModel,
     ResearchDossierModel,
     SceneAlternativeModel,
     SceneModel,
@@ -56,6 +58,9 @@ from youtuber_api.models import (
 )
 from youtuber_api.schemas import (
     AutomaticContinuation,
+    DirectScriptedVideoImportStart,
+    DirectScriptedVideoPreviewStart,
+    DirectScriptedVideoPreviewView,
     EditorialApprovalWrite,
     ExistingResearchScriptImportStart,
     MediaProductionStart,
@@ -89,6 +94,7 @@ Editor = Annotated[UserModel, Depends(require(Permission.EDIT_EDITORIAL))]
 _WORKFLOW_ID = re.compile(r"^[a-zA-Z0-9_.:-]{1,240}$")
 _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TERMINATED", "TIMED_OUT"}
 _EDITORIAL_WORKFLOWS = {
+    "direct-scripted-video-import",
     "script-import-existing-research",
     "script-generation",
     "script-regeneration",
@@ -376,6 +382,94 @@ async def start_existing_research_script_import(
     return await _workflow_view(session, gateway, workflow_id)
 
 
+@router.post(
+    "/direct-scripted-video-preview",
+    response_model=DirectScriptedVideoPreviewView,
+)
+async def preview_direct_scripted_video(
+    payload: DirectScriptedVideoPreviewStart,
+    _: Editor,
+) -> DirectScriptedVideoPreviewView:
+    try:
+        parsed = parse_direct_scripted_video(
+            payload.master_script,
+            title=payload.title,
+            target_wpm_min=payload.target_wpm_min,
+            target_wpm_max=payload.target_wpm_max,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return DirectScriptedVideoPreviewView.model_validate(parsed.preview())
+
+
+@router.post(
+    "/direct-scripted-video-runs",
+    response_model=ResearchWorkflowView,
+    status_code=202,
+)
+async def start_direct_scripted_video_import(
+    payload: DirectScriptedVideoImportStart,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ResearchWorkflowView:
+    channel = await session.get(ChannelProfileModel, payload.channel_profile_id)
+    if channel is None or channel.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Active channel profile not found")
+    try:
+        parsed = parse_direct_scripted_video(
+            payload.master_script,
+            title=payload.title,
+            target_wpm_min=payload.target_wpm_min,
+            target_wpm_max=payload.target_wpm_max,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    workflow_id = f"direct-scripted-video-import-{payload.idempotency_key}"
+    workflow_payload = {
+        "workflow_id": workflow_id,
+        "channel_profile_id": str(channel.id),
+        "title": payload.title,
+        "master_script": payload.master_script,
+        "master_script_hash": hashlib.sha256(payload.master_script.encode()).hexdigest(),
+        "target_wpm_min": payload.target_wpm_min,
+        "target_wpm_max": payload.target_wpm_max,
+        "sensitivity": payload.sensitivity,
+        "idempotency_key": payload.idempotency_key,
+        "actor_id": str(actor.id),
+        "correlation_id": request.state.correlation_id,
+    }
+    gateway = _gateway(request)
+    _, reconciled = await _start_tracked(
+        session,
+        gateway,
+        workflow_type="direct-scripted-video-import",
+        payload=workflow_payload,
+        actor=actor,
+        correlation_id=request.state.correlation_id,
+    )
+    await append_audit(
+        session,
+        action=(
+            "script.direct_scripted_video_import_reconciled"
+            if reconciled
+            else "script.direct_scripted_video_import_started"
+        ),
+        actor_id=actor.id,
+        target_type="channel_profile",
+        target_id=str(channel.id),
+        correlation_id=request.state.correlation_id,
+        context={
+            "workflow_id": workflow_id,
+            "scene_count": parsed.scene_count,
+            "placeholder_tokens": list(parsed.placeholder_tokens),
+            "master_script_hash": workflow_payload["master_script_hash"],
+        },
+    )
+    await session.commit()
+    return await _workflow_view(session, gateway, workflow_id)
+
+
 @router.post("/scripts/{script_id}/storyboard-runs", response_model=ResearchWorkflowView, status_code=202)
 async def start_storyboard_run(
     script_id: UUID,
@@ -434,6 +528,11 @@ async def start_script_verification_run(
     script = await session.get(ScriptModel, script_id)
     if script is None or script.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Script not found")
+    if script.source_kind == "direct_scripted_video":
+        raise HTTPException(
+            status_code=409,
+            detail="Direct scripted-video scripts do not use independent evidence verification",
+        )
     version = await session.get(ScriptVersionModel, script.current_version_id)
     if version is None:
         raise HTTPException(status_code=409, detail="Script has no current version")
@@ -488,6 +587,11 @@ async def start_script_regeneration_run(
     script = await session.get(ScriptModel, script_id)
     if script is None or script.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Script not found")
+    if script.source_kind == "direct_scripted_video":
+        raise HTTPException(
+            status_code=409,
+            detail="Direct scripted-video scripts cannot use evidence-bound regeneration",
+        )
     version = await session.get(ScriptVersionModel, script.current_version_id)
     if version is None:
         raise HTTPException(status_code=409, detail="Script has no current version")
@@ -742,9 +846,16 @@ async def _script_detail(session: AsyncSession, script: ScriptModel) -> ScriptDe
                 ],
             }
         )
+    channel_profile_id = await _script_channel_profile_id(session, script)
+    evidence_required = bool(version.verification_report.get("evidence_required", True))
     return ScriptDetailView(
         id=script.id,
         dossier_id=script.research_dossier_id,
+        opportunity_id=script.opportunity_id,
+        production_brief_id=script.production_brief_id,
+        channel_profile_id=channel_profile_id,
+        source_kind=script.source_kind,
+        evidence_required=evidence_required,
         status=script.status,
         version=version.version_number,
         current_version_id=version.id,
@@ -757,6 +868,24 @@ async def _script_detail(session: AsyncSession, script: ScriptModel) -> ScriptDe
     )
 
 
+async def _script_channel_profile_id(
+    session: AsyncSession, script: ScriptModel
+) -> UUID | None:
+    if script.production_brief_id:
+        return await session.scalar(
+            select(ProductionBriefModel.channel_profile_id).where(
+                ProductionBriefModel.id == script.production_brief_id
+            )
+        )
+    if script.opportunity_id:
+        return await session.scalar(
+            select(SubjectProfileModel.channel_profile_id)
+            .join(OpportunityModel, OpportunityModel.subject_profile_id == SubjectProfileModel.id)
+            .where(OpportunityModel.id == script.opportunity_id)
+        )
+    return None
+
+
 @router.get("/scripts", response_model=list[ScriptSummaryView])
 async def list_scripts(
     _: Viewer, session: Annotated[AsyncSession, Depends(get_session)]
@@ -764,10 +893,11 @@ async def list_scripts(
     scripts = list(
         await session.scalars(
             select(ScriptModel)
-            .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+            .outerjoin(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
             .where(
                 ScriptModel.deleted_at.is_(None),
-                OpportunityModel.deleted_at.is_(None),
+                (ScriptModel.source_kind == "direct_scripted_video")
+                | (OpportunityModel.deleted_at.is_(None)),
             )
             .order_by(ScriptModel.created_at.desc())
         )
@@ -823,6 +953,52 @@ def _edit_core_segments(payload: ScriptVersionEdit) -> tuple[ScriptSegmentDraft,
     )
 
 
+def _direct_edit_report(payload: ScriptVersionEdit) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    for segment in payload.segments:
+        if not segment.annotations:
+            issues.append(
+                {
+                    "code": "missing_editorial_annotation",
+                    "severity": "error",
+                    "segment_key": segment.segment_key,
+                    "statement": None,
+                    "message": "Direct scripted-video segments need at least one editorial annotation.",
+                }
+            )
+        for annotation in segment.annotations:
+            if annotation.claim_ids or annotation.evidence_excerpt_id:
+                issues.append(
+                    {
+                        "code": "direct_mode_claim_link",
+                        "severity": "error",
+                        "segment_key": segment.segment_key,
+                        "statement": annotation.text,
+                        "message": "Direct scripted-video mode cannot reference dossier claims or evidence excerpts.",
+                    }
+                )
+            if annotation.kind not in {"editorial", "opinion"}:
+                issues.append(
+                    {
+                        "code": "direct_mode_factual_annotation",
+                        "severity": "error",
+                        "segment_key": segment.segment_key,
+                        "statement": annotation.text,
+                        "message": "Direct scripted-video mode stores operator-supplied narration without factual evidence labels.",
+                    }
+                )
+    return {
+        "valid": not any(item["severity"] == "error" for item in issues),
+        "coverage_percent": 0,
+        "issues": issues,
+    }
+
+
+def _direct_placeholders(payload: ScriptVersionEdit) -> list[str]:
+    text = _canonical(payload.model_dump(mode="json"))
+    return sorted(set(re.findall(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]", text)))
+
+
 @router.post("/scripts/{script_id}/versions", response_model=ScriptDetailView, status_code=201)
 async def edit_script_version(
     script_id: UUID,
@@ -870,43 +1046,75 @@ async def edit_script_version(
                 status_code=409,
                 detail=f"Locked segment {old.segment_key} cannot be changed or unlocked",
             )
-    claims = list(
-        await session.scalars(
-            select(ClaimModel).where(
-                ClaimModel.research_dossier_id == script.research_dossier_id,
-                ClaimModel.status == "approved",
-                ClaimModel.deleted_at.is_(None),
+    if script.source_kind == "direct_scripted_video":
+        direct_report = _direct_edit_report(payload)
+        parent_report = parent.verification_report or {}
+        report = None
+        coverage_percent = direct_report["coverage_percent"]
+        status = "verified" if direct_report["valid"] else "blocked"
+        verification_report = {
+            "valid": direct_report["valid"],
+            "deterministic_valid": direct_report["valid"],
+            "requires_independent_verification": False,
+            "evidence_required": False,
+            "claim_coverage_applicable": False,
+            "mode": "direct_scripted_video",
+            "source_kind": "direct_scripted_video",
+            "coverage_percent": coverage_percent,
+            "issues": direct_report["issues"],
+            "placeholder_tokens": _direct_placeholders(payload),
+            "unresolved_placeholders": _direct_placeholders(payload),
+            "edit_comment": payload.comment,
+            "direct_storyboard": parent_report.get("direct_storyboard", {"scenes": []}),
+        }
+    else:
+        claims = list(
+            await session.scalars(
+                select(ClaimModel).where(
+                    ClaimModel.research_dossier_id == script.research_dossier_id,
+                    ClaimModel.status == "approved",
+                    ClaimModel.deleted_at.is_(None),
+                )
             )
         )
-    )
-    approved_claim_ids = [str(item.id) for item in claims]
-    central_claim_ids = [str(item.id) for item in claims if item.central]
-    evidence_rows = (
-        await session.execute(
-            select(ClaimEvidenceModel, EvidenceExcerptModel)
-            .join(
-                EvidenceExcerptModel,
-                EvidenceExcerptModel.id == ClaimEvidenceModel.evidence_excerpt_id,
+        approved_claim_ids = [str(item.id) for item in claims]
+        central_claim_ids = [str(item.id) for item in claims if item.central]
+        evidence_rows = (
+            await session.execute(
+                select(ClaimEvidenceModel, EvidenceExcerptModel)
+                .join(
+                    EvidenceExcerptModel,
+                    EvidenceExcerptModel.id == ClaimEvidenceModel.evidence_excerpt_id,
+                )
+                .where(
+                    ClaimEvidenceModel.claim_id.in_([item.id for item in claims]),
+                    ClaimEvidenceModel.relationship.in_(["supports", "context"]),
+                )
             )
-            .where(
-                ClaimEvidenceModel.claim_id.in_([item.id for item in claims]),
-                ClaimEvidenceModel.relationship.in_(["supports", "context"]),
-            )
+        ).all()
+        evidence_text: dict[str, str] = {}
+        evidence_claims: dict[str, list[str]] = {}
+        for link, excerpt in evidence_rows:
+            excerpt_id = str(excerpt.id)
+            evidence_text[excerpt_id] = excerpt.exact_text
+            evidence_claims.setdefault(excerpt_id, []).append(str(link.claim_id))
+        verified = verify_script_draft(
+            _edit_core_segments(payload),
+            approved_claim_ids=approved_claim_ids,
+            central_claim_ids=central_claim_ids,
+            evidence_text_by_id=evidence_text,
+            evidence_claim_ids_by_id=evidence_claims,
         )
-    ).all()
-    evidence_text: dict[str, str] = {}
-    evidence_claims: dict[str, list[str]] = {}
-    for link, excerpt in evidence_rows:
-        excerpt_id = str(excerpt.id)
-        evidence_text[excerpt_id] = excerpt.exact_text
-        evidence_claims.setdefault(excerpt_id, []).append(str(link.claim_id))
-    report = verify_script_draft(
-        _edit_core_segments(payload),
-        approved_claim_ids=approved_claim_ids,
-        central_claim_ids=central_claim_ids,
-        evidence_text_by_id=evidence_text,
-        evidence_claim_ids_by_id=evidence_claims,
-    )
+        report = verified
+        coverage_percent = verified.coverage_percent
+        status = "draft" if verified.valid else "blocked"
+        verification_report = {
+            "valid": False,
+            "deterministic_valid": verified.valid,
+            "requires_independent_verification": verified.valid,
+            "issues": [item.__dict__ for item in verified.issues],
+            "edit_comment": payload.comment,
+        }
     next_number = int(
         await session.scalar(
             select(func.coalesce(func.max(ScriptVersionModel.version_number), 0) + 1)
@@ -920,14 +1128,6 @@ async def edit_script_version(
         "segments": [item.model_dump(mode="json") for item in payload.segments],
     }
     content_hash = hashlib.sha256(_canonical(document).encode()).hexdigest()
-    status = "draft" if report.valid else "blocked"
-    verification_report = {
-        "valid": False,
-        "deterministic_valid": report.valid,
-        "requires_independent_verification": report.valid,
-        "issues": [item.__dict__ for item in report.issues],
-        "edit_comment": payload.comment,
-    }
     session.add(
         ScriptVersionModel(
             id=version_id,
@@ -941,7 +1141,7 @@ async def edit_script_version(
             writer_prompt_id=parent.writer_prompt_id,
             verifier_prompt_id=None,
             verification_report=verification_report,
-            coverage_percent=report.coverage_percent,
+            coverage_percent=coverage_percent,
             content_hash=content_hash,
             parent_version_id=parent.id,
             workflow_id=f"manual-script-edit-{version_id}",
@@ -971,20 +1171,21 @@ async def edit_script_version(
                 created_at=now,
             )
         )
-        for annotation in segment.annotations:
-            for claim_id in annotation.claim_ids:
-                session.add(
-                    SegmentClaimModel(
-                        script_segment_id=segment_id,
-                        claim_id=claim_id,
-                        evidence_excerpt_id=annotation.evidence_excerpt_id,
-                        statement_text=annotation.text,
-                        start_offset=annotation.start_offset,
-                        end_offset=annotation.end_offset,
-                        statement_kind=annotation.kind,
-                        created_at=now,
+        if script.source_kind != "direct_scripted_video":
+            for annotation in segment.annotations:
+                for claim_id in annotation.claim_ids:
+                    session.add(
+                        SegmentClaimModel(
+                            script_segment_id=segment_id,
+                            claim_id=claim_id,
+                            evidence_excerpt_id=annotation.evidence_excerpt_id,
+                            statement_text=annotation.text,
+                            start_offset=annotation.start_offset,
+                            end_offset=annotation.end_offset,
+                            statement_kind=annotation.kind,
+                            created_at=now,
+                        )
                     )
-                )
     script.current_version_id = version_id
     script.status = status
     script.version += 1
@@ -1012,8 +1213,8 @@ async def edit_script_version(
             "version": next_number,
             "parent_version_id": str(parent.id),
             "content_hash": content_hash,
-            "deterministic_valid": report.valid,
-            "requires_independent_verification": report.valid,
+            "deterministic_valid": verification_report["deterministic_valid"],
+            "requires_independent_verification": verification_report["requires_independent_verification"],
         },
     )
     await session.commit()
@@ -1050,6 +1251,8 @@ async def approve_script(
             policy_snapshot={
                 "verification_valid": True,
                 "coverage_percent": version.coverage_percent,
+                "source_kind": script.source_kind,
+                "evidence_required": bool(version.verification_report.get("evidence_required", True)),
             },
             supersedes_approval_id=None,
             actor_id=actor.id,
@@ -1172,6 +1375,28 @@ async def _storyboard_detail(
     )
 
 
+async def _storyboard_placeholder_tokens(
+    session: AsyncSession, storyboard_version_id: UUID
+) -> list[str]:
+    source_kind = await session.scalar(
+        select(ScriptModel.source_kind)
+        .join(StoryboardModel, StoryboardModel.script_id == ScriptModel.id)
+        .join(StoryboardVersionModel, StoryboardVersionModel.storyboard_id == StoryboardModel.id)
+        .where(StoryboardVersionModel.id == storyboard_version_id)
+    )
+    if source_kind != "direct_scripted_video":
+        return []
+    rows = list(
+        await session.scalars(
+            select(SceneVersionModel.scene_spec).where(
+                SceneVersionModel.storyboard_version_id == storyboard_version_id
+            )
+        )
+    )
+    text = _canonical(rows)
+    return sorted(set(re.findall(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]", text)))
+
+
 @router.get("/storyboards", response_model=list[StoryboardSummaryView])
 async def list_storyboards(
     _: Viewer, session: Annotated[AsyncSession, Depends(get_session)]
@@ -1180,11 +1405,12 @@ async def list_storyboards(
         await session.scalars(
             select(StoryboardModel)
             .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
-            .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+            .outerjoin(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
             .where(
                 StoryboardModel.deleted_at.is_(None),
                 ScriptModel.deleted_at.is_(None),
-                OpportunityModel.deleted_at.is_(None),
+                (ScriptModel.source_kind == "direct_scripted_video")
+                | (OpportunityModel.deleted_at.is_(None)),
             )
             .order_by(StoryboardModel.created_at.desc())
         )
@@ -1667,85 +1893,114 @@ async def approve_storyboard(
             message="Media production already exists for this approved storyboard version.",
         )
     else:
-        channel = await session.scalar(
-            select(ChannelProfileModel)
-            .join(SubjectProfileModel, SubjectProfileModel.channel_profile_id == ChannelProfileModel.id)
-            .join(OpportunityModel, OpportunityModel.subject_profile_id == SubjectProfileModel.id)
-            .join(ScriptModel, ScriptModel.opportunity_id == OpportunityModel.id)
-            .where(ScriptModel.id == storyboard.script_id)
-        )
-        render_settings = channel.default_render_settings if channel else {}
-        workflow_key = str(render_settings.get("workflow_key", ""))
-        workflow_statement = (
-            select(ComfyWorkflowVersionModel)
-            .join(
-                ComfyWorkflowHeadModel,
-                ComfyWorkflowHeadModel.active_version_id == ComfyWorkflowVersionModel.id,
-            )
-            .where(ComfyWorkflowVersionModel.approval_state == "approved")
-            .order_by(ComfyWorkflowVersionModel.workflow_key)
-        )
-        if workflow_key:
-            workflow_statement = workflow_statement.where(
-                ComfyWorkflowVersionModel.workflow_key == workflow_key
-            )
-        comfy_workflow = await session.scalar(workflow_statement.limit(1))
-        voice_key = str(render_settings.get("voice_profile_key", ""))
-        voice_statement = (
-            select(VoiceProfileVersionModel)
-            .join(
-                VoiceProfileHeadModel,
-                VoiceProfileHeadModel.active_version_id == VoiceProfileVersionModel.id,
-            )
-            .where(VoiceProfileVersionModel.enabled.is_(True))
-            .order_by(VoiceProfileVersionModel.profile_key)
-        )
-        if voice_key:
-            voice_statement = voice_statement.where(
-                VoiceProfileVersionModel.profile_key == voice_key
-            )
-        voice = await session.scalar(voice_statement.limit(1))
-        if comfy_workflow is None or voice is None:
+        unresolved = await _storyboard_placeholder_tokens(session, version.id)
+        if unresolved:
             continuation = AutomaticContinuation(
                 state="awaiting_input",
                 action="media_production",
-                message="Storyboard approval is recorded, but an active approved visual workflow and enabled voice profile are required.",
+                message=(
+                    "Storyboard approval is recorded, but media production is blocked until "
+                    f"unresolved placeholders are replaced: {', '.join(unresolved[:8])}."
+                ),
             )
         else:
-            configured_resolution = str(render_settings.get("resolution", ""))
-            try:
-                width_text, height_text = configured_resolution.lower().split("x", 1)
-                width, height = int(width_text), int(height_text)
-            except (AttributeError, TypeError, ValueError):
-                width, height = 854, 480
-            allowed = comfy_workflow.allowed_resolutions or []
-            if {"width": width, "height": height} not in allowed and allowed:
-                width, height = int(allowed[0]["width"]), int(allowed[0]["height"])
-            idempotency_key = f"approval-{version.id.hex}-v{version.version_number}"
-            from youtuber_api.routers.media import start_production
+            script_record = await session.get(ScriptModel, storyboard.script_id)
+            if script_record and script_record.production_brief_id:
+                channel = await session.scalar(
+                    select(ChannelProfileModel)
+                    .join(
+                        ProductionBriefModel,
+                        ProductionBriefModel.channel_profile_id == ChannelProfileModel.id,
+                    )
+                    .where(ProductionBriefModel.id == script_record.production_brief_id)
+                )
+            elif script_record and script_record.opportunity_id:
+                channel = await session.scalar(
+                    select(ChannelProfileModel)
+                    .join(
+                        SubjectProfileModel,
+                        SubjectProfileModel.channel_profile_id == ChannelProfileModel.id,
+                    )
+                    .join(
+                        OpportunityModel,
+                        OpportunityModel.subject_profile_id == SubjectProfileModel.id,
+                    )
+                    .where(OpportunityModel.id == script_record.opportunity_id)
+                )
+            else:
+                channel = None
+            render_settings = channel.default_render_settings if channel else {}
+            workflow_key = str(render_settings.get("workflow_key", ""))
+            workflow_statement = (
+                select(ComfyWorkflowVersionModel)
+                .join(
+                    ComfyWorkflowHeadModel,
+                    ComfyWorkflowHeadModel.active_version_id == ComfyWorkflowVersionModel.id,
+                )
+                .where(ComfyWorkflowVersionModel.approval_state == "approved")
+                .order_by(ComfyWorkflowVersionModel.workflow_key)
+            )
+            if workflow_key:
+                workflow_statement = workflow_statement.where(
+                    ComfyWorkflowVersionModel.workflow_key == workflow_key
+                )
+            comfy_workflow = await session.scalar(workflow_statement.limit(1))
+            voice_key = str(render_settings.get("voice_profile_key", ""))
+            voice_statement = (
+                select(VoiceProfileVersionModel)
+                .join(
+                    VoiceProfileHeadModel,
+                    VoiceProfileHeadModel.active_version_id == VoiceProfileVersionModel.id,
+                )
+                .where(VoiceProfileVersionModel.enabled.is_(True))
+                .order_by(VoiceProfileVersionModel.profile_key)
+            )
+            if voice_key:
+                voice_statement = voice_statement.where(
+                    VoiceProfileVersionModel.profile_key == voice_key
+                )
+            voice = await session.scalar(voice_statement.limit(1))
+            if comfy_workflow is None or voice is None:
+                continuation = AutomaticContinuation(
+                    state="awaiting_input",
+                    action="media_production",
+                    message="Storyboard approval is recorded, but an active approved visual workflow and enabled voice profile are required.",
+                )
+            else:
+                configured_resolution = str(render_settings.get("resolution", ""))
+                try:
+                    width_text, height_text = configured_resolution.lower().split("x", 1)
+                    width, height = int(width_text), int(height_text)
+                except (AttributeError, TypeError, ValueError):
+                    width, height = 854, 480
+                allowed = comfy_workflow.allowed_resolutions or []
+                if {"width": width, "height": height} not in allowed and allowed:
+                    width, height = int(allowed[0]["width"]), int(allowed[0]["height"])
+                idempotency_key = f"approval-{version.id.hex}-v{version.version_number}"
+                from youtuber_api.routers.media import start_production
 
-            run = await start_production(
-                MediaProductionStart(
-                    storyboard_version_id=version.id,
-                    expected_storyboard_hash=version.content_hash,
-                    render_tier=str(render_settings.get("render_tier", "preview")),
-                    workflow_key=comfy_workflow.workflow_key,
-                    voice_profile_key=voice.profile_key,
-                    width=width,
-                    height=height,
-                    fps=int(render_settings.get("fps", 24)),
-                    idempotency_key=idempotency_key,
-                ),
-                request,
-                actor,
-                session,
-            )
-            continuation = AutomaticContinuation(
-                state="started",
-                action="media_production",
-                workflow_id=run.workflow_id,
-                message="Media production and automated QA started from the approved storyboard hash.",
-            )
+                run = await start_production(
+                    MediaProductionStart(
+                        storyboard_version_id=version.id,
+                        expected_storyboard_hash=version.content_hash,
+                        render_tier=str(render_settings.get("render_tier", "preview")),
+                        workflow_key=comfy_workflow.workflow_key,
+                        voice_profile_key=voice.profile_key,
+                        width=width,
+                        height=height,
+                        fps=int(render_settings.get("fps", 24)),
+                        idempotency_key=idempotency_key,
+                    ),
+                    request,
+                    actor,
+                    session,
+                )
+                continuation = AutomaticContinuation(
+                    state="started",
+                    action="media_production",
+                    workflow_id=run.workflow_id,
+                    message="Media production and automated QA started from the approved storyboard hash.",
+                )
     await append_audit(
         session,
         action=f"automation.storyboard_{continuation.state}",

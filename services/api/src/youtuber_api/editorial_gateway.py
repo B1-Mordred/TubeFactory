@@ -22,6 +22,7 @@ class TemporalEditorialGateway(TemporalResearchGateway):
 
     async def start(self, workflow_type: str, request: dict[str, Any]) -> str:
         if workflow_type not in {
+            "direct-scripted-video-import",
             "script-import-existing-research",
             "script-generation",
             "script-regeneration",

@@ -103,6 +103,29 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+async def _direct_storyboard_placeholders(
+    session: AsyncSession, storyboard_version_id: UUID
+) -> list[str]:
+    source_kind = await session.scalar(
+        select(ScriptModel.source_kind)
+        .join(StoryboardModel, StoryboardModel.script_id == ScriptModel.id)
+        .join(StoryboardVersionModel, StoryboardVersionModel.storyboard_id == StoryboardModel.id)
+        .where(StoryboardVersionModel.id == storyboard_version_id)
+    )
+    if source_kind != "direct_scripted_video":
+        return []
+    specs = list(
+        await session.scalars(
+            select(SceneVersionModel.scene_spec).where(
+                SceneVersionModel.storyboard_version_id == storyboard_version_id
+            )
+        )
+    )
+    return sorted(
+        set(re.findall(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]", _canonical(specs).decode()))
+    )
+
+
 async def _commit(session: AsyncSession, detail: str) -> None:
     try:
         await session.commit()
@@ -280,11 +303,12 @@ async def list_productions(_: Viewer, session: Annotated[AsyncSession, Depends(g
             )
             .join(StoryboardModel, StoryboardModel.id == StoryboardVersionModel.storyboard_id)
             .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
-            .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+            .outerjoin(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
             .where(
                 StoryboardModel.deleted_at.is_(None),
                 ScriptModel.deleted_at.is_(None),
-                OpportunityModel.deleted_at.is_(None),
+                (ScriptModel.source_kind == "direct_scripted_video")
+                | (OpportunityModel.deleted_at.is_(None)),
             )
             .order_by(MediaProductionModel.created_at.desc())
             .limit(100)
@@ -321,6 +345,15 @@ async def start_production(
     approval = await session.scalar(select(ApprovalModel.id).where(ApprovalModel.target_type == "storyboard_version", ApprovalModel.target_id == storyboard.id, ApprovalModel.target_version == storyboard.version_number, ApprovalModel.target_hash == storyboard.content_hash, ApprovalModel.decision == "approved"))
     if approval is None:
         raise HTTPException(status_code=409, detail="Storyboard version has no exact-hash approval")
+    unresolved = await _direct_storyboard_placeholders(session, storyboard.id)
+    if unresolved:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Direct scripted-video media production is blocked until placeholders are resolved",
+                "placeholder_tokens": unresolved,
+            },
+        )
     workflow_head = await session.get(ComfyWorkflowHeadModel, payload.workflow_key)
     voice_head = await session.get(VoiceProfileHeadModel, payload.voice_profile_key)
     workflow = await session.get(ComfyWorkflowVersionModel, workflow_head.active_version_id) if workflow_head else None
@@ -457,28 +490,43 @@ async def approve_render(render_id: UUID, payload: RenderApprovalWrite, request:
     storyboard = await session.get(StoryboardVersionModel, production.storyboard_version_id)
     if storyboard.content_hash != production.storyboard_hash:
         raise HTTPException(status_code=409, detail="Production is stale against its bound storyboard")
-    policy_row = (
-        await session.execute(
-            select(SubjectProfileModel, OpportunityModel)
-            .join(OpportunityModel, OpportunityModel.subject_profile_id == SubjectProfileModel.id)
-            .join(ScriptModel, ScriptModel.opportunity_id == OpportunityModel.id)
-            .join(StoryboardModel, StoryboardModel.script_id == ScriptModel.id)
-            .join(StoryboardVersionModel, StoryboardVersionModel.storyboard_id == StoryboardModel.id)
-            .where(StoryboardVersionModel.id == production.storyboard_version_id)
-        )
-    ).one_or_none()
-    if policy_row is None:
-        raise HTTPException(status_code=409, detail="Production editorial policy lineage is unavailable")
-    subject, opportunity = policy_row
-    profile = subject.approval_profile or {}
-    policy_snapshot = evaluate_operating_policy(
-        mode=str(profile.get("mode", "assisted")), risk=subject.risk,
-        sensitive_topics=profile.get("sensitive_topics", []),
-    ).as_dict()
-    if payload.decision == "approved" and len(opportunity.editorial_rationale.strip()) < 20:
-        raise HTTPException(status_code=409, detail="Final approval requires the opportunity editorial rationale")
+    script = await session.scalar(
+        select(ScriptModel)
+        .join(StoryboardModel, StoryboardModel.script_id == ScriptModel.id)
+        .join(StoryboardVersionModel, StoryboardVersionModel.storyboard_id == StoryboardModel.id)
+        .where(StoryboardVersionModel.id == production.storyboard_version_id)
+    )
+    if script is None:
+        raise HTTPException(status_code=409, detail="Production script lineage is unavailable")
+    if script.source_kind == "direct_scripted_video":
+        policy_snapshot = {
+            "mode": "direct_scripted_video",
+            "risk": "operator_supplied",
+            "required_human_gates": ["script_approval", "storyboard_approval", "render_approval"],
+            "evidence_required": False,
+        }
+        editorial_rationale = "Direct scripted-video production; factual and business correctness accepted by reviewer."
+    else:
+        policy_row = (
+            await session.execute(
+                select(SubjectProfileModel, OpportunityModel)
+                .join(OpportunityModel, OpportunityModel.subject_profile_id == SubjectProfileModel.id)
+                .where(OpportunityModel.id == script.opportunity_id)
+            )
+        ).one_or_none()
+        if policy_row is None:
+            raise HTTPException(status_code=409, detail="Production editorial policy lineage is unavailable")
+        subject, opportunity = policy_row
+        profile = subject.approval_profile or {}
+        policy_snapshot = evaluate_operating_policy(
+            mode=str(profile.get("mode", "assisted")), risk=subject.risk,
+            sensitive_topics=profile.get("sensitive_topics", []),
+        ).as_dict()
+        if payload.decision == "approved" and len(opportunity.editorial_rationale.strip()) < 20:
+            raise HTTPException(status_code=409, detail="Final approval requires the opportunity editorial rationale")
+        editorial_rationale = opportunity.editorial_rationale
     previous = await session.scalar(select(ApprovalModel).where(ApprovalModel.target_type == "production_render", ApprovalModel.target_id == render.id).order_by(ApprovalModel.created_at.desc()).limit(1))
-    approval = ApprovalModel(id=uuid4(), target_type="production_render", target_id=render.id, target_version=render.render_number, target_hash=render.content_hash, decision=payload.decision, comment=payload.comment, policy_snapshot={"manifest_hash": manifest.content_hash, "qa_report_hash": report.content_hash, "unoverridden_failures": unoverridden_fail, "operating_policy": policy_snapshot, "editorial_rationale": opportunity.editorial_rationale}, supersedes_approval_id=previous.id if previous else None, actor_id=actor.id, correlation_id=request.state.correlation_id, created_at=datetime.now(timezone.utc))
+    approval = ApprovalModel(id=uuid4(), target_type="production_render", target_id=render.id, target_version=render.render_number, target_hash=render.content_hash, decision=payload.decision, comment=payload.comment, policy_snapshot={"manifest_hash": manifest.content_hash, "qa_report_hash": report.content_hash, "unoverridden_failures": unoverridden_fail, "operating_policy": policy_snapshot, "editorial_rationale": editorial_rationale}, supersedes_approval_id=previous.id if previous else None, actor_id=actor.id, correlation_id=request.state.correlation_id, created_at=datetime.now(timezone.utc))
     session.add(approval)
     await append_audit(session, action=f"production_render.{payload.decision}", actor_id=actor.id, target_type="production_render", target_id=str(render.id), correlation_id=request.state.correlation_id, context={"render_hash": render.content_hash, "manifest_hash": manifest.content_hash, "qa_report_hash": report.content_hash, "operating_policy": policy_snapshot})
     continuation: AutomaticContinuation | None = None

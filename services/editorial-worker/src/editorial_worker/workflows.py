@@ -2324,6 +2324,37 @@ async def _refine_script_with_verifier(
     return checked, verifier, latest_writer
 
 
+@workflow.defn(name="direct-scripted-video-import")
+class DirectScriptedVideoImportWorkflow:
+    def __init__(self) -> None:
+        self._state = "CREATED"
+        self._progress = 0
+        self._result: dict[str, Any] | None = None
+
+    @workflow.run
+    async def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._state = "IMPORTING_DIRECT_SCRIPT"
+        self._progress = 20
+        self._result = await workflow.execute_activity(
+            "persist-direct-scripted-video-import",
+            request,
+            start_to_close_timeout=timedelta(minutes=2),
+            retry_policy=_DB_RETRY,
+        )
+        self._state = "SCRIPT_VERIFIED"
+        self._progress = 100
+        return self._result
+
+    @workflow.query(name="status")
+    def status(self) -> dict[str, Any]:
+        return {
+            "workflow_id": workflow.info().workflow_id,
+            "state": self._state,
+            "progress": self._progress,
+            "result": self._result,
+        }
+
+
 @workflow.defn(name="script-import-existing-research")
 class ExistingResearchScriptImportWorkflow:
     def __init__(self) -> None:
@@ -2817,39 +2848,44 @@ class StoryboardGenerationWorkflow:
             start_to_close_timeout=timedelta(seconds=45),
             retry_policy=_DB_RETRY,
         )
-        self._state = "GENERATING_SCENES"
-        self._progress = 40
-        generated = await workflow.execute_activity(
-            "invoke-editorial-model",
-            {
-                "actor_id": context["actor_id"],
-                "correlation_id": context["correlation_id"],
-                "sensitivity": request.get("sensitivity", "internal"),
-                "task_type": "storyboard",
-                "routes": context["routes"],
-                "structured_inputs": context["structured_inputs"],
-                "additional_system_instructions": _additional_instructions(
-                    context, "storyboard"
-                ),
-            },
-            start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
-            retry_policy=_EDITORIAL_MODEL_RETRY,
-        )
-        self._state = "ASSEMBLING_SCENES"
-        self._progress = 60
-        assembled = await workflow.execute_activity(
-            "assemble-storyboard-draft",
-            {
-                "content_draft": generated["output"],
-                "expected_segment_ids": context["expected_segment_ids"],
-                "segment_durations": context["segment_durations"],
-                "segment_narrations": context["segment_narrations"],
-                "allowed_claim_ids": context["allowed_claim_ids"],
-                "allowed_source_ids": context["allowed_source_ids"],
-            },
-            start_to_close_timeout=timedelta(seconds=45),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        )
+        if context.get("source_kind") == "direct_scripted_video":
+            self._state = "MATERIALIZING_IMPORTED_SCENES"
+            self._progress = 55
+            assembled = {"draft": {"scenes": context["direct_storyboard_scenes"]}}
+        else:
+            self._state = "GENERATING_SCENES"
+            self._progress = 40
+            generated = await workflow.execute_activity(
+                "invoke-editorial-model",
+                {
+                    "actor_id": context["actor_id"],
+                    "correlation_id": context["correlation_id"],
+                    "sensitivity": request.get("sensitivity", "internal"),
+                    "task_type": "storyboard",
+                    "routes": context["routes"],
+                    "structured_inputs": context["structured_inputs"],
+                    "additional_system_instructions": _additional_instructions(
+                        context, "storyboard"
+                    ),
+                },
+                start_to_close_timeout=_EDITORIAL_MODEL_ACTIVITY_TIMEOUT,
+                retry_policy=_EDITORIAL_MODEL_RETRY,
+            )
+            self._state = "ASSEMBLING_SCENES"
+            self._progress = 60
+            assembled = await workflow.execute_activity(
+                "assemble-storyboard-draft",
+                {
+                    "content_draft": generated["output"],
+                    "expected_segment_ids": context["expected_segment_ids"],
+                    "segment_durations": context["segment_durations"],
+                    "segment_narrations": context["segment_narrations"],
+                    "allowed_claim_ids": context["allowed_claim_ids"],
+                    "allowed_source_ids": context["allowed_source_ids"],
+                },
+                start_to_close_timeout=timedelta(seconds=45),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
         self._state = "VALIDATING_SCENES"
         self._progress = 70
         validated = await workflow.execute_activity(
