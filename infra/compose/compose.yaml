@@ -75,6 +75,9 @@ services:
       context: ../..
       dockerfile: services/api/Dockerfile
     profiles: [core]
+    env_file:
+      - path: ../../.env.local
+        required: false
     environment:
       APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -118,6 +121,8 @@ services:
       - application
       - data
       - identity-egress
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -175,6 +180,9 @@ services:
       context: ../..
       dockerfile: services/editorial-worker/Dockerfile
     profiles: [core, gpu]
+    env_file:
+      - path: ../../.env.local
+        required: false
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
@@ -192,6 +200,7 @@ services:
       RENDER_ENDPOINT: http://render-service:8091
       COMFYUI_ENDPOINT: ${COMFYUI_ENDPOINT:-http://comfyui:8188}
     extra_hosts:
+      - "host.docker.internal:host-gateway"
       - "ai.b1.germering=${AI_SERVER_IPV4:-192.168.2.100}"
     secrets:
       - postgres_password
@@ -320,6 +329,9 @@ services:
       context: ../..
       dockerfile: services/research-worker/Dockerfile
     profiles: [research]
+    env_file:
+      - path: ../../.env.local
+        required: false
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
@@ -353,6 +365,8 @@ services:
       - data
       - research-egress
       - firecrawl-client
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

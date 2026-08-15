@@ -2282,6 +2282,7 @@ async def approve_storyboard(
                     VoiceProfileHeadModel.active_version_id == VoiceProfileVersionModel.id,
                 )
                 .where(VoiceProfileVersionModel.enabled.is_(True))
+                .where(VoiceProfileVersionModel.provider_type != "fake")
                 .order_by(VoiceProfileVersionModel.profile_key)
             )
             if voice_key:
@@ -2293,7 +2294,7 @@ async def approve_storyboard(
                 continuation = AutomaticContinuation(
                     state="awaiting_input",
                     action="media_production",
-                    message="Storyboard approval is recorded, but an active approved visual workflow and enabled voice profile are required.",
+                    message="Storyboard approval is recorded, but an active approved visual workflow and real enabled Voicebox voice profile are required.",
                 )
             else:
                 render_tier = str(render_settings.get("render_tier", "preview"))

@@ -1,11 +1,15 @@
 import base64
+import hashlib
 import io
+import json
 import wave
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
+import certifi
 import httpx
 import pytest
 import respx
-from unittest.mock import AsyncMock, patch
 
 from editorial_worker.comfyui import ComfyUICapabilityError, ComfyUIClient
 from editorial_worker.media_activities import (
@@ -34,6 +38,107 @@ async def test_voicebox_contract_decodes_audio():
     respx.post("http://voicebox:8000/synthesize").mock(return_value=httpx.Response(200, json={"audio_base64": base64.b64encode(b"RIFF").decode(), "duration_seconds": 1, "sample_rate": 48000, "engine": "fixture", "model_version": "1", "word_alignment": [], "warnings": []}))
     result = await VoiceboxRESTClient("http://voicebox:8000").synthesize({"text": "hello"})
     assert result.audio == b"RIFF"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_voicebox_b1_generate_stream_contract_returns_wav_with_authorization():
+    audio, _ = _fixture_wav("hallo welt", 1, 24_000)
+    route = respx.post("http://voicebox:8000/generate/stream").mock(
+        return_value=httpx.Response(200, content=audio, headers={"content-type": "audio/wav"})
+    )
+    result = await VoiceboxRESTClient("http://voicebox:8000", api_key="test-token").synthesize(
+        {
+            "provider_contract": "b1_generate_stream",
+            "voice_id": "voice-uuid",
+            "text": "hallo welt",
+            "language": "de",
+            "engine": "remote_http",
+            "model_version": "b1-local-voicebox",
+            "accept": "audio/wav",
+        }
+    )
+
+    assert result.audio == audio
+    assert result.sample_rate == 24_000
+    assert result.duration_seconds == 1
+    assert result.engine == "remote_http"
+    assert result.model_version == "b1-local-voicebox"
+    assert result.word_alignment[0]["timing_source"] == "estimated_from_b1_stream_duration"
+    request = route.calls[0].request
+    assert request.headers["authorization"] == "Bearer test-token"
+    assert json.loads(request.content) == {
+        "profile_id": "voice-uuid",
+        "text": "hallo welt",
+        "language": "de",
+        "engine": "remote_http",
+        "normalize": False,
+        "effects_chain": [],
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_voicebox_b1_generate_stream_retries_transient_admission_conflict():
+    audio, _ = _fixture_wav("hallo welt", 1, 24_000)
+    route = respx.post("http://voicebox:8000/generate/stream").mock(
+        side_effect=[
+            httpx.Response(
+                409,
+                json={"detail": {"message": "GPU scheduler lease is held by another owner"}},
+                headers={"retry-after": "0"},
+            ),
+            httpx.Response(200, content=audio, headers={"content-type": "audio/wav"}),
+        ]
+    )
+
+    result = await VoiceboxRESTClient("http://voicebox:8000").synthesize(
+        {
+            "provider_contract": "b1_generate_stream",
+            "voice_id": "voice-uuid",
+            "text": "hallo welt",
+            "language": "de",
+            "engine": "chatterbox",
+            "accept": "audio/wav",
+            "stream_generation_retry_attempts": 2,
+            "stream_generation_retry_backoff_seconds": 0,
+        }
+    )
+
+    assert result.audio == audio
+    assert result.warnings == ["B1 stream generation admitted after 2 attempts"]
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_voicebox_b1_generate_stream_can_bootstrap_profile_ca(tmp_path):
+    audio, _ = _fixture_wav("hallo welt", 1, 24_000)
+    certificate = Path(certifi.where()).read_bytes()
+    ca_path = tmp_path / "b1-root.crt"
+    respx.get("http://ca.local/root.crt").mock(return_value=httpx.Response(200, content=certificate))
+    respx.post("http://voicebox:8000/generate/stream").mock(
+        return_value=httpx.Response(200, content=audio, headers={"content-type": "audio/wav"})
+    )
+
+    result = await VoiceboxRESTClient(
+        "http://voicebox:8000",
+        ca_cert_bootstrap_url="http://ca.local/root.crt",
+        ca_cert_sha256=hashlib.sha256(certificate).hexdigest(),
+        ca_cert_path=str(ca_path),
+    ).synthesize(
+        {
+            "provider_contract": "b1_generate_stream",
+            "voice_id": "voice-uuid",
+            "text": "hallo welt",
+            "language": "de",
+            "engine": "chatterbox",
+            "accept": "audio/wav",
+        }
+    )
+
+    assert result.audio == audio
+    assert ca_path.read_bytes() == certificate
 
 
 @pytest.mark.asyncio

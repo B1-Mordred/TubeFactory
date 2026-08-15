@@ -13,6 +13,20 @@ def _secret(name: str) -> str:
     return Path(file_name).read_text(encoding="utf-8").strip()
 
 
+def _optional_secret(name: str) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return value.strip()
+    file_name = os.getenv(f"{name}_FILE")
+    if not file_name:
+        return None
+    path = Path(file_name)
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > 16_384:
+        return None
+    value = path.read_text(encoding="utf-8").strip()
+    return value or None
+
+
 @dataclass(frozen=True)
 class Settings:
     temporal_address: str = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
@@ -48,6 +62,10 @@ class Settings:
     @property
     def minio_secret_key(self) -> str:
         return _secret("MINIO_SECRET_KEY")
+
+    @property
+    def b1_api_key(self) -> str | None:
+        return _optional_secret("B1_API_KEY")
 
     def provider_secret(self, reference: str | None) -> str | None:
         if reference is None:

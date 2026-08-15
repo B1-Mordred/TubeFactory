@@ -693,14 +693,44 @@ async def generate_production_narration(context: dict[str, Any]) -> dict[str, An
     cursor = 0.0
     voice_client: VoiceboxRESTClient | VoiceboxWSClient | None = None
     if profile["provider_type"] == "voicebox_rest":
-        voice_client = VoiceboxRESTClient(profile["endpoint"])
+        tls_verify = profile["output_settings"].get("tls_verify", True)
+        if not isinstance(tls_verify, bool | str):
+            tls_verify = True
+        voice_client = VoiceboxRESTClient(
+            profile["endpoint"],
+            api_key=settings.b1_api_key,
+            tls_verify=tls_verify,
+            ca_cert_bootstrap_url=profile["output_settings"].get("ca_cert_bootstrap_url"),
+            ca_cert_sha256=profile["output_settings"].get("ca_cert_sha256"),
+            ca_cert_path=profile["output_settings"].get("tls_ca_cert_path"),
+        )
     elif profile["provider_type"] == "voicebox_ws":
         voice_client = VoiceboxWSClient(profile["endpoint"])
-    if voice_client is not None:
+    if voice_client is not None and profile["output_settings"].get("health_check", True):
         await voice_client.health()
     for segment in context["segments"]:
         activity.heartbeat(f"narration {segment['order']} of {len(context['segments'])}")
-        request = {"text": segment["narration"], "language": profile["language"], "voice_profile_version_id": profile["id"], "engine": profile["engine"], "delivery": profile["delivery"], "speed": profile["delivery"].get("speed", 1.0), "pronunciation": profile["pronunciation"], "output": {"format": "wav", "sample_rate": sample_rate}, "sampling": profile["output_settings"].get("sampling", {}), "consent": profile["consent"]}
+        request = {
+            "text": segment["narration"],
+            "language": profile["language"],
+            "voice_profile_version_id": profile["id"],
+            "voice_id": profile["voice_id"],
+            "engine": profile["engine"],
+            "model_version": profile["model_version"],
+            "provider_contract": profile["output_settings"].get("provider_contract", "provider_neutral_synthesize"),
+            "accept": profile["output_settings"].get("accept", "application/json"),
+            "normalize": bool(profile["output_settings"].get("normalize", False)),
+            "effects_chain": profile["output_settings"].get("effects_chain", []),
+            "stream_generation_retry_attempts": profile["output_settings"].get("stream_generation_retry_attempts", 8),
+            "stream_generation_retry_backoff_seconds": profile["output_settings"].get("stream_generation_retry_backoff_seconds", 5),
+            "stream_generation_retry_max_backoff_seconds": profile["output_settings"].get("stream_generation_retry_max_backoff_seconds", 30),
+            "delivery": profile["delivery"],
+            "speed": profile["delivery"].get("speed", 1.0),
+            "pronunciation": profile["pronunciation"],
+            "output": {"format": "wav", "sample_rate": sample_rate},
+            "sampling": profile["output_settings"].get("sampling", {}),
+            "consent": profile["consent"],
+        }
         chunks = stable_voice_chunks(segment["narration"], maximum_characters=int(profile["output_settings"].get("maximum_chunk_characters", 500)))
         request_hash = canonical_hash(request)
         voice_cache_key = canonical_hash({"kind": "voice_original", "request_hash": request_hash})

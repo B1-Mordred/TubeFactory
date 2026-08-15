@@ -460,6 +460,17 @@ def _voice_view(item: VoiceProfileVersionModel, active_id: UUID | None) -> Voice
     )
 
 
+def _ensure_production_voice(voice: VoiceProfileVersionModel | None) -> VoiceProfileVersionModel:
+    if voice is None or not voice.enabled:
+        raise HTTPException(status_code=409, detail="Select an active enabled voice profile")
+    if voice.provider_type == "fake":
+        raise HTTPException(
+            status_code=409,
+            detail="Fixture voice profiles only produce test tones. Select a real Voicebox voice profile for media production.",
+        )
+    return voice
+
+
 @router.get("/voice-profiles", response_model=list[VoiceProfileView])
 async def list_voice_profiles(
     _: Viewer, session: Annotated[AsyncSession, Depends(get_session)]
@@ -604,8 +615,7 @@ async def start_production(
     voice = await session.get(VoiceProfileVersionModel, voice_head.active_version_id) if voice_head else None
     if workflow is None or workflow.approval_state != "approved":
         raise HTTPException(status_code=409, detail="Select an active approved ComfyUI workflow")
-    if voice is None or not voice.enabled:
-        raise HTTPException(status_code=409, detail="Select an active enabled voice profile")
+    voice = _ensure_production_voice(voice)
     if {"width": payload.width, "height": payload.height} not in workflow.allowed_resolutions:
         raise HTTPException(status_code=422, detail="Resolution is not allowed by this workflow version")
     workflow_id = f"media-production-{payload.idempotency_key}"
@@ -688,8 +698,7 @@ async def start_timeline_draft(
     voice = await session.get(VoiceProfileVersionModel, voice_head.active_version_id) if voice_head else None
     if workflow is None or workflow.approval_state != "approved":
         raise HTTPException(status_code=409, detail="Select an active approved ComfyUI workflow")
-    if voice is None or not voice.enabled:
-        raise HTTPException(status_code=409, detail="Select an active enabled voice profile")
+    voice = _ensure_production_voice(voice)
     if {"width": payload.width, "height": payload.height} not in workflow.allowed_resolutions:
         raise HTTPException(status_code=422, detail="Resolution is not allowed by this workflow version")
     workflow_id = f"media-timeline-draft-{payload.idempotency_key}"
