@@ -460,6 +460,15 @@ def test_partial_chunk_generation_requires_an_existing_base_draft() -> None:
     assert "max_generation_attempts = 2 if base_draft is not None else 3" in source
 
 
+def test_scoped_verifier_repair_defaults_to_single_pass_before_fallback() -> None:
+    source = inspect.getsource(__import__(
+        "editorial_worker.workflows", fromlist=["_refine_script_with_verifier"]
+    )._refine_script_with_verifier)
+
+    assert "maximum_attempts: int | None = None" in source
+    assert "maximum_attempts = 1 if allowed_segment_keys is not None else 3" in source
+
+
 def test_verifier_correction_boundary_is_ordered_bounded_and_lock_aware() -> None:
     checked = {
         "draft": {
@@ -807,6 +816,96 @@ def test_extractive_fallback_avoids_repeating_selected_role_blocks() -> None:
         >= 45
         for segment in counter_segments
     )
+
+
+def test_extractive_fallback_reaches_format_floor_without_repeating_claim_text() -> None:
+    def approved_claim(statement: str, coverage_unit_id: str) -> dict:
+        return {
+            "id": str(uuid4()),
+            "normalized_statement": statement,
+            "claim_type": "fact",
+            "central": False,
+            "coverage_unit_ids": [coverage_unit_id],
+            "evidence": [{"evidence_excerpt_id": str(uuid4())}],
+        }
+
+    evidence = approved_claim(
+        "Heimische Lithiumgewinnung könnte Deutschland unabhängiger von Importen machen.",
+        "evidence",
+    )
+    mechanism = approved_claim(
+        "Lithium kann in Tiefenwasser gelöst vorkommen und mit technischer Extraktion gewonnen werden.",
+        "mechanism",
+    )
+    limit = approved_claim(
+        "Die Schätzung hängt von Konzentration, Effizienz, Geschwindigkeit und Extraktionsmittel ab.",
+        "limits",
+    )
+    open_question = approved_claim(
+        "Die Forschung entwickelt Verfahren, die Lithiumproduktion und geothermische Nutzung kombinieren.",
+        "open_questions",
+    )
+    checked = {
+        "draft": {
+            "title": "Geothermie und Lithium",
+            "segments": [
+                {
+                    "segment_key": key,
+                    "segment_type": segment_type,
+                    "presentation_purpose": "Fallback target",
+                    "annotations": [],
+                }
+                for key, segment_type in [
+                    ("02-thesis", "thesis"),
+                    ("05-evidence", "evidence"),
+                    ("06-counterevidence", "counterevidence"),
+                    ("07-counterevidence", "counterevidence"),
+                    ("08-evidence", "evidence"),
+                    ("09-uncertainty", "uncertainty"),
+                    ("10-conclusion", "conclusion"),
+                    ("11-call_to_action", "call_to_action"),
+                ]
+            ],
+        }
+    }
+    context = {
+        "script_policy": {
+            "target_word_range": [675, 1350],
+            "minimum_duration_seconds": 300,
+        },
+        "structured_inputs": {
+            "title": "Geothermie und Lithium",
+            "claims": [evidence, mechanism, limit, open_question],
+        },
+    }
+
+    content = _extractive_fallback_content(
+        context,
+        checked,
+        tuple(segment["segment_key"] for segment in checked["draft"]["segments"]),
+    )
+
+    sentences = [
+        sentence["text"]
+        for segment in content["segments"]
+        for sentence in segment["sentences"]
+        if len(sentence["text"].split()) >= 7
+    ]
+    total_words = sum(
+        len(sentence["text"].split())
+        for segment in content["segments"]
+        for sentence in segment["sentences"]
+    )
+    evidence_claim_uses = [
+        sentence
+        for segment in content["segments"]
+        for sentence in segment["sentences"]
+        if sentence["text"] == evidence["normalized_statement"]
+    ]
+
+    assert total_words >= _script_target_words(context["script_policy"])
+    assert len(sentences) == len(set(sentences))
+    assert len(evidence_claim_uses) == 1
 
 
 def test_safe_counterevidence_makes_no_factual_assertion() -> None:

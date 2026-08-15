@@ -1599,7 +1599,9 @@ def _extractive_fallback_content(
             ],
         }
 
-    def choose_claim(preferred_units: set[str]) -> dict[str, Any] | None:
+    def choose_claim(
+        preferred_units: set[str], *, allow_used: bool = False
+    ) -> dict[str, Any] | None:
         preferred = [
             claim
             for claim in claims
@@ -1610,7 +1612,9 @@ def _extractive_fallback_content(
             claim_id = str(claim.get("id"))
             if claim_id not in used_claim_ids:
                 return claim
-        return preferred[0] if preferred else (claims[0] if claims else None)
+        if allow_used:
+            return preferred[0] if preferred else (claims[0] if claims else None)
+        return None
 
     def word_count(sentences: list[dict[str, Any]]) -> int:
         return sum(len(str(sentence.get("text", "")).split()) for sentence in sentences)
@@ -1750,6 +1754,24 @@ def _extractive_fallback_content(
                 "claim_ids": [],
                 "evidence_excerpt_ids": [],
             },
+            {
+                "text": (
+                    "Dabei bleibt die Erklärung bewusst bei der Einordnung und "
+                    "macht aus vorhandenen Belegen keine zusätzliche Tatsachenbehauptung."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Der Mehrwert liegt darin, die Bedeutung des Punktes für den "
+                    "gesamten Zusammenhang klarer zu machen."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
         ]
 
     def ensure_minimum(
@@ -1768,6 +1790,230 @@ def _extractive_fallback_content(
             local_keys.add(key)
         return output
 
+    def format_padding_candidates() -> list[dict[str, Any]]:
+        return [
+            {
+                "text": (
+                    "Für eine einfache Erklärung lohnt sich die Trennung zwischen "
+                    "beobachteter Grundlage, technischer Möglichkeit und praktischer "
+                    "Erwartung."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Der nächste gedankliche Schritt ist deshalb nicht mehr Information, "
+                    "sondern eine sauberere Ordnung der bereits erklärten Punkte."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Wichtig ist außerdem, Potenzial nicht mit gesichertem Ergebnis zu "
+                    "verwechseln, weil genau dort viele Missverständnisse entstehen."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "So bleibt die Bewertung nachvollziehbar: Erst klären wir den "
+                    "Mechanismus, dann die Voraussetzungen, dann die Grenzen."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Wenn ein Verfahren grundsätzlich plausibel klingt, entscheidet "
+                    "trotzdem die Umsetzung darüber, ob daraus ein belastbarer Beitrag "
+                    "wird."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Gerade bei technischen Themen hilft es, jede Schlussfolgerung eine "
+                    "Stufe kleiner zu formulieren, als es die Schlagzeile nahelegt."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Die praktische Frage lautet daher nicht nur, ob etwas möglich ist, "
+                    "sondern unter welchen Bedingungen es zuverlässig funktioniert."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Für Zuschauer wird das Thema verständlicher, wenn Chancen und "
+                    "Einschränkungen nebeneinander stehen, statt gegeneinander ausgespielt "
+                    "zu werden."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Eine robuste Einordnung benennt deshalb auch, welche Messgrößen, "
+                    "Standorte oder Annahmen das Ergebnis stark verändern können."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Damit wird die Geschichte nicht größer gemacht, sondern präziser: "
+                    "Sie zeigt, was man wissen kann und was noch geprüft werden muss."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Der Kernpunkt lässt sich so behalten, ohne aus einzelnen Belegen "
+                    "eine Gewissheit abzuleiten, die sie nicht tragen."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Am Ende entsteht dadurch kein einfaches Versprechen, sondern ein "
+                    "prüfbarer Rahmen für die weitere Recherche."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Eine solche Trennung schützt vor Übertreibung und macht trotzdem "
+                    "sichtbar, warum das Thema erklärenswert ist."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Für die Zuschauerperspektive zählt dabei besonders, welche "
+                    "Voraussetzung erfüllt sein muss, bevor aus einer Idee Alltag "
+                    "werden kann."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Wenn mehrere Faktoren gleichzeitig wichtig sind, hilft eine "
+                    "schrittweise Erklärung mehr als eine einzelne schnelle Antwort."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Die Erklärung gewinnt dadurch Tiefe, ohne komplizierter zu werden: "
+                    "Jeder Punkt erfüllt eine erkennbare Aufgabe."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Ein weiterer Orientierungspunkt ist die Frage, ob ein Argument "
+                    "den Mechanismus erklärt oder bereits eine Wirkung bewertet."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Damit wird sichtbar, welche Teile der Geschichte stabil sind und "
+                    "welche nur unter bestimmten Annahmen gelten."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Wo die Datenlage knapp bleibt, ist Zurückhaltung kein Nachteil, "
+                    "sondern ein Teil der sachlichen Erklärung."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Aus dieser Perspektive wird die Folge nicht nur informativer, "
+                    "sondern auch überprüfbarer für alle, die weiterlesen möchten."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Der rote Faden bleibt dabei einfach: Was ist die Idee, was spricht "
+                    "dafür, und was begrenzt sie?"
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Eine gute Folge darf deshalb langsam genug sein, damit die "
+                    "entscheidenden Unterschiede wirklich hängen bleiben."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "So kann das Publikum die Aussage später selbst einordnen, statt "
+                    "nur eine fertige Bewertung zu übernehmen."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Diese vorsichtige Sprache macht die Erklärung nicht schwächer, "
+                    "sondern belastbarer."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+        ]
+
     preferred_units = {
         "context": {"foundation", "mechanism"},
         "evidence": {"evidence", "mechanism", "foundation"},
@@ -1775,6 +2021,7 @@ def _extractive_fallback_content(
         "uncertainty": {"open_questions", "limits"},
     }
     output = []
+    selected_output_indexes: list[int] = []
     for segment in checked["draft"]["segments"]:
         if segment["segment_key"] not in selected:
             copied_sentences = [
@@ -1816,7 +2063,9 @@ def _extractive_fallback_content(
                     if str(claim.get("id")) not in used_claim_ids
                 ),
                 None,
-            ) or choose_claim(preferred_units["counterevidence"])
+            ) or choose_claim(
+                preferred_units["counterevidence"], allow_used=True
+            )
             if claim:
                 opener = (
                     "Als Gegenperspektive zählt hier vor allem:"
@@ -1885,6 +2134,26 @@ def _extractive_fallback_content(
                 "sentences": sentences,
             }
         )
+        selected_output_indexes.append(len(output) - 1)
+    policy = context.get("script_policy", {})
+    if policy and selected_output_indexes:
+        target_words = _script_target_words(policy)
+        candidate_index = 0
+        candidates = format_padding_candidates()
+        while (
+            sum(word_count(segment["sentences"]) for segment in output) < target_words
+            and candidate_index < len(candidates)
+        ):
+            candidate = candidates[candidate_index]
+            candidate_index += 1
+            key = sentence_key(str(candidate.get("text", "")))
+            if key in used_sentence_keys:
+                continue
+            segment = output[
+                selected_output_indexes[(candidate_index - 1) % len(selected_output_indexes)]
+            ]
+            segment["sentences"].append(dict(candidate))
+            used_sentence_keys.add(key)
     return {"title": checked["draft"]["title"], "segments": output}
 
 
@@ -1907,11 +2176,13 @@ async def _refine_script_with_verifier(
     verifier: dict[str, Any],
     *,
     allowed_segment_keys: set[str] | None = None,
-    maximum_attempts: int = 3,
+    maximum_attempts: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
     """Run bounded evidence-safe rewrites and reapply both quality gates."""
 
     latest_writer: dict[str, Any] | None = None
+    if maximum_attempts is None:
+        maximum_attempts = 1 if allowed_segment_keys is not None else 3
     for attempt in range(1, maximum_attempts + 1):
         if verifier["output"]["valid"]:
             break
