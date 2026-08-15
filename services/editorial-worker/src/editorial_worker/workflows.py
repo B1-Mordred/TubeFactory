@@ -674,6 +674,7 @@ async def _write_script_segments(
     if not beats:
         raise RuntimeError("script chunk generation requires at least one beat")
     generated_by_key: dict[str, dict[str, Any]] = {}
+    fallback_segment_keys: list[str] = []
     first_result: dict[str, Any] | None = None
     for position, beat in enumerate(beats, 1):
         segment_type = str(beat["segment_type"])
@@ -696,7 +697,8 @@ async def _write_script_segments(
             chunk_instruction += " " + operational_instruction
         result: dict[str, Any] | None = None
         contract_satisfied = False
-        for generation_attempt in range(1, 4):
+        max_generation_attempts = 2 if base_draft is not None else 3
+        for generation_attempt in range(1, max_generation_attempts + 1):
             attempt_instruction = chunk_instruction
             if generation_attempt > 1:
                 attempt_instruction += (
@@ -752,10 +754,12 @@ async def _write_script_segments(
             raise RuntimeError("script chunk generation returned no model result")
         first_result = first_result or result
         if not contract_satisfied and base_draft is not None:
-            # A selected regeneration may improve only the chunks it can rewrite
-            # without weakening evidence or format contracts. If the model keeps
-            # undershooting after bounded retries, preserve the immutable parent
-            # segment instead of accepting degraded short prose.
+            # A selected regeneration cannot preserve a rejected parent chunk
+            # forever. If the local model keeps undershooting after bounded
+            # retries, replace that selected chunk with deterministic
+            # source-bound fallback prose instead of carrying old defects
+            # forward.
+            fallback_segment_keys.append(str(beat["segment_key"]))
             continue
         if not contract_satisfied:
             raise RuntimeError(
@@ -772,6 +776,12 @@ async def _write_script_segments(
             )
         else:
             generated_by_key[str(beat["segment_key"])] = result["output"]["segment"]
+    if base_draft is not None and fallback_segment_keys:
+        generated_by_key.update(
+            _extractive_fallback_segments_by_key(
+                context, base_draft, tuple(fallback_segment_keys)
+            )
+        )
     if first_result is None:
         raise RuntimeError("script chunk generation produced no segments")
     if base_draft is not None:
@@ -1876,6 +1886,18 @@ def _extractive_fallback_content(
             }
         )
     return {"title": checked["draft"]["title"], "segments": output}
+
+
+def _extractive_fallback_segments_by_key(
+    context: dict[str, Any], base_draft: dict[str, Any], segment_keys: tuple[str, ...]
+) -> dict[str, dict[str, Any]]:
+    selected = {str(segment_key) for segment_key in segment_keys}
+    content = _extractive_fallback_content(context, {"draft": base_draft}, segment_keys)
+    return {
+        str(source["segment_key"]): fallback
+        for source, fallback in zip(base_draft["segments"], content["segments"])
+        if str(source["segment_key"]) in selected
+    }
 
 
 async def _refine_script_with_verifier(

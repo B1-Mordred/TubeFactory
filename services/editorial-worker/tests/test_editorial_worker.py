@@ -44,6 +44,7 @@ from editorial_worker.workflows import (
     _correction_segment_keys,
     _compact_generated_segment,
     _extractive_fallback_content,
+    _extractive_fallback_segments_by_key,
     _factual_audit_statements,
     _local_script_quality_issues,
     _near_duplicate_claim,
@@ -455,7 +456,8 @@ def test_partial_chunk_generation_requires_an_existing_base_draft() -> None:
     assert "generated_by_key.get" in source
     assert 'segment["annotations"]' in source
     assert "if not contract_satisfied and base_draft is not None" in source
-    assert "preserve the immutable parent" in source
+    assert "_extractive_fallback_segments_by_key" in source
+    assert "max_generation_attempts = 2 if base_draft is not None else 3" in source
 
 
 def test_verifier_correction_boundary_is_ordered_bounded_and_lock_aware() -> None:
@@ -603,6 +605,52 @@ def test_extractive_fallback_uses_exact_approved_claim_text_and_evidence() -> No
         approved["evidence"][0]["evidence_excerpt_id"]
     ]
     assert sentences[-1]["kind"] == "editorial"
+
+
+def test_extractive_fallback_segments_by_key_replaces_selected_parent_text() -> None:
+    approved = claim()
+    base_draft = {
+        "title": "Explainer",
+        "segments": [
+            {
+                "segment_key": "05-evidence",
+                "segment_type": "evidence",
+                "presentation_purpose": "Old evidence",
+                "annotations": [
+                    {
+                        "text": "Alte problematische Wiederholung.",
+                        "kind": "fact",
+                        "claim_ids": [],
+                    }
+                ],
+            },
+            {
+                "segment_key": "06-counterevidence",
+                "segment_type": "counterevidence",
+                "presentation_purpose": "Keep parent",
+                "annotations": [
+                    {
+                        "text": "Dieses Segment bleibt unverändert.",
+                        "kind": "editorial",
+                        "claim_ids": [],
+                    }
+                ],
+            },
+        ],
+    }
+
+    mapped = _extractive_fallback_segments_by_key(
+        {"structured_inputs": {"title": "Explainer", "claims": [approved]}},
+        base_draft,
+        ("05-evidence",),
+    )
+
+    assert set(mapped) == {"05-evidence"}
+    narration = " ".join(
+        sentence["text"] for sentence in mapped["05-evidence"]["sentences"]
+    )
+    assert approved["normalized_statement"] in narration
+    assert "Alte problematische Wiederholung" not in narration
 
 
 def test_extractive_fallback_pads_local_quality_segments_without_internal_language() -> None:
