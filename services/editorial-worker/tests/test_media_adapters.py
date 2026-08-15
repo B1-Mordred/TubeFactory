@@ -18,7 +18,7 @@ from editorial_worker.media_activities import (
     _fixture_wav,
     _synchronize_media_timing,
 )
-from editorial_worker.voicebox import VoiceboxRESTClient, VoiceboxWSClient
+from editorial_worker.voicebox import VoiceboxError, VoiceboxRESTClient, VoiceboxWSClient
 
 
 @pytest.mark.asyncio
@@ -106,7 +106,69 @@ async def test_voicebox_b1_generate_stream_retries_transient_admission_conflict(
     )
 
     assert result.audio == audio
-    assert result.warnings == ["B1 stream generation admitted after 2 attempts"]
+    assert result.warnings == ["B1 stream generation admitted after 2 attempts over 0s"]
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_voicebox_b1_generate_stream_reports_cooling_retry_heartbeats():
+    audio, _ = _fixture_wav("hallo welt", 1, 24_000)
+    events: list[dict[str, object]] = []
+    route = respx.post("http://voicebox:8000/generate/stream").mock(
+        side_effect=[
+            httpx.Response(503, json={"detail": "lan-p40-media runtime recover hook returned HTTP 503"}, headers={"retry-after": "0"}),
+            httpx.Response(200, content=audio, headers={"content-type": "audio/wav"}),
+        ]
+    )
+
+    result = await VoiceboxRESTClient(
+        "http://voicebox:8000",
+        retry_observer=events.append,
+        retry_heartbeat_interval_seconds=0.01,
+    ).synthesize(
+        {
+            "provider_contract": "b1_generate_stream",
+            "voice_id": "voice-uuid",
+            "text": "hallo welt",
+            "language": "de",
+            "engine": "chatterbox",
+            "accept": "audio/wav",
+            "stream_generation_retry_attempts": 2,
+            "stream_generation_retry_backoff_seconds": 0,
+        }
+    )
+
+    assert result.audio == audio
+    assert route.call_count == 2
+    assert any(event.get("state") == "b1_voicebox_cooling_retry" and event.get("status_code") == 503 for event in events)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_voicebox_b1_generate_stream_exhausted_cooling_is_retryable_error():
+    route = respx.post("http://voicebox:8000/generate/stream").mock(
+        return_value=httpx.Response(
+            503,
+            json={"detail": "lan-p40-media runtime recover hook returned HTTP 503"},
+            headers={"retry-after": "0"},
+        )
+    )
+
+    with pytest.raises(VoiceboxError, match="still cooling down or unavailable"):
+        await VoiceboxRESTClient("http://voicebox:8000").synthesize(
+            {
+                "provider_contract": "b1_generate_stream",
+                "voice_id": "voice-uuid",
+                "text": "hallo welt",
+                "language": "de",
+                "engine": "chatterbox",
+                "accept": "audio/wav",
+                "stream_generation_retry_attempts": 2,
+                "stream_generation_retry_backoff_seconds": 0,
+            }
+        )
+
     assert route.call_count == 2
 
 

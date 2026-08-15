@@ -692,6 +692,31 @@ async def generate_production_narration(context: dict[str, Any]) -> dict[str, An
     vtt: list[str] = ["WEBVTT", ""]
     cursor = 0.0
     voice_client: VoiceboxRESTClient | VoiceboxWSClient | None = None
+    voicebox_retry_context: dict[str, Any] = {}
+
+    def observe_voicebox_retry(details: dict[str, Any]) -> None:
+        activity.heartbeat(
+            {
+                "provider": "b1_voicebox",
+                **voicebox_retry_context,
+                **{
+                    key: value
+                    for key, value in details.items()
+                    if key
+                    in {
+                        "state",
+                        "attempt",
+                        "max_attempts",
+                        "status_code",
+                        "delay_seconds",
+                        "elapsed_seconds",
+                        "retry_window_seconds",
+                        "detail",
+                    }
+                },
+            }
+        )
+
     if profile["provider_type"] == "voicebox_rest":
         tls_verify = profile["output_settings"].get("tls_verify", True)
         if not isinstance(tls_verify, bool | str):
@@ -703,6 +728,7 @@ async def generate_production_narration(context: dict[str, Any]) -> dict[str, An
             ca_cert_bootstrap_url=profile["output_settings"].get("ca_cert_bootstrap_url"),
             ca_cert_sha256=profile["output_settings"].get("ca_cert_sha256"),
             ca_cert_path=profile["output_settings"].get("tls_ca_cert_path"),
+            retry_observer=observe_voicebox_retry,
         )
     elif profile["provider_type"] == "voicebox_ws":
         voice_client = VoiceboxWSClient(profile["endpoint"])
@@ -721,9 +747,11 @@ async def generate_production_narration(context: dict[str, Any]) -> dict[str, An
             "accept": profile["output_settings"].get("accept", "application/json"),
             "normalize": bool(profile["output_settings"].get("normalize", False)),
             "effects_chain": profile["output_settings"].get("effects_chain", []),
-            "stream_generation_retry_attempts": profile["output_settings"].get("stream_generation_retry_attempts", 8),
+            "stream_generation_retry_attempts": profile["output_settings"].get("stream_generation_retry_attempts", 180),
+            "stream_generation_retry_window_seconds": profile["output_settings"].get("stream_generation_retry_window_seconds", 7200),
             "stream_generation_retry_backoff_seconds": profile["output_settings"].get("stream_generation_retry_backoff_seconds", 5),
-            "stream_generation_retry_max_backoff_seconds": profile["output_settings"].get("stream_generation_retry_max_backoff_seconds", 30),
+            "stream_generation_retry_max_backoff_seconds": profile["output_settings"].get("stream_generation_retry_max_backoff_seconds", 60),
+            "stream_generation_request_timeout_seconds": profile["output_settings"].get("stream_generation_request_timeout_seconds", 180),
             "delivery": profile["delivery"],
             "speed": profile["delivery"].get("speed", 1.0),
             "pronunciation": profile["pronunciation"],
@@ -744,7 +772,17 @@ async def generate_production_narration(context: dict[str, Any]) -> dict[str, An
         elif voice_client is not None:
             results = []
             for chunk in chunks:
+                voicebox_retry_context.clear()
+                voicebox_retry_context.update(
+                    {
+                        "segment_order": segment["order"],
+                        "segment_count": len(context["segments"]),
+                        "chunk_index": len(results) + 1,
+                        "chunk_count": len(chunks),
+                    }
+                )
                 results.append(await voice_client.synthesize({**request, "text": chunk}))
+            voicebox_retry_context.clear()
             original = await asyncio.to_thread(_crossfade_wavs, [item.audio for item in results])
             alignment, alignment_cursor = [], 0.0
             for index, item in enumerate(results):

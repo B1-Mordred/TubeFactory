@@ -18,6 +18,14 @@ _MODEL_RETRY = RetryPolicy(
 )
 _EDITORIAL_MODEL_ACTIVITY_TIMEOUT = timedelta(minutes=12)
 _EDITORIAL_MODEL_RETRY = RetryPolicy(maximum_attempts=1)
+_NARRATION_ACTIVITY_TIMEOUT = timedelta(hours=3)
+_NARRATION_HEARTBEAT_TIMEOUT = timedelta(minutes=5)
+_NARRATION_RETRY = RetryPolicy(
+    initial_interval=timedelta(minutes=5),
+    backoff_coefficient=1.5,
+    maximum_interval=timedelta(minutes=30),
+    maximum_attempts=12,
+)
 _DB_RETRY = RetryPolicy(maximum_attempts=5)
 _SCOPED_VERIFIER_REPAIR_SEGMENT_LIMIT = 3
 _SCRIPT_SEGMENT_TYPES = (
@@ -3061,9 +3069,9 @@ class MediaProductionWorkflow:
             )
             narration = await workflow.execute_activity(
                 "generate-production-narration", context,
-                start_to_close_timeout=timedelta(minutes=45),
-                heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(initial_interval=timedelta(seconds=5), maximum_interval=timedelta(minutes=1), maximum_attempts=3),
+                start_to_close_timeout=_NARRATION_ACTIVITY_TIMEOUT,
+                heartbeat_timeout=_NARRATION_HEARTBEAT_TIMEOUT,
+                retry_policy=_NARRATION_RETRY,
             )
             self._state, self._progress = "SYNCHRONIZING_PRODUCTION_TIMELINE", 38
             synchronized = await workflow.execute_activity(
@@ -3150,9 +3158,9 @@ class MediaTimelineDraftWorkflow:
             )
             narration = await workflow.execute_activity(
                 "generate-production-narration", context,
-                start_to_close_timeout=timedelta(minutes=45),
-                heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(initial_interval=timedelta(seconds=5), maximum_interval=timedelta(minutes=1), maximum_attempts=3),
+                start_to_close_timeout=_NARRATION_ACTIVITY_TIMEOUT,
+                heartbeat_timeout=_NARRATION_HEARTBEAT_TIMEOUT,
+                retry_policy=_NARRATION_RETRY,
             )
             self._state, self._progress = "SYNCHRONIZING_PRODUCTION_TIMELINE", 70
             synchronized = await workflow.execute_activity(
@@ -3300,7 +3308,7 @@ class NarrationSegmentRegenerationWorkflow:
         voice = {**context["voice_profile"], "delivery": {**context["voice_profile"]["delivery"], "instruction": instruction}}
         context = {**context, "workflow_id": request["workflow_id"], "production_id": request["production_id"], "scenes": [], "segments": selected, "voice_profile": voice, "regeneration": True, "regeneration_instruction": instruction}
         self._state, self._progress = "SYNTHESIZING_AUDITION", 45
-        generated = await workflow.execute_activity("generate-production-narration", context, start_to_close_timeout=timedelta(minutes=45), heartbeat_timeout=timedelta(minutes=2), retry_policy=_MODEL_RETRY)
+        generated = await workflow.execute_activity("generate-production-narration", context, start_to_close_timeout=_NARRATION_ACTIVITY_TIMEOUT, heartbeat_timeout=_NARRATION_HEARTBEAT_TIMEOUT, retry_policy=_NARRATION_RETRY)
         self._state, self._progress = "PERSISTING_IMMUTABLE_AUDIO", 90
         self._result = await workflow.execute_activity("persist-media-regeneration", {"context": context, "result": generated, "kind": "narration_segment"}, start_to_close_timeout=timedelta(minutes=5), retry_policy=_DB_RETRY)
         self._state, self._progress = "NARRATION_AUDITION_READY", 100
