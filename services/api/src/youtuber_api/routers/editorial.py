@@ -1369,6 +1369,7 @@ async def _storyboard_detail(
         current_version_id=version.id,
         content_hash=version.content_hash,
         scene_count=len(scenes),
+        placeholder_tokens=await _storyboard_placeholder_tokens(session, version.id),
         created_at=version.created_at,
         script_version_id=version.script_version_id,
         scenes=scenes,

@@ -1637,6 +1637,7 @@ class StoryboardSummaryView(BaseModel):
     current_version_id: UUID
     content_hash: str
     scene_count: int
+    placeholder_tokens: list[str] = []
     created_at: datetime
 
 
