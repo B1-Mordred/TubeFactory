@@ -7,13 +7,17 @@ from uuid import uuid4
 import pytest
 
 import editorial_worker.workflows as editorial_workflows
+from editorial_core.direct_scripted_video import (
+    direct_script_draft_document,
+    parse_direct_scripted_video,
+)
 from editorial_core.editorial import (
     ScriptSegmentDraft,
     StatementAnnotation,
     StatementKind,
     verify_script_draft,
 )
-from editorial_worker.contracts import ScriptDraft, StoryboardDraft, VerifierOutput
+from editorial_worker.contracts import DirectScriptDraft, ScriptDraft, StoryboardDraft, VerifierOutput
 from editorial_worker.channel_workflow import channel_workflow_context
 from editorial_worker.fakes import fake_output
 from editorial_worker.model_activities import (
@@ -79,6 +83,58 @@ def claim() -> dict:
             }
         ],
     }
+
+
+FOUR_SCENE_DIRECT_SCRIPT = """
+S01 | 00:00–00:30 | Warum ein Render-Test wichtig ist
+
+Dramaturgische Funktion: Den Zweck des Testlaufs klar machen.
+Voiceover: Dieser kurze Test zeigt, ob TubeFactory einen direkt eingefügten Text vom Import bis zur Medienproduktion zuverlässig verarbeitet.
+Bild/Schnitt: Ruhige Startkarte mit Prozesslinie.
+On-Screen-Text: Browser-Testlauf / Keine offenen Platzhalter
+Benötigte Assets: Neutrale Startkarte; einfache Prozessgrafik
+Evidenz-/Freigabehinweis: Technischer Testinhalt.
+
+S02 | 00:30–01:00 | Vom Skript zur Szenenplanung
+
+Dramaturgische Funktion: Den Übergang vom Text in eine visuelle Struktur erklären.
+Voiceover: Nach dem Import teilt das System den Text in Szenen auf. Jede Szene enthält Sprechertext, Bildidee, On-Screen-Text und Dauer.
+Bild/Schnitt: Zwei Spalten mit Text und Szenenkarte.
+On-Screen-Text: Struktur vor Render / Review vor Produktion
+Benötigte Assets: Abstrakte Szenenkarte; Status-Chip für Review
+Evidenz-/Freigabehinweis: Nur Workflow-Verhalten demonstrieren.
+
+S03 | 01:00–01:30 | Der Render als kontrollierter Schritt
+
+Dramaturgische Funktion: Zeigen, dass Medienproduktion erst nach Freigabe startet.
+Voiceover: Der Render startet erst, wenn die Eingaben vollständig sind. Fehlt eine Voraussetzung, muss das System sie sichtbar benennen.
+Bild/Schnitt: Checkliste mit drei Punkten.
+On-Screen-Text: Freigabe / Workflow / Stimme / Dann rendern
+Benötigte Assets: Checklisten-Grafik; Render-Warteschlange
+Evidenz-/Freigabehinweis: Keine Aussage über externe Anbieter.
+
+S04 | 01:30–02:00 | Abschluss und Übergabe
+
+Dramaturgische Funktion: Den Endzustand des Testlaufs beschreiben.
+Voiceover: Am Ende steht ein prüfbarer Medienentwurf mit Manifest, Hashes, Szenenbezug und Qualitätsstatus.
+Bild/Schnitt: Abschlusskarte mit Videoentwurf und Prüfhäkchen.
+On-Screen-Text: Medienentwurf prüfen / Danach Publishing vorbereiten
+Benötigte Assets: Abschlusskarte; Manifest-Symbol; QA-Status
+Evidenz-/Freigabehinweis: Testfreigabe gilt nur für diesen E2E-Testlauf.
+"""
+
+
+def test_direct_script_draft_preserves_short_operator_scene_plan() -> None:
+    parsed = parse_direct_scripted_video(
+        FOUR_SCENE_DIRECT_SCRIPT,
+        title="E2E Browser Test - Direkter Workflow",
+    )
+
+    draft = DirectScriptDraft.model_validate(direct_script_draft_document(parsed))
+
+    assert len(draft.segments) == 4
+    assert draft.segments[0].segment_key == "s01"
+    assert draft.segments[-1].segment_key == "s04"
 
 
 def test_topic_review_quality_policy_filters_abstentions_and_weak_dimensions() -> None:

@@ -23,6 +23,7 @@ from editorial_worker.media_activities import (
     load_media_production_context,
     persist_media_regeneration,
     persist_media_production,
+    record_media_production_state,
     synchronize_media_timing,
 )
 from editorial_worker.script_activities import (
@@ -126,6 +127,7 @@ async def run() -> None:
             generate_production_narration,
             assemble_and_qa_production,
             persist_media_production,
+            record_media_production_state,
             persist_media_regeneration,
             synchronize_media_timing,
         ],

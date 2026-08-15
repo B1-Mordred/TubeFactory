@@ -42,6 +42,21 @@ def _production_id(workflow_id: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"evidence-studio:{workflow_id}:production")
 
 
+def _production_settings(context: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "width": context["width"],
+            "height": context["height"],
+            "fps": context["fps"],
+            "comfy_workflow_version_id": context["comfy_workflow"]["id"],
+            "voice_profile_version_id": context["voice_profile"]["id"],
+            "channel_profile_version": context["channel_profile_version"],
+            "brand_hash": context["brand_hash"],
+            "production_duration_seconds": context.get("production_duration_seconds"),
+        }
+    )
+
+
 def _minio(settings: Settings) -> Minio:
     return Minio(settings.minio_endpoint, access_key=settings.minio_access_key, secret_key=settings.minio_secret_key, secure=False)
 
@@ -215,6 +230,80 @@ async def load_media_production_context(request: dict[str, Any]) -> dict[str, An
             "sources": [{"id": str(row["id"]), "title": row["title"], "url": row["canonical_url"], "publisher": row["publisher"], "author": row["author"], "snapshot_hash": row["snapshot_hash"], "retrieved_at": row["retrieved_at"].isoformat()} for row in sources],
             "claims": {"total": claim_count, "supported": supported_count},
         }
+    finally:
+        await connection.close()
+
+
+@activity.defn(name="record-media-production-state")
+async def record_media_production_state(request: dict[str, Any]) -> dict[str, Any]:
+    context = request["context"]
+    state = str(request["state"])
+    if state not in {
+        "queued",
+        "generating_assets",
+        "generating_narration",
+        "assembling",
+        "quality_assurance",
+        "failed",
+        "cancelled",
+    }:
+        raise ApplicationError(
+            f"unsupported media production state: {state}",
+            non_retryable=True,
+        )
+    settings = Settings()
+    connection = await asyncpg.connect(settings.database_dsn)
+    transaction = connection.transaction()
+    await transaction.start()
+    try:
+        now = datetime.now(timezone.utc)
+        production_id = UUID(context["production_id"])
+        completed_at = now if state in {"failed", "cancelled"} else None
+        existing = await connection.fetchrow(
+            "SELECT id,completed_at FROM media_productions WHERE workflow_id=$1",
+            context["workflow_id"],
+        )
+        if existing:
+            await connection.execute(
+                """UPDATE media_productions
+                      SET state=$2,
+                          settings=$3::jsonb,
+                          completed_at=COALESCE(completed_at, $4)
+                    WHERE id=$1 AND completed_at IS NULL""",
+                existing["id"],
+                state,
+                _production_settings(context),
+                completed_at,
+            )
+            await transaction.commit()
+            return {
+                "production_id": str(existing["id"]),
+                "state": state,
+                "reconciled": True,
+            }
+        await connection.execute(
+            """INSERT INTO media_productions(
+                   id,storyboard_version_id,storyboard_hash,workflow_id,render_tier,
+                   state,settings,correlation_id,started_by,created_at,completed_at
+               )
+               VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11)""",
+            production_id,
+            UUID(context["storyboard_version_id"]),
+            context["storyboard_hash"],
+            context["workflow_id"],
+            context["render_tier"],
+            state,
+            _production_settings(context),
+            context["correlation_id"],
+            UUID(context["actor_id"]),
+            now,
+            completed_at,
+        )
+        await transaction.commit()
+        return {"production_id": str(production_id), "state": state, "reconciled": False}
+    except Exception:
+        await transaction.rollback()
+        raise
     finally:
         await connection.close()
 
@@ -731,17 +820,41 @@ async def persist_media_production(request: dict[str, Any]) -> dict[str, Any]:
     transaction = connection.transaction()
     await transaction.start()
     try:
-        existing = await connection.fetchrow("SELECT id,state FROM media_productions WHERE workflow_id=$1", context["workflow_id"])
-        if existing:
+        existing = await connection.fetchrow(
+            "SELECT id,state,completed_at FROM media_productions WHERE workflow_id=$1",
+            context["workflow_id"],
+        )
+        if existing and existing["completed_at"] is not None:
             await transaction.rollback()
             return {"production_id": str(existing["id"]), "state": existing["state"], "reconciled": True}
         now = datetime.now(timezone.utc)
-        production_id = UUID(context["production_id"])
-        await connection.execute(
-            """INSERT INTO media_productions(id,storyboard_version_id,storyboard_hash,workflow_id,render_tier,state,settings,correlation_id,started_by,created_at,completed_at)
-               VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$10)""",
-            production_id, UUID(context["storyboard_version_id"]), context["storyboard_hash"], context["workflow_id"], context["render_tier"], "ready" if result["qa"]["verdict"] != "fail" else "blocked", json.dumps({"width": context["width"], "height": context["height"], "fps": context["fps"], "comfy_workflow_version_id": context["comfy_workflow"]["id"], "voice_profile_version_id": context["voice_profile"]["id"], "channel_profile_version": context["channel_profile_version"], "brand_hash": context["brand_hash"], "production_duration_seconds": context.get("production_duration_seconds")}), context["correlation_id"], UUID(context["actor_id"]), now,
-        )
+        production_id = UUID(str(existing["id"])) if existing else UUID(context["production_id"])
+        final_state = "ready" if result["qa"]["verdict"] != "fail" else "blocked"
+        if existing:
+            await connection.execute(
+                """UPDATE media_productions
+                      SET state=$2,settings=$3::jsonb,completed_at=$4
+                    WHERE id=$1""",
+                production_id,
+                final_state,
+                _production_settings(context),
+                now,
+            )
+        else:
+            await connection.execute(
+                """INSERT INTO media_productions(id,storyboard_version_id,storyboard_hash,workflow_id,render_tier,state,settings,correlation_id,started_by,created_at,completed_at)
+                   VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$10)""",
+                production_id,
+                UUID(context["storyboard_version_id"]),
+                context["storyboard_hash"],
+                context["workflow_id"],
+                context["render_tier"],
+                final_state,
+                _production_settings(context),
+                context["correlation_id"],
+                UUID(context["actor_id"]),
+                now,
+            )
         for asset in result["assets"]:
             await connection.execute(
                 """INSERT INTO media_assets(id,production_id,scene_version_id,asset_kind,object_key,content_hash,mime_type,byte_size,width,height,duration_seconds,licence,generation_provenance,cache_key,created_at)
@@ -765,7 +878,7 @@ async def persist_media_production(request: dict[str, Any]) -> dict[str, Any]:
                                         VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,$7::jsonb,$8,$9)""", uuid5(NAMESPACE_URL, f"{context['workflow_id']}:qa:{finding['code']}"), report_id, order, finding["code"], finding["verdict"], finding["message"], json.dumps(finding["details"]), finding["override_policy"], now)
         await append_audit(connection, action="media_production.completed" if qa["verdict"] != "fail" else "media_production.blocked", actor_id=UUID(context["actor_id"]), target_type="media_production", target_id=str(production_id), correlation_id=context["correlation_id"], context={"workflow_id": context["workflow_id"], "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_hash": render["content_hash"], "manifest_hash": manifest["content_hash"], "qa_hash": qa["content_hash"], "qa_verdict": qa["verdict"]})
         await transaction.commit()
-        return {"production_id": str(production_id), "state": "ready" if qa["verdict"] != "fail" else "blocked", "render_id": render["id"], "render_hash": render["content_hash"], "manifest_hash": manifest["content_hash"], "qa_verdict": qa["verdict"], "reconciled": False}
+        return {"production_id": str(production_id), "state": final_state, "render_id": render["id"], "render_hash": render["content_hash"], "manifest_hash": manifest["content_hash"], "qa_verdict": qa["verdict"], "reconciled": False}
     except Exception:
         await transaction.rollback()
         raise

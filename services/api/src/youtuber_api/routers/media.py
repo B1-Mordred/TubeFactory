@@ -29,6 +29,7 @@ from youtuber_api.models import (
     MediaAssetModel,
     MediaProductionModel,
     OpportunityModel,
+    ProductionBriefModel,
     ProductionManifestModel,
     ProductionRenderModel,
     PublishMetadataVersionModel,
@@ -506,6 +507,8 @@ async def approve_render(render_id: UUID, payload: RenderApprovalWrite, request:
             "evidence_required": False,
         }
         editorial_rationale = "Direct scripted-video production; factual and business correctness accepted by reviewer."
+        subject = None
+        opportunity = None
     else:
         policy_row = (
             await session.execute(
@@ -553,11 +556,19 @@ async def approve_render(render_id: UUID, payload: RenderApprovalWrite, request:
                 None,
             )
             thumbnail = next((item for item in assets if item.asset_kind == "thumbnail"), None)
-            sources = [
-                {"title": str(item.get("title", "Source")), "url": str(item.get("url", ""))}
-                for item in manifest.document.get("sources", [])
-                if item.get("url")
-            ]
+            if script.source_kind == "direct_scripted_video":
+                sources = [
+                    {
+                        "title": "Operator-supplied direct script reviewed in TubeFactory",
+                        "url": f"urn:tubefactory:script:{script.id}",
+                    }
+                ]
+            else:
+                sources = [
+                    {"title": str(item.get("title", "Source")), "url": str(item.get("url", ""))}
+                    for item in manifest.document.get("sources", [])
+                    if item.get("url")
+                ]
             raw_chapters = manifest.document.get("chapters", [])
             chapters = [
                 {
@@ -569,7 +580,19 @@ async def approve_render(render_id: UUID, payload: RenderApprovalWrite, request:
             if not chapters:
                 chapters = [{"title": "Introduction", "start_seconds": 0}]
             script_version = await session.get(ScriptVersionModel, storyboard.script_version_id)
-            channel = await session.get(ChannelProfileModel, subject.channel_profile_id)
+            if subject is not None:
+                channel = await session.get(ChannelProfileModel, subject.channel_profile_id)
+            elif script.production_brief_id:
+                channel = await session.scalar(
+                    select(ChannelProfileModel)
+                    .join(
+                        ProductionBriefModel,
+                        ProductionBriefModel.channel_profile_id == ChannelProfileModel.id,
+                    )
+                    .where(ProductionBriefModel.id == script.production_brief_id)
+                )
+            else:
+                channel = None
             if caption is None or thumbnail is None or not sources or script_version is None:
                 missing = []
                 if caption is None:
@@ -594,12 +617,18 @@ async def approve_render(render_id: UUID, payload: RenderApprovalWrite, request:
                         expected_render_hash=render.content_hash,
                         title=script_version.title[:100],
                         description=(
-                            "Evidence-first explanation based on the cited sources, including uncertainty and counterevidence."
+                            "Direct scripted-video production from operator-supplied, reviewer-approved material."
+                            if script.source_kind == "direct_scripted_video"
+                            else "Evidence-first explanation based on the cited sources, including uncertainty and counterevidence."
                         ),
                         sources=sources,
                         evidence_url=None,
                         chapters=chapters,
-                        tags=["evidence", "sources", "explainer"],
+                        tags=(
+                            ["direct-script", "reviewed", "explainer"]
+                            if script.source_kind == "direct_scripted_video"
+                            else ["evidence", "sources", "explainer"]
+                        ),
                         category_id="27",
                         language=(channel.languages[0] if channel and channel.languages else "en"),
                         made_for_kids=False,

@@ -44,6 +44,13 @@ class ScriptDraft(StrictModel):
     segments: list[ScriptSegment] = Field(min_length=8, max_length=200)
 
 
+class DirectScriptDraft(StrictModel):
+    """Operator-supplied direct scripts preserve the pasted scene count."""
+
+    title: str = Field(min_length=1, max_length=300)
+    segments: list[ScriptSegment] = Field(min_length=1, max_length=200)
+
+
 class ScriptContentSentence(StrictModel):
     text: str = Field(min_length=1, max_length=4_000)
     kind: Literal["fact", "inference", "editorial"]

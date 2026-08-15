@@ -1968,15 +1968,30 @@ async def approve_storyboard(
                     message="Storyboard approval is recorded, but an active approved visual workflow and enabled voice profile are required.",
                 )
             else:
-                configured_resolution = str(render_settings.get("resolution", ""))
+                render_tier = str(render_settings.get("render_tier", "preview"))
+                resolution_key = (
+                    "resolution"
+                    if render_tier == "full"
+                    else "preview_resolution"
+                )
+                configured_resolution = str(render_settings.get(resolution_key, ""))
                 try:
                     width_text, height_text = configured_resolution.lower().split("x", 1)
                     width, height = int(width_text), int(height_text)
                 except (AttributeError, TypeError, ValueError):
-                    width, height = 854, 480
+                    width, height = (1920, 1080) if render_tier == "full" else (854, 480)
                 allowed = comfy_workflow.allowed_resolutions or []
                 if {"width": width, "height": height} not in allowed and allowed:
                     width, height = int(allowed[0]["width"]), int(allowed[0]["height"])
+                try:
+                    fps = int(
+                        render_settings.get(
+                            "fps" if render_tier == "full" else "preview_fps",
+                            24 if render_tier == "full" else 12,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    fps = 24 if render_tier == "full" else 12
                 idempotency_key = f"approval-{version.id.hex}-v{version.version_number}"
                 from youtuber_api.routers.media import start_production
 
@@ -1984,12 +1999,12 @@ async def approve_storyboard(
                     MediaProductionStart(
                         storyboard_version_id=version.id,
                         expected_storyboard_hash=version.content_hash,
-                        render_tier=str(render_settings.get("render_tier", "preview")),
+                        render_tier=render_tier,
                         workflow_key=comfy_workflow.workflow_key,
                         voice_profile_key=voice.profile_key,
                         width=width,
                         height=height,
-                        fps=int(render_settings.get("fps", 24)),
+                        fps=fps,
                         idempotency_key=idempotency_key,
                     ),
                     request,

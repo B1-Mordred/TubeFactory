@@ -25,7 +25,7 @@ from youtuber_api.config import get_settings
 from youtuber_api.db import get_session
 from youtuber_api.models import (
     ApprovalModel, ChannelProfileModel, MediaAssetModel, MediaProductionModel, OAuthStateModel,
-    OpportunityModel, OriginalityReportModel, ProductionManifestModel, ProductionRenderModel, PublicationApprovalModel, PublicationModel,
+    OpportunityModel, OriginalityReportModel, ProductionBriefModel, ProductionManifestModel, ProductionRenderModel, PublicationApprovalModel, PublicationModel,
     PublicationScheduleModel, PublishMetadataVersionModel,
     PublishingConfigurationHeadModel, PublishingConfigurationVersionModel,
     QAReportModel, ScriptModel, SourceFreshnessCheckModel, SourceSnapshotModel, StoryboardModel, StoryboardVersionModel,
@@ -106,7 +106,12 @@ async def _render_channel_id(
         await session.get(SubjectProfileModel, opportunity.subject_profile_id)
         if opportunity else None
     )
-    return subject.channel_profile_id if subject else None
+    if subject:
+        return subject.channel_profile_id
+    if script and script.production_brief_id:
+        brief = await session.get(ProductionBriefModel, script.production_brief_id)
+        return brief.channel_profile_id if brief else None
+    return None
 
 
 async def _require_matching_channel_lineage(
@@ -424,11 +429,12 @@ async def list_metadata(_: Viewer, session: Annotated[AsyncSession, Depends(get_
         .join(StoryboardVersionModel, StoryboardVersionModel.id == MediaProductionModel.storyboard_version_id)
         .join(StoryboardModel, StoryboardModel.id == StoryboardVersionModel.storyboard_id)
         .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
-        .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+        .outerjoin(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
         .where(
             StoryboardModel.deleted_at.is_(None),
             ScriptModel.deleted_at.is_(None),
-            OpportunityModel.deleted_at.is_(None),
+            (ScriptModel.source_kind == "direct_scripted_video")
+            | (OpportunityModel.deleted_at.is_(None)),
         )
         .order_by(PublishMetadataVersionModel.created_at.desc())
         .limit(100)
@@ -612,11 +618,12 @@ async def list_uploads(_: Viewer, session: Annotated[AsyncSession, Depends(get_s
         .join(StoryboardVersionModel, StoryboardVersionModel.id == MediaProductionModel.storyboard_version_id)
         .join(StoryboardModel, StoryboardModel.id == StoryboardVersionModel.storyboard_id)
         .join(ScriptModel, ScriptModel.id == StoryboardModel.script_id)
-        .join(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
+        .outerjoin(OpportunityModel, OpportunityModel.id == ScriptModel.opportunity_id)
         .where(
             StoryboardModel.deleted_at.is_(None),
             ScriptModel.deleted_at.is_(None),
-            OpportunityModel.deleted_at.is_(None),
+            (ScriptModel.source_kind == "direct_scripted_video")
+            | (OpportunityModel.deleted_at.is_(None)),
         )
         .order_by(PublicationModel.created_at.desc())
         .limit(100)

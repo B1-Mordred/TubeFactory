@@ -25,7 +25,7 @@ from editorial_core.direct_scripted_video import (
 from editorial_core.explanation_readiness import explanation_policy
 from editorial_worker.config import Settings
 from editorial_worker.channel_workflow import channel_workflow_context
-from editorial_worker.contracts import ScriptContentDraft, ScriptDraft, VerifierOutput
+from editorial_worker.contracts import DirectScriptDraft, ScriptContentDraft, ScriptDraft, VerifierOutput
 from editorial_worker.db import append_audit
 from editorial_worker.model_activities import load_task_routes
 
@@ -77,7 +77,7 @@ def _attach_imported_script(
     }
 
 
-def _core_segments(draft: ScriptDraft) -> tuple[ScriptSegmentDraft, ...]:
+def _core_segments(draft: ScriptDraft | DirectScriptDraft) -> tuple[ScriptSegmentDraft, ...]:
     return tuple(
         ScriptSegmentDraft(
             segment_key=segment.segment_key,
@@ -117,7 +117,7 @@ async def persist_direct_scripted_video_import(request: dict[str, Any]) -> dict[
         target_wpm_min=int(request.get("target_wpm_min", 108)),
         target_wpm_max=int(request.get("target_wpm_max", 116)),
     )
-    draft = ScriptDraft.model_validate(direct_script_draft_document(parsed))
+    draft = DirectScriptDraft.model_validate(direct_script_draft_document(parsed))
     report = direct_import_report(parsed)
     source_hash = hashlib.sha256(parsed.source_text.encode()).hexdigest()
     document = draft.model_dump(mode="json")
