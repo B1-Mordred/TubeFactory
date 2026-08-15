@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Annotated, Any
 from uuid import UUID, uuid4
@@ -64,6 +65,7 @@ from youtuber_api.schemas import (
     EditorialApprovalWrite,
     ExistingResearchScriptImportStart,
     MediaProductionStart,
+    PlaceholderReplacementWrite,
     ResearchWorkflowCancel,
     ResearchWorkflowLogEntry,
     ResearchWorkflowRetry,
@@ -1015,6 +1017,8 @@ async def edit_script_version(
         raise HTTPException(status_code=409, detail="Script has no current version")
     if parent.version_number != payload.expected_version or parent.content_hash != payload.expected_hash:
         raise HTTPException(status_code=409, detail="Script version or hash changed; reload before editing")
+    if script.source_kind != "direct_scripted_video" and len(payload.segments) < 8:
+        raise HTTPException(status_code=422, detail="Evidence-bound scripts require at least 8 segments")
     old_segments = list(
         await session.scalars(
             select(ScriptSegmentModel)
@@ -1396,6 +1400,316 @@ async def _storyboard_placeholder_tokens(
     )
     text = _canonical(rows)
     return sorted(set(re.findall(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]", text)))
+
+
+_PLACEHOLDER_TOKEN = re.compile(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]")
+
+
+def _placeholder_tokens(value: Any) -> list[str]:
+    return sorted(set(_PLACEHOLDER_TOKEN.findall(_canonical(value))))
+
+
+def _replace_placeholder_values(value: Any, replacements: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        next_value = value
+        for token, replacement in replacements.items():
+            next_value = next_value.replace(token, replacement)
+        return next_value
+    if isinstance(value, list):
+        return [_replace_placeholder_values(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_placeholder_values(item, replacements)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _replace_segment_ids(value: Any, segment_id_map: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        return segment_id_map.get(value, value)
+    if isinstance(value, list):
+        return [_replace_segment_ids(item, segment_id_map) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_segment_ids(item, segment_id_map) for key, item in value.items()}
+    return value
+
+
+@router.post(
+    "/storyboards/{storyboard_id}/placeholders/replace",
+    response_model=StoryboardDetailView,
+    status_code=201,
+)
+async def replace_storyboard_placeholders(
+    storyboard_id: UUID,
+    payload: PlaceholderReplacementWrite,
+    request: Request,
+    actor: Editor,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> StoryboardDetailView:
+    storyboard = await session.get(StoryboardModel, storyboard_id, with_for_update=True)
+    if storyboard is None or storyboard.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Storyboard not found")
+    script = await session.get(ScriptModel, storyboard.script_id, with_for_update=True)
+    if script is None or script.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Script not found")
+    if script.source_kind != "direct_scripted_video":
+        raise HTTPException(
+            status_code=409,
+            detail="Placeholder replacement is only available for direct scripted-video productions",
+        )
+    parent_board = await session.get(StoryboardVersionModel, storyboard.current_version_id)
+    if parent_board is None:
+        raise HTTPException(status_code=409, detail="Storyboard has no current version")
+    parent_script = await session.get(ScriptVersionModel, parent_board.script_version_id)
+    if parent_script is None:
+        raise HTTPException(status_code=409, detail="Storyboard script version is missing")
+    if script.current_version_id != parent_script.id:
+        raise HTTPException(
+            status_code=409,
+            detail="Storyboard is not based on the current script version; reload before replacing placeholders",
+        )
+    if (
+        parent_script.version_number != payload.expected_script_version
+        or parent_script.content_hash != payload.expected_script_hash
+    ):
+        raise HTTPException(status_code=409, detail="Script version or hash changed; reload before replacing placeholders")
+    if (
+        parent_board.version_number != payload.expected_storyboard_version
+        or parent_board.content_hash != payload.expected_storyboard_hash
+    ):
+        raise HTTPException(status_code=409, detail="Storyboard version or hash changed; reload before replacing placeholders")
+    script_segments = list(
+        await session.scalars(
+            select(ScriptSegmentModel)
+            .where(ScriptSegmentModel.script_version_id == parent_script.id)
+            .order_by(ScriptSegmentModel.segment_order)
+        )
+    )
+    scene_rows = (
+        await session.execute(
+            select(SceneModel, SceneVersionModel)
+            .join(SceneVersionModel, SceneVersionModel.id == SceneModel.current_version_id)
+            .where(SceneModel.storyboard_id == storyboard.id, SceneModel.deleted_at.is_(None))
+            .order_by(SceneVersionModel.scene_order)
+        )
+    ).all()
+    current_tokens = sorted(
+        set(_placeholder_tokens([segment.narration for segment in script_segments]))
+        | set(_placeholder_tokens([segment.presentation_purpose for segment in script_segments]))
+        | set(_placeholder_tokens([segment.citation_display for segment in script_segments]))
+        | set(_placeholder_tokens([segment.annotations for segment in script_segments]))
+        | set(_placeholder_tokens([scene_version.scene_spec for _, scene_version in scene_rows]))
+    )
+    if not current_tokens:
+        raise HTTPException(status_code=409, detail="No unresolved placeholders are present")
+    unknown_tokens = sorted(set(payload.replacements) - set(current_tokens))
+    if unknown_tokens:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Replacement includes unknown placeholders", "placeholder_tokens": unknown_tokens},
+        )
+    next_script_number = int(
+        await session.scalar(
+            select(func.coalesce(func.max(ScriptVersionModel.version_number), 0) + 1)
+            .where(ScriptVersionModel.script_id == script.id)
+        )
+    )
+    next_storyboard_number = int(
+        await session.scalar(
+            select(func.coalesce(func.max(StoryboardVersionModel.version_number), 0) + 1)
+            .where(StoryboardVersionModel.storyboard_id == storyboard.id)
+        )
+    )
+    version_id = uuid4()
+    board_id = uuid4()
+    now = datetime.now(timezone.utc)
+    new_segment_documents: list[dict[str, Any]] = []
+    segment_id_map: dict[str, str] = {}
+    for segment in script_segments:
+        annotation_docs = _replace_placeholder_values(deepcopy(segment.annotations), payload.replacements)
+        segment_document = {
+            "segment_key": segment.segment_key,
+            "segment_type": segment.segment_type,
+            "narration": _replace_placeholder_values(segment.narration, payload.replacements),
+            "presentation_purpose": _replace_placeholder_values(segment.presentation_purpose, payload.replacements),
+            "duration_seconds": segment.duration_seconds,
+            "citation_display": _replace_placeholder_values(deepcopy(segment.citation_display), payload.replacements),
+            "annotations": annotation_docs,
+            "locked": segment.locked,
+        }
+        for annotation in segment_document["annotations"]:
+            if isinstance(annotation, dict) and annotation.get("kind") in {"editorial", "opinion"}:
+                annotation["text"] = _replace_placeholder_values(str(annotation.get("text", "")), payload.replacements) or segment_document["narration"]
+                annotation["start_offset"] = min(int(annotation.get("start_offset", 0) or 0), max(len(segment_document["narration"]) - 1, 0))
+                annotation["end_offset"] = max(int(annotation.get("end_offset", 1) or 1), annotation["start_offset"] + 1)
+                annotation["end_offset"] = min(annotation["end_offset"], len(segment_document["narration"]))
+                if annotation["end_offset"] <= annotation["start_offset"]:
+                    annotation["start_offset"] = 0
+                    annotation["end_offset"] = max(1, len(segment_document["narration"]))
+        new_segment_documents.append(segment_document)
+    remaining_script_tokens = _placeholder_tokens(
+        {"title": parent_script.title, "segments": new_segment_documents}
+    )
+    verification_report = {
+        **(parent_script.verification_report or {}),
+        "valid": True,
+        "deterministic_valid": True,
+        "requires_independent_verification": False,
+        "evidence_required": False,
+        "claim_coverage_applicable": False,
+        "mode": "direct_scripted_video",
+        "source_kind": "direct_scripted_video",
+        "coverage_percent": 0,
+        "issues": [],
+        "placeholder_tokens": remaining_script_tokens,
+        "unresolved_placeholders": remaining_script_tokens,
+        "edit_comment": payload.comment,
+    }
+    script_document = {"title": parent_script.title, "segments": new_segment_documents}
+    script_hash = hashlib.sha256(_canonical(script_document).encode()).hexdigest()
+    session.add(
+        ScriptVersionModel(
+            id=version_id,
+            script_id=script.id,
+            version_number=next_script_number,
+            status="verified",
+            title=parent_script.title,
+            total_duration_seconds=sum(float(item["duration_seconds"]) for item in new_segment_documents),
+            writer_model_id=parent_script.writer_model_id,
+            verifier_model_id=None,
+            writer_prompt_id=parent_script.writer_prompt_id,
+            verifier_prompt_id=None,
+            verification_report=verification_report,
+            coverage_percent=0,
+            content_hash=script_hash,
+            parent_version_id=parent_script.id,
+            workflow_id=f"manual-placeholder-replacement-{version_id}",
+            correlation_id=request.state.correlation_id,
+            created_by=actor.id,
+            created_at=now,
+        )
+    )
+    await session.flush()
+    for segment, document in zip(script_segments, new_segment_documents, strict=True):
+        segment_id = uuid4()
+        segment_id_map[str(segment.id)] = str(segment_id)
+        session.add(
+            ScriptSegmentModel(
+                id=segment_id,
+                script_version_id=version_id,
+                segment_key=document["segment_key"],
+                segment_order=segment.segment_order,
+                segment_type=document["segment_type"],
+                narration=document["narration"],
+                presentation_purpose=document["presentation_purpose"],
+                duration_seconds=document["duration_seconds"],
+                citation_display=document["citation_display"],
+                annotations=document["annotations"],
+                locked=segment.locked,
+                content_hash=hashlib.sha256(_canonical(document).encode()).hexdigest(),
+                created_at=now,
+            )
+        )
+    next_specs = [
+        _replace_segment_ids(
+            _replace_placeholder_values(deepcopy(scene_version.scene_spec), payload.replacements),
+            segment_id_map,
+        )
+        for _, scene_version in scene_rows
+    ]
+    storyboard_errors = validate_storyboard(next_specs, expected_segment_ids=list(segment_id_map.values()))
+    if storyboard_errors:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Storyboard coverage rejected", "issues": list(storyboard_errors)},
+        )
+    remaining_storyboard_tokens = _placeholder_tokens(next_specs)
+    board_hash = hashlib.sha256(_canonical({"scenes": next_specs}).encode()).hexdigest()
+    session.add(
+        StoryboardVersionModel(
+            id=board_id,
+            storyboard_id=storyboard.id,
+            script_version_id=version_id,
+            version_number=next_storyboard_number,
+            status="in_review",
+            content_hash=board_hash,
+            parent_version_id=parent_board.id,
+            workflow_id=f"manual-placeholder-replacement-{board_id}",
+            correlation_id=request.state.correlation_id,
+            created_by=actor.id,
+            created_at=now,
+        )
+    )
+    await session.flush()
+    for (scene, old_version), spec in zip(scene_rows, next_specs, strict=True):
+        next_scene_version = SceneVersionModel(
+            scene_id=scene.id,
+            storyboard_version_id=board_id,
+            version_number=old_version.version_number + 1,
+            scene_order=spec["order"],
+            duration_seconds=spec["duration"],
+            visual_type=spec["visual_type"],
+            scene_spec=spec,
+            content_hash=hashlib.sha256(_canonical(spec).encode()).hexdigest(),
+            parent_version_id=old_version.id,
+            created_by=actor.id,
+            created_at=now,
+        )
+        session.add(next_scene_version)
+        await session.flush()
+        scene.current_version_id = next_scene_version.id
+        scene.version += 1
+        scene.updated_at = now
+    script.current_version_id = version_id
+    script.status = "verified"
+    script.version += 1
+    script.updated_at = now
+    storyboard.current_version_id = board_id
+    storyboard.status = "in_review"
+    storyboard.version += 1
+    storyboard.updated_at = now
+    session.add(
+        WorkflowTransitionModel(
+            aggregate_type="script",
+            aggregate_id=script.id,
+            from_stage=parent_script.status.upper(),
+            to_stage="VERIFIED",
+            reason=payload.comment,
+            actor_id=actor.id,
+            correlation_id=request.state.correlation_id,
+            occurred_at=now,
+        )
+    )
+    await append_audit(
+        session,
+        action="storyboard.placeholders_replaced",
+        actor_id=actor.id,
+        target_type="storyboard_version",
+        target_id=str(board_id),
+        correlation_id=request.state.correlation_id,
+        context={
+            "script_version_id": str(version_id),
+            "parent_script_version_id": str(parent_script.id),
+            "parent_storyboard_version_id": str(parent_board.id),
+            "replacement_tokens": sorted(payload.replacements),
+            "remaining_script_placeholders": remaining_script_tokens,
+            "remaining_storyboard_placeholders": remaining_storyboard_tokens,
+            "script_hash": script_hash,
+            "storyboard_hash": board_hash,
+        },
+    )
+    await session.commit()
+    detail = await _storyboard_detail(session, storyboard)
+    return detail.model_copy(
+        update={
+            "automatic_continuation": AutomaticContinuation(
+                state="awaiting_input",
+                action="review_corrected_versions",
+                message="Placeholder values were saved as new immutable script and storyboard versions. Review and approve the corrected hashes before rendering.",
+            )
+        }
+    )
 
 
 @router.get("/storyboards", response_model=list[StoryboardSummaryView])
@@ -1849,6 +2163,17 @@ async def approve_storyboard(
         raise HTTPException(status_code=409, detail="Storyboard is not reviewable")
     if version.version_number != payload.expected_version or version.content_hash != payload.expected_hash:
         raise HTTPException(status_code=409, detail="Storyboard version or hash changed; reload before approval")
+    script_record = await session.get(ScriptModel, storyboard.script_id)
+    if (
+        script_record is None
+        or script_record.deleted_at is not None
+        or script_record.current_version_id != version.script_version_id
+        or script_record.status != "approved"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Approve the exact current script hash before approving this storyboard",
+        )
     if storyboard.status == "approved":
         return await _storyboard_detail(session, storyboard)
     now = datetime.now(timezone.utc)
@@ -1905,7 +2230,6 @@ async def approve_storyboard(
                 ),
             )
         else:
-            script_record = await session.get(ScriptModel, storyboard.script_id)
             if script_record and script_record.production_brief_id:
                 channel = await session.scalar(
                     select(ChannelProfileModel)

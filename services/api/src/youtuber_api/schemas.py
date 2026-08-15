@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -1403,7 +1404,7 @@ class ScriptVersionEdit(StrictRequestModel):
     expected_version: int = Field(ge=1)
     expected_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     title: str = Field(min_length=1, max_length=300)
-    segments: list[ScriptSegmentWrite] = Field(min_length=8, max_length=200)
+    segments: list[ScriptSegmentWrite] = Field(min_length=1, max_length=200)
     comment: str = Field(min_length=10, max_length=4000)
 
 
@@ -1412,6 +1413,37 @@ class SceneEdit(StrictRequestModel):
     expected_storyboard_version: int = Field(ge=1)
     scene_spec: dict[str, Any]
     comment: str = Field(min_length=10, max_length=4000)
+
+
+class PlaceholderReplacementWrite(StrictRequestModel):
+    expected_script_version: int = Field(ge=1)
+    expected_script_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_storyboard_version: int = Field(ge=1)
+    expected_storyboard_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    replacements: dict[str, str] = Field(min_length=1, max_length=80)
+    comment: str = Field(min_length=10, max_length=4000)
+
+    @field_validator("replacements")
+    @classmethod
+    def validate_replacements(cls, value: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for raw_key, raw_value in value.items():
+            key = raw_key.strip()
+            if not key.startswith("["):
+                key = f"[{key}"
+            if not key.endswith("]"):
+                key = f"{key}]"
+            if not re.fullmatch(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]", key):
+                raise ValueError(f"invalid placeholder token: {raw_key}")
+            replacement = raw_value.strip()
+            if not replacement:
+                raise ValueError(f"replacement for {key} must not be blank")
+            if len(replacement) > 1000:
+                raise ValueError(f"replacement for {key} is too long")
+            if re.search(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]", replacement):
+                raise ValueError(f"replacement for {key} must not contain another placeholder token")
+            normalized[key] = replacement
+        return normalized
 
 
 class SceneLockWrite(StrictRequestModel):

@@ -10,7 +10,11 @@ from youtuber_api.schemas import (
     AllOpportunityArchiveWrite,
     DirectScriptedVideoImportStart,
     ExistingResearchScriptImportStart,
+    PlaceholderReplacementWrite,
     ScoredOpportunityArchiveWrite,
+    ScriptAnnotationWrite,
+    ScriptSegmentWrite,
+    ScriptVersionEdit,
 )
 
 
@@ -82,6 +86,7 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/editorial/scripts/{script_id}/approve" in paths
     assert "/api/v1/editorial/scripts/{script_id}/storyboard-runs" in paths
     assert "/api/v1/editorial/storyboards/{storyboard_id}" in paths
+    assert "/api/v1/editorial/storyboards/{storyboard_id}/placeholders/replace" in paths
     assert "/api/v1/editorial/storyboards/{storyboard_id}/scenes/{scene_id}/lock" in paths
     assert "/api/v1/editorial/storyboards/{storyboard_id}/scenes/{scene_id}/versions" in paths
     assert "/api/v1/editorial/storyboards/{storyboard_id}/scenes/{scene_id}/alternative-runs" in paths
@@ -162,3 +167,52 @@ def test_existing_research_script_import_requires_substantive_text() -> None:
         idempotency_key="import-test",
     )
     assert len(payload.script_text) >= 200
+
+
+def test_placeholder_replacement_normalizes_tokens_and_rejects_nested_placeholders() -> None:
+    payload = PlaceholderReplacementWrite(
+        expected_script_version=1,
+        expected_script_hash="a" * 64,
+        expected_storyboard_version=1,
+        expected_storyboard_hash="b" * 64,
+        replacements={"LEGACY_AKTIV_MIN": "42 Minuten"},
+        comment="Replace benchmark placeholders before render.",
+    )
+    assert payload.replacements == {"[LEGACY_AKTIV_MIN]": "42 Minuten"}
+
+    with pytest.raises(ValidationError):
+        PlaceholderReplacementWrite(
+            expected_script_version=1,
+            expected_script_hash="a" * 64,
+            expected_storyboard_version=1,
+            expected_storyboard_hash="b" * 64,
+            replacements={"[LEGACY_AKTIV_MIN]": "[OTHER_TOKEN]"},
+            comment="Reject values that create another unresolved placeholder.",
+        )
+
+
+def test_direct_script_version_edit_allows_short_scene_plan_schema() -> None:
+    segment = ScriptSegmentWrite(
+        segment_key="s01",
+        segment_type="hook",
+        narration="A concise direct narration segment.",
+        presentation_purpose="Open the direct scripted video.",
+        duration_seconds=20,
+        citation_display={},
+        annotations=[
+            ScriptAnnotationWrite(
+                text="A concise direct narration segment.",
+                start_offset=0,
+                end_offset=35,
+                kind="editorial",
+            )
+        ],
+    )
+    payload = ScriptVersionEdit(
+        expected_version=1,
+        expected_hash="c" * 64,
+        title="Short direct script",
+        segments=[segment],
+        comment="Direct scripts may preserve a short operator scene plan.",
+    )
+    assert len(payload.segments) == 1
