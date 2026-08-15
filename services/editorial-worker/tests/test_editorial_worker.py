@@ -754,6 +754,11 @@ def test_extractive_fallback_avoids_repeating_selected_role_blocks() -> None:
     assert counter_segments[0]["sentences"][0]["text"] != counter_segments[1]["sentences"][0]["text"]
     assert counter_segments[0]["sentences"][0]["claim_ids"]
     assert counter_segments[1]["sentences"][0]["claim_ids"]
+    assert all(
+        len(" ".join(sentence["text"] for sentence in segment["sentences"]).split())
+        >= 45
+        for segment in counter_segments
+    )
 
 
 def test_safe_counterevidence_makes_no_factual_assertion() -> None:

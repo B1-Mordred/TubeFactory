@@ -1638,6 +1638,16 @@ def _extractive_fallback_content(
                     "claim_ids": [],
                     "evidence_excerpt_ids": [],
                 },
+                {
+                    "text": (
+                        "Die Folge kann dadurch klar zeigen, welche Voraussetzung noch "
+                        "geklärt werden muss, bevor aus einem plausiblen Ansatz eine "
+                        "verlässliche Erwartung wird."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
             ]
         if segment_type == "uncertainty":
             return _safe_uncertainty_segment()["sentences"] + [
@@ -1686,7 +1696,16 @@ def _extractive_fallback_content(
                     "kind": "editorial",
                     "claim_ids": [],
                     "evidence_excerpt_ids": [],
-                }
+                },
+                {
+                    "text": (
+                        "Achte dabei besonders darauf, wo eine Quelle direkt belegt, "
+                        "wo wir vorsichtig einordnen und welche Frage offen bleibt."
+                    ),
+                    "kind": "editorial",
+                    "claim_ids": [],
+                    "evidence_excerpt_ids": [],
+                },
             ]
         title = str(context.get("structured_inputs", {}).get("title") or "Explainer")
         if segment_type == "hook":
@@ -1707,6 +1726,15 @@ def _extractive_fallback_content(
                 "text": (
                     "So entsteht zusätzlicher Nutzen für das Publikum, ohne bereits "
                     "erklärte Aussagen nur noch einmal zu wiederholen."
+                ),
+                "kind": "editorial",
+                "claim_ids": [],
+                "evidence_excerpt_ids": [],
+            },
+            {
+                "text": (
+                    "Der Abschnitt beantwortet deshalb nicht nur, was belegt ist, "
+                    "sondern auch, warum dieser Punkt für die Gesamtfrage zählt."
                 ),
                 "kind": "editorial",
                 "claim_ids": [],
