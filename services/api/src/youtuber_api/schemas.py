@@ -840,6 +840,20 @@ class AllOpportunityArchiveView(BaseModel):
     archived_at: datetime
 
 
+class WorkflowActivityStatus(BaseModel):
+    activity_id: str
+    activity_type: str
+    label: str
+    state: str
+    attempt: int | None = None
+    maximum_attempts: int | None = None
+    scheduled_at: datetime | None = None
+    started_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    worker_identity: str | None = None
+    heartbeat: dict[str, Any] = Field(default_factory=dict)
+
+
 class ResearchWorkflowView(BaseModel):
     workflow_id: str
     state: str
@@ -850,6 +864,7 @@ class ResearchWorkflowView(BaseModel):
     ]
     retryable: bool
     correlation_id: str | None = None
+    activity_status: list[WorkflowActivityStatus] = Field(default_factory=list)
 
 
 class ResearchWorkflowCancel(StrictRequestModel):

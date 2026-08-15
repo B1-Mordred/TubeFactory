@@ -5,7 +5,7 @@ from typing import Any
 
 from temporalio.client import Client
 from temporalio.client import WorkflowExecutionStatus
-from temporalio.api.enums.v1 import EventType
+from temporalio.api.enums.v1 import EventType, PendingActivityState
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError
@@ -63,6 +63,7 @@ class TemporalResearchGateway:
         handle = self.client.get_workflow_handle(workflow_id)
         description = await handle.describe()
         execution_status = _execution_status_name(description.status)
+        activity_status = await _safe_pending_activity_status(description)
         last_error: RPCError | None = None
         query_attempts = 30 if execution_status == "RUNNING" else 1
         for _ in range(query_attempts):
@@ -75,6 +76,7 @@ class TemporalResearchGateway:
                     "execution_status": execution_status,
                     "retryable": execution_status
                     in {"FAILED", "CANCELLED", "TERMINATED", "TIMED_OUT"},
+                    "activity_status": activity_status,
                 }
             except RPCError as exc:
                 last_error = exc
@@ -88,6 +90,7 @@ class TemporalResearchGateway:
                 "execution_status": execution_status,
                 "retryable": execution_status
                 in {"FAILED", "CANCELLED", "TERMINATED", "TIMED_OUT"},
+                "activity_status": activity_status,
             }
         assert last_error is not None
         raise last_error
@@ -172,6 +175,92 @@ def _execution_status_name(status: WorkflowExecutionStatus | None) -> str:
     return status.name
 
 
+def _timestamp(value: Any) -> Any:
+    try:
+        dt = value.ToDatetime()
+    except (AttributeError, ValueError):
+        return None
+    if getattr(dt, "year", 1) <= 1:
+        return None
+    return dt
+
+
+def _safe_heartbeat(value: Any) -> dict[str, Any]:
+    if isinstance(value, list):
+        value = value[-1] if value else None
+    if isinstance(value, str):
+        return {"message": value[:240]}
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "provider",
+        "state",
+        "segment_order",
+        "segment_count",
+        "chunk_index",
+        "chunk_count",
+        "attempt",
+        "max_attempts",
+        "status_code",
+        "delay_seconds",
+        "elapsed_seconds",
+        "retry_window_seconds",
+        "detail",
+    }
+    safe: dict[str, Any] = {}
+    for key in allowed:
+        if key not in value:
+            continue
+        item = value[key]
+        if isinstance(item, str):
+            safe[key] = item.replace("\n", " ")[:240]
+        elif isinstance(item, bool | int | float) or item is None:
+            safe[key] = item
+    return safe
+
+
+async def _safe_pending_activity_status(description: Any) -> list[dict[str, Any]]:
+    raw_description = getattr(description, "raw_description", None)
+    pending = list(getattr(raw_description, "pending_activities", []) or [])
+    if not pending:
+        return []
+    data_converter = getattr(description, "data_converter", None)
+    items: list[dict[str, Any]] = []
+    for activity in pending[:10]:
+        activity_type = str(activity.activity_type.name)
+        heartbeat: dict[str, Any] = {}
+        heartbeat_details = getattr(activity, "heartbeat_details", None)
+        if data_converter is not None and heartbeat_details is not None and heartbeat_details.payloads:
+            try:
+                heartbeat = _safe_heartbeat(await data_converter.decode_wrapper(heartbeat_details))
+            except Exception:
+                heartbeat = {}
+        try:
+            state = PendingActivityState.Name(activity.state)
+        except ValueError:
+            state = "PENDING_ACTIVITY_STATE_UNSPECIFIED"
+        items.append(
+            {
+                "activity_id": str(activity.activity_id),
+                "activity_type": activity_type,
+                "label": _safe_activity_label(activity_type),
+                "state": state,
+                "attempt": int(activity.attempt) if activity.attempt else None,
+                "maximum_attempts": int(activity.maximum_attempts)
+                if activity.maximum_attempts
+                else None,
+                "scheduled_at": _timestamp(activity.scheduled_time),
+                "started_at": _timestamp(activity.last_started_time),
+                "last_heartbeat_at": _timestamp(activity.last_heartbeat_time),
+                "worker_identity": str(activity.last_worker_identity)[:160]
+                if activity.last_worker_identity
+                else None,
+                "heartbeat": heartbeat,
+            }
+        )
+    return items
+
+
 def _safe_activity_label(activity_type: str) -> str:
     return {
         "run-fixture-pipeline": "Deterministic acceptance pipeline",
@@ -194,4 +283,14 @@ def _safe_activity_label(activity_type: str) -> str:
         "load-storyboard-generation-context": "Exact approved script snapshot",
         "validate-storyboard-draft": "Strict SceneSpec policy validation",
         "persist-storyboard-result": "Immutable storyboard version persistence",
+        "load-media-production-context": "Exact media production input",
+        "record-media-production-state": "Media production state update",
+        "generate-production-narration": "Generate narration audio",
+        "synchronize-media-timing": "Synchronize narration timeline",
+        "persist-media-timeline-draft": "Persist narration-first timeline",
+        "generate-scene-media-assets": "Generate scene visuals",
+        "assemble-and-qa-production": "Assemble render and run QA",
+        "persist-media-production": "Persist render result",
+        "load-media-timeline-render-context": "Load approved timeline render input",
+        "persist-media-regeneration": "Persist media regeneration",
     }.get(activity_type, "Workflow activity")

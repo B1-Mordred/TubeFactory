@@ -216,6 +216,10 @@ aside nav button.active { box-shadow:inset 3px 0 var(--green); }
 .workflow-log time { color:var(--green); font-variant-numeric:tabular-nums; }
 .workflow-log .warning { color:var(--amber); }
 .workflow-log .error { color:var(--red); }
+.activity-status { grid-column:1/-1; display:grid; gap:.28rem; padding:.75rem .85rem; border-left:3px solid var(--green); border-radius:7px; background:#edf6f1; color:var(--forest); font-size:.72rem; }
+.activity-status.waiting { border-color:var(--amber); background:#fff6e7; color:#76501f; }
+.activity-status strong,.activity-status span,.activity-status small { display:block; }
+.activity-status small { color:inherit; overflow-wrap:anywhere; }
 .discovery-health { grid-column:1/-1; display:grid; gap:.28rem; padding:.75rem .85rem; border-left:3px solid var(--green); border-radius:7px; background:#edf6f1; color:var(--forest); font-size:.72rem; }
 .discovery-health.waiting { border-color:var(--amber); background:#fff6e7; color:#76501f; }
 .discovery-health.bad { border-color:var(--red); background:#fbefed; color:#7e3027; }
@@ -451,6 +455,10 @@ aside nav button.active { box-shadow:inset 3px 0 var(--green); }
 .publishing-layout { grid-template-columns:minmax(360px,1fr) minmax(420px,1.05fr); }
 .media-layout .panel,.review-layout .panel { min-width:0; }
 .media-player video { display:block; width:100%; aspect-ratio:16/9; background:#07101d; border-radius:10px; }
+.production-workflow-detail { display:grid; gap:.55rem; margin-top:.8rem; padding:.75rem; border:1px solid var(--line); border-radius:8px; background:#fbfcfb; }
+.production-workflow-detail strong,.production-workflow-detail small { display:block; }
+.production-workflow-detail small { margin-top:.2rem; color:var(--muted); font-size:.68rem; overflow-wrap:anywhere; }
+.production-workflow-detail .activity-status { margin:0; }
 .hash-grid { display:grid; gap:.4rem; margin-top:.8rem; padding:.75rem; background:#f7f9f7; border:1px solid var(--line); border-radius:8px; }
 .hash-grid span { display:grid; grid-template-columns:75px 1fr; gap:.5rem; color:var(--muted); font-size:.67rem; }
 .hash-grid code { overflow-wrap:anywhere; }
