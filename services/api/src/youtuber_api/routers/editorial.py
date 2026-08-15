@@ -65,6 +65,7 @@ from youtuber_api.schemas import (
     EditorialApprovalWrite,
     ExistingResearchScriptImportStart,
     MediaProductionStart,
+    MediaTimelineDraftStart,
     PlaceholderReplacementWrite,
     ResearchWorkflowCancel,
     ResearchWorkflowLogEntry,
@@ -104,6 +105,8 @@ _EDITORIAL_WORKFLOWS = {
     "scene-alternative-generation",
     "storyboard-generation",
     "media-production",
+    "media-timeline-draft",
+    "media-timeline-render",
     "scene-media-regeneration",
     "narration-segment-regeneration",
 }
@@ -2209,7 +2212,8 @@ async def approve_storyboard(
     )
     existing_production = await session.scalar(
         select(MediaProductionModel.id).where(
-            MediaProductionModel.storyboard_version_id == version.id
+            MediaProductionModel.storyboard_version_id == version.id,
+            MediaProductionModel.state.notin_({"failed", "cancelled"}),
         )
     )
     if existing_production:
@@ -2317,30 +2321,59 @@ async def approve_storyboard(
                 except (TypeError, ValueError):
                     fps = 24 if render_tier == "full" else 12
                 idempotency_key = f"approval-{version.id.hex}-v{version.version_number}"
-                from youtuber_api.routers.media import start_production
+                media_workflow_type = str(
+                    render_settings.get("media_workflow_type", "narration_timeline")
+                )
+                if media_workflow_type == "legacy_one_step":
+                    from youtuber_api.routers.media import start_production
 
-                run = await start_production(
-                    MediaProductionStart(
-                        storyboard_version_id=version.id,
-                        expected_storyboard_hash=version.content_hash,
-                        render_tier=render_tier,
-                        workflow_key=comfy_workflow.workflow_key,
-                        voice_profile_key=voice.profile_key,
-                        width=width,
-                        height=height,
-                        fps=fps,
-                        idempotency_key=idempotency_key,
-                    ),
-                    request,
-                    actor,
-                    session,
-                )
-                continuation = AutomaticContinuation(
-                    state="started",
-                    action="media_production",
-                    workflow_id=run.workflow_id,
-                    message="Media production and automated QA started from the approved storyboard hash.",
-                )
+                    run = await start_production(
+                        MediaProductionStart(
+                            storyboard_version_id=version.id,
+                            expected_storyboard_hash=version.content_hash,
+                            render_tier=render_tier,
+                            workflow_key=comfy_workflow.workflow_key,
+                            voice_profile_key=voice.profile_key,
+                            width=width,
+                            height=height,
+                            fps=fps,
+                            idempotency_key=idempotency_key,
+                        ),
+                        request,
+                        actor,
+                        session,
+                    )
+                    continuation = AutomaticContinuation(
+                        state="started",
+                        action="media_production",
+                        workflow_id=run.workflow_id,
+                        message="Legacy one-step media production started from the approved storyboard hash because the channel render settings explicitly selected legacy_one_step.",
+                    )
+                else:
+                    from youtuber_api.routers.media import start_timeline_draft
+
+                    run = await start_timeline_draft(
+                        MediaTimelineDraftStart(
+                            storyboard_version_id=version.id,
+                            expected_storyboard_hash=version.content_hash,
+                            render_tier=render_tier,
+                            workflow_key=comfy_workflow.workflow_key,
+                            voice_profile_key=voice.profile_key,
+                            width=width,
+                            height=height,
+                            fps=fps,
+                            idempotency_key=idempotency_key,
+                        ),
+                        request,
+                        actor,
+                        session,
+                    )
+                    continuation = AutomaticContinuation(
+                        state="started",
+                        action="media_timeline_draft",
+                        workflow_id=run.workflow_id,
+                        message="Narration-first timeline generation started from the approved storyboard hash. Review the timeline before rendering.",
+                    )
     await append_audit(
         session,
         action=f"automation.storyboard_{continuation.state}",
