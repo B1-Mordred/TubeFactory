@@ -103,7 +103,10 @@ def _topic_excerpt(value: str, *, limit: int = 180) -> str:
 
 
 def _scene_concreteness_errors(
-    scenes: list[dict[str, Any]], segment_narrations: dict[str, str]
+    scenes: list[dict[str, Any]],
+    segment_narrations: dict[str, str],
+    *,
+    require_topic_alignment: bool = True,
 ) -> list[str]:
     """Reject production placeholders while keeping creative choices model-owned."""
 
@@ -131,7 +134,11 @@ def _scene_concreteness_errors(
             if token not in {"diese", "dieser", "einen", "einer", "werden", "wurde", "sowie"}
         }
         scene_tokens = set(re.findall(r"[\wÄÖÜäöüß-]{5,}", normalized.casefold()))
-        if topic_tokens and not topic_tokens.intersection(scene_tokens):
+        if (
+            require_topic_alignment
+            and topic_tokens
+            and not topic_tokens.intersection(scene_tokens)
+        ):
             errors.append(f"scene[{index}]: visual plan is not tied to its narration topic")
         brief_key = re.sub(r"\W+", " ", brief.casefold()).strip()
         if brief_key in seen_briefs:
@@ -847,6 +854,7 @@ async def validate_storyboard_activity(request: dict[str, Any]) -> dict[str, Any
                 str(key): str(value)
                 for key, value in request.get("segment_narrations", {}).items()
             },
+            require_topic_alignment=request.get("source_kind") != "direct_scripted_video",
         )
     )
     known_segments = set(request["expected_segment_ids"])

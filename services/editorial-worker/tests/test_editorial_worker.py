@@ -1933,6 +1933,56 @@ async def test_storyboard_rejects_claim_or_source_outside_referenced_segment() -
         )
 
 
+async def test_direct_storyboard_allows_human_visual_direction_without_token_overlap() -> None:
+    segment_id = str(uuid4())
+    output = fake_output(
+        "storyboard",
+        {
+            "script_version_id": str(uuid4()),
+            "segments": [
+                {
+                    "id": segment_id,
+                    "presentation_purpose": "Explain",
+                    "narration": (
+                        "Single-site precision evaluates repeated quantitative measurements "
+                        "under defined conditions."
+                    ),
+                    "duration_seconds": 12,
+                    "annotations": [],
+                }
+            ],
+        },
+        "storyboard",
+    )
+    output["scenes"][0]["purpose"] = "Administrative handoffs"
+    output["scenes"][0]["visual_brief"] = (
+        "A clean timeline of office handoffs, review status cards, version stamps, "
+        "and document storage locations."
+    )
+    output["scenes"][0]["on_screen_text"] = ["Workflow handoffs"]
+    request = {
+        "draft": output,
+        "expected_segment_ids": [segment_id],
+        "segment_narrations": {
+            segment_id: (
+                "Single-site precision evaluates repeated quantitative measurements "
+                "under defined conditions."
+            )
+        },
+        "allowed_claim_ids": {segment_id: []},
+        "allowed_source_ids": {segment_id: []},
+    }
+
+    with pytest.raises(ApplicationError, match="visual plan is not tied"):
+        await validate_storyboard_activity(request)
+
+    validated = await validate_storyboard_activity(
+        {**request, "source_kind": "direct_scripted_video"}
+    )
+
+    assert validated["scenes"][0]["visual_brief"] == output["scenes"][0]["visual_brief"]
+
+
 async def test_scene_alternative_is_distinct_and_preserves_combined_coverage() -> None:
     segment_id = str(uuid4())
     claim_id = str(uuid4())

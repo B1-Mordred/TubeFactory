@@ -2896,6 +2896,7 @@ class StoryboardGenerationWorkflow:
                 "segment_narrations": context["segment_narrations"],
                 "allowed_claim_ids": context["allowed_claim_ids"],
                 "allowed_source_ids": context["allowed_source_ids"],
+                "source_kind": context.get("source_kind"),
             },
             start_to_close_timeout=timedelta(seconds=45),
             retry_policy=RetryPolicy(maximum_attempts=1),
