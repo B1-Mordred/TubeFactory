@@ -37,6 +37,10 @@ export const validateRenderRequest = (value) => {
     const assetMimeType = scene.assetMimeType === undefined ? null : String(scene.assetMimeType);
     const assetHash = scene.assetHash === undefined ? null : String(scene.assetHash);
     if (assetUrl && (!ASSET_MIME_TYPES.has(assetMimeType) || !SAFE_HASH.test(assetHash))) throw new Error('scene asset metadata is invalid');
+    const trimStartSeconds = Number(scene.trimStartSeconds ?? 0);
+    const trimEndSeconds = scene.trimEndSeconds === undefined || scene.trimEndSeconds === null ? null : Number(scene.trimEndSeconds);
+    if (!Number.isFinite(trimStartSeconds) || trimStartSeconds < 0 || trimStartSeconds > 7200) throw new Error('invalid scene trim start');
+    if (trimEndSeconds !== null && (!Number.isFinite(trimEndSeconds) || trimEndSeconds <= trimStartSeconds || trimEndSeconds > 7200)) throw new Error('invalid scene trim end');
     return {
       sceneVersionId: scene.sceneVersionId,
       purpose: String(scene.purpose ?? '').slice(0, 2000),
@@ -47,6 +51,8 @@ export const validateRenderRequest = (value) => {
       assetUrl,
       assetMimeType,
       assetHash,
+      trimStartSeconds,
+      trimEndSeconds,
       durationSeconds: scene.durationSeconds,
     };
   });

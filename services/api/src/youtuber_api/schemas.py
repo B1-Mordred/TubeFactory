@@ -1574,6 +1574,21 @@ class MediaProductionStart(StrictRequestModel):
     idempotency_key: str = Field(min_length=8, max_length=120, pattern=r"^[a-zA-Z0-9_.:-]+$")
 
 
+class MediaTimelineDraftStart(MediaProductionStart):
+    pass
+
+
+class MediaTimelinePlanWrite(StrictRequestModel):
+    expected_timeline_plan_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    timeline_plan: dict[str, Any]
+    comment: str = Field(default="Updated narration timeline plan.", min_length=3, max_length=2000)
+
+
+class MediaTimelineRenderStart(StrictRequestModel):
+    expected_timeline_plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency_key: str = Field(min_length=8, max_length=120, pattern=r"^[a-zA-Z0-9_.:-]+$")
+
+
 class MediaRegenerationStart(StrictRequestModel):
     instruction: str = Field(min_length=10, max_length=2000)
     idempotency_key: str = Field(min_length=8, max_length=120, pattern=r"^[a-zA-Z0-9_.:-]+$")
@@ -1624,6 +1639,8 @@ class MediaProductionView(BaseModel):
     qa: dict[str, Any] | None
     findings: list[QAFindingView]
     approval: dict[str, Any] | None
+    timeline_plan: dict[str, Any] | None = None
+    timeline_plan_hash: str | None = None
     automatic_continuation: AutomaticContinuation | None = None
 
 

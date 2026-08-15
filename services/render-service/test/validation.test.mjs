@@ -19,6 +19,13 @@ test('accepts only hashed scene assets from the internal media origin', () => {
   assert.throws(() => validateRenderRequest({width: 854, height: 480, fps: 24, scenes: [{sceneVersionId: 's1', durationSeconds: 2, assetUrl: 'http://evil.test/image.png', assetMimeType: 'image/png', assetHash: 'a'.repeat(64)}]}), /internal media origin/);
 });
 
+test('normalizes operator clip trim ranges', () => {
+  const value = validateRenderRequest({width: 854, height: 480, fps: 24, scenes: [{sceneVersionId: 's1', durationSeconds: 2, purpose: 'Purpose', assetUrl: 'http://minio:9000/production-artifacts/productions/p/scenes/1.mp4?signature=test', assetMimeType: 'video/mp4', assetHash: 'a'.repeat(64), trimStartSeconds: 1.25, trimEndSeconds: 3.5}], brand: {name: 'Channel'}});
+  assert.equal(value.scenes[0].trimStartSeconds, 1.25);
+  assert.equal(value.scenes[0].trimEndSeconds, 3.5);
+  assert.throws(() => validateRenderRequest({width: 854, height: 480, fps: 24, scenes: [{sceneVersionId: 's1', durationSeconds: 2, trimStartSeconds: 5, trimEndSeconds: 4}]}), /trim end/);
+});
+
 test('normalizes the constrained Channel Brand Kit without accepting CSS', () => {
   const value = validateRenderRequest({width: 854, height: 480, fps: 24, scenes: [{sceneVersionId: 's1', durationSeconds: 2}], brand: {logo_text: 'FS', accent: '#D6A43A', heading_font: 'serif', motion_style: 'calm', corner_style: 'soft', image_treatment: 'editorial'}});
   assert.equal(value.brand.logoText, 'FS');

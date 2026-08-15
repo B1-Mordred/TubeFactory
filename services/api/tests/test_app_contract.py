@@ -93,6 +93,15 @@ def test_application_routes_can_be_constructed() -> None:
     assert "/api/v1/editorial/storyboards/{storyboard_id}/scenes/{scene_id}/alternatives" in paths
     assert "/api/v1/editorial/storyboards/{storyboard_id}/scenes/{scene_id}/alternatives/{alternative_id}/select" in paths
     assert "/api/v1/editorial/storyboards/{storyboard_id}/approve" in paths
+    assert "/api/v1/media/productions" in paths
+    assert "/api/v1/media/timeline-drafts" in paths
+    assert "/api/v1/media/productions/{production_id}/clips" in paths
+    assert "/api/v1/media/productions/{production_id}/timeline-plan" in paths
+    assert "/api/v1/media/productions/{production_id}/timeline-render" in paths
+    assert "POST" in methods_by_path["/api/v1/media/timeline-drafts"]
+    assert "POST" in methods_by_path["/api/v1/media/productions/{production_id}/clips"]
+    assert "PUT" in methods_by_path["/api/v1/media/productions/{production_id}/timeline-plan"]
+    assert "POST" in methods_by_path["/api/v1/media/productions/{production_id}/timeline-render"]
     assert "/api/v1/publishing/configuration" in paths
     assert "/api/v1/publishing/oauth/start" in paths
     assert "/api/v1/publishing/oauth/callback" in paths

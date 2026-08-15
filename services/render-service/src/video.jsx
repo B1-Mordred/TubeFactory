@@ -20,11 +20,13 @@ const Scene = ({scene, brand, fps}) => {
   const radius = radii[brand.cornerStyle] ?? radii.soft;
   const video = scene.assetUrl && scene.assetMimeType?.startsWith('video/');
   const image = scene.assetUrl && scene.assetMimeType?.startsWith('image/');
+  const trimStartFrames = Math.max(0, Math.round((scene.trimStartSeconds || 0) * fps));
+  const trimEndFrames = scene.trimEndSeconds ? Math.max(trimStartFrames + 1, Math.round(scene.trimEndSeconds * fps)) : undefined;
   const overlay = brand.imageTreatment === 'cinematic' ? '.72' : brand.imageTreatment === 'documentary' ? '.58' : brand.imageTreatment === 'clean' ? '.32' : '.48';
   return (
     <AbsoluteFill style={{background: brand.background, color: brand.text, fontFamily: fonts[brand.bodyFont], opacity, overflow: 'hidden'}}>
       {image ? <Img src={scene.assetUrl} style={{position: 'absolute', inset: '-2%', width: '104%', height: '104%', objectFit: 'cover', transform: `scale(${scale})`}} /> : null}
-      {video ? <OffthreadVideo src={scene.assetUrl} muted style={{position: 'absolute', inset: 0, width, height, objectFit: 'cover'}} /> : null}
+      {video ? <OffthreadVideo src={scene.assetUrl} muted startFrom={trimStartFrames} endAt={trimEndFrames} style={{position: 'absolute', inset: 0, width, height, objectFit: 'cover'}} /> : null}
       {!image && !video ? <AbsoluteFill style={{background: `radial-gradient(circle at 76% 20%, ${brand.accent}88, transparent 34%), linear-gradient(135deg, ${brand.background}, ${brand.primary}55)`}} /> : null}
       <AbsoluteFill style={{background: `linear-gradient(90deg, ${brand.background}F2 0%, ${brand.background}${Math.round(Number(overlay) * 255).toString(16).padStart(2, '0')} 48%, transparent 82%)`}} />
       <div style={{position: 'absolute', inset: '6%', display: 'flex', flexDirection: 'column'}}>

@@ -43,18 +43,26 @@ def _production_id(workflow_id: str) -> UUID:
 
 
 def _production_settings(context: dict[str, Any]) -> str:
-    return json.dumps(
-        {
-            "width": context["width"],
-            "height": context["height"],
-            "fps": context["fps"],
-            "comfy_workflow_version_id": context["comfy_workflow"]["id"],
-            "voice_profile_version_id": context["voice_profile"]["id"],
-            "channel_profile_version": context["channel_profile_version"],
-            "brand_hash": context["brand_hash"],
-            "production_duration_seconds": context.get("production_duration_seconds"),
-        }
-    )
+    settings = {
+        "width": context["width"],
+        "height": context["height"],
+        "fps": context["fps"],
+        "comfy_workflow_version_id": context["comfy_workflow"]["id"],
+        "voice_profile_version_id": context["voice_profile"]["id"],
+        "channel_profile_version": context["channel_profile_version"],
+        "brand_hash": context["brand_hash"],
+        "production_duration_seconds": context.get("production_duration_seconds"),
+    }
+    for key in (
+        "timeline_plan",
+        "timeline_plan_hash",
+        "timeline_plan_updated_at",
+        "timeline_source_workflow_id",
+        "render_workflow_id",
+    ):
+        if key in context:
+            settings[key] = context[key]
+    return json.dumps(settings)
 
 
 def _minio(settings: Settings) -> Minio:
@@ -244,6 +252,7 @@ async def record_media_production_state(request: dict[str, Any]) -> dict[str, An
         "generating_narration",
         "assembling",
         "quality_assurance",
+        "timeline_ready",
         "failed",
         "cancelled",
     }:
@@ -260,8 +269,9 @@ async def record_media_production_state(request: dict[str, Any]) -> dict[str, An
         production_id = UUID(context["production_id"])
         completed_at = now if state in {"failed", "cancelled"} else None
         existing = await connection.fetchrow(
-            "SELECT id,completed_at FROM media_productions WHERE workflow_id=$1",
+            "SELECT id,completed_at FROM media_productions WHERE workflow_id=$1 OR id=$2",
             context["workflow_id"],
+            UUID(context["production_id"]),
         )
         if existing:
             await connection.execute(
@@ -371,6 +381,147 @@ async def synchronize_media_timing(request: dict[str, Any]) -> dict[str, Any]:
     return {"context": context, "narration": narration}
 
 
+def _timeline_plan_hash(plan: dict[str, Any]) -> str:
+    clean = {
+        key: value
+        for key, value in plan.items()
+        if key not in {"content_hash", "updated_at"}
+    }
+    return canonical_hash(clean)
+
+
+def _build_default_timeline_plan(
+    context: dict[str, Any], narration: dict[str, Any]
+) -> dict[str, Any]:
+    combined_audio_asset_id = str(narration["combined_audio_asset_id"])
+    scenes: list[dict[str, Any]] = []
+    video_track: list[dict[str, Any]] = []
+    cursor = 0.0
+    for scene in context["scenes"]:
+        scene_id = f"storyboard:{scene['id']}"
+        duration = round(float(scene["duration_seconds"]), 3)
+        start = round(cursor, 3)
+        end = round(cursor + duration, 3)
+        spec = scene["scene_spec"]
+        narration_segment_ids = [
+            str(value) for value in spec.get("narration_segment_ids", [])
+        ]
+        scenes.append(
+            {
+                "id": scene_id,
+                "role": "storyboard",
+                "scene_version_id": scene["id"],
+                "scene_hash": scene["content_hash"],
+                "title": str(spec.get("purpose") or f"Scene {scene['order']}")[:200],
+                "start_seconds": start,
+                "duration_seconds": duration,
+                "end_seconds": end,
+                "narration_segment_ids": narration_segment_ids,
+                "on_screen_text": list(spec.get("on_screen_text", []))[:20],
+                "video": {
+                    "mode": "generated",
+                    "asset_id": None,
+                    "source_start_seconds": 0.0,
+                    "source_end_seconds": None,
+                    "fit": "cover",
+                    "volume": 0.0,
+                },
+                "audio": {"mode": "narration", "asset_id": combined_audio_asset_id},
+                "locked_to_narration": True,
+                "can_delete": False,
+            }
+        )
+        video_track.append(
+            {
+                "id": f"video:{scene_id}",
+                "kind": "scene_visual",
+                "scene_id": scene_id,
+                "asset_id": None,
+                "mode": "generated",
+                "start_seconds": start,
+                "duration_seconds": duration,
+                "end_seconds": end,
+                "source_start_seconds": 0.0,
+                "source_end_seconds": None,
+                "fit": "cover",
+                "volume": 0.0,
+            }
+        )
+        cursor = end
+    plan = {
+        "schema_version": "media_timeline.v1",
+        "production_id": context["production_id"],
+        "storyboard_version_id": context["storyboard_version_id"],
+        "storyboard_hash": context["storyboard_hash"],
+        "render_tier": context["render_tier"],
+        "width": context["width"],
+        "height": context["height"],
+        "fps": context["fps"],
+        "voice_profile": {
+            "id": context["voice_profile"]["id"],
+            "profile_key": context["voice_profile"]["profile_key"],
+            "version_number": context["voice_profile"]["version_number"],
+            "content_hash": context["voice_profile"]["content_hash"],
+            "language": context["voice_profile"]["language"],
+            "engine": context["voice_profile"]["engine"],
+            "delivery": context["voice_profile"]["delivery"],
+            "output_settings": context["voice_profile"]["output_settings"],
+        },
+        "duration_seconds": round(cursor, 3),
+        "narration": {
+            "asset_id": combined_audio_asset_id,
+            "object_key": narration["combined_audio_key"],
+            "duration_seconds": round(float(narration["duration_seconds"]), 3),
+            "chapters": narration["chapters"],
+        },
+        "scenes": scenes,
+        "tracks": {
+            "video": video_track,
+            "audio": [
+                {
+                    "id": "audio:narration-master",
+                    "kind": "narration",
+                    "asset_id": combined_audio_asset_id,
+                    "start_seconds": 0.0,
+                    "duration_seconds": round(float(narration["duration_seconds"]), 3),
+                    "end_seconds": round(float(narration["duration_seconds"]), 3),
+                    "source_start_seconds": 0.0,
+                    "source_end_seconds": round(float(narration["duration_seconds"]), 3),
+                    "volume": 1.0,
+                    "locked": True,
+                }
+            ],
+            "music": [],
+            "sfx": [],
+        },
+        "editorial_controls": {
+            "intro_outro_scenes": "operator_may_add_before_or_after_narration",
+            "storyboard_scenes": "locked_to_measured_narration",
+            "approved_storyboard_mutation": False,
+        },
+    }
+    plan["content_hash"] = _timeline_plan_hash(plan)
+    plan["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return plan
+
+
+def _timeline_scene_clip(plan: dict[str, Any], scene_id: str) -> dict[str, Any] | None:
+    for scene in plan.get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        if scene.get("scene_version_id") != scene_id and scene.get("id") != scene_id:
+            continue
+        video = scene.get("video") if isinstance(scene.get("video"), dict) else {}
+        asset_id = video.get("asset_id") or scene.get("video_asset_id")
+        if isinstance(asset_id, str) and asset_id:
+            return {
+                **video,
+                "asset_id": asset_id,
+                "scene_id": str(scene.get("id") or scene_id),
+            }
+    return None
+
+
 def _fixture_png(scene: dict[str, Any], width: int, height: int) -> bytes:
     seed = int(hashlib.sha256(scene["content_hash"].encode()).hexdigest()[:6], 16)
     image = Image.new("RGB", (width, height), ((seed >> 16) & 80, (seed >> 8) & 80, seed & 80))
@@ -395,8 +546,25 @@ async def generate_scene_media_assets(context: dict[str, Any]) -> dict[str, Any]
     workflow = context["comfy_workflow"]
     capability_hash = canonical_hash({"required_nodes": workflow["required_nodes"], "required_models": workflow["required_models"]})
     assets: list[dict[str, Any]] = []
+    bindings: dict[str, dict[str, Any]] = {}
+    existing_assets = {
+        str(asset["id"]): asset
+        for asset in context.get("existing_assets", [])
+        if isinstance(asset, dict)
+    }
+    timeline_plan = context.get("timeline_plan") if isinstance(context.get("timeline_plan"), dict) else {}
     for scene in context["scenes"]:
         activity.heartbeat(f"scene {scene['order']} of {len(context['scenes'])}")
+        clip = _timeline_scene_clip(timeline_plan, scene["id"]) if timeline_plan else None
+        if clip is not None:
+            asset = existing_assets.get(str(clip["asset_id"]))
+            if asset is None:
+                raise ApplicationError(
+                    f"timeline scene {scene['id']} references a missing operator clip",
+                    non_retryable=True,
+                )
+            bindings[scene["id"]] = {**asset, "timeline_clip": clip}
+            continue
         seed = int(hashlib.sha256(f"{context['storyboard_hash']}:{scene['id']}".encode()).hexdigest()[:16], 16)
         inputs = {"prompt": scene["scene_spec"]["visual_brief"], "seed": seed, "width": context["width"], "height": context["height"], "duration": scene["duration_seconds"]}
         cache_key = canonical_hash({"workflow_hash": workflow["content_hash"], "scene_hash": scene["content_hash"], "inputs": inputs, "capability_hash": capability_hash})
@@ -421,8 +589,10 @@ async def generate_scene_media_assets(context: dict[str, Any]) -> dict[str, Any]
         scene_root = f"productions/{production_id}/regenerations/{context['workflow_id']}/scenes" if context.get("regeneration") else f"productions/{production_id}/scenes"
         key = f"{scene_root}/{scene['order']:03d}-{scene['id']}.{suffix}"
         await _put(minio, settings.minio_bucket, key, body, mime)
-        assets.append(_asset(workflow_id=context["workflow_id"], key=f"scene:{scene['id']}", production_id=production_id, kind="visual", body=body, mime=mime, object_key=key, scene_version_id=scene["id"], width=context["width"], height=context["height"], duration=scene["duration_seconds"] if mime == "video/mp4" else None, licence={"status": "cleared", "basis": "generated_for_production", "attribution": None, "synthetic": True}, provenance=provenance, cache_key=cache_key))
-    return {"assets": assets, "capability_hash": capability_hash}
+        asset = _asset(workflow_id=context["workflow_id"], key=f"scene:{scene['id']}", production_id=production_id, kind="visual", body=body, mime=mime, object_key=key, scene_version_id=scene["id"], width=context["width"], height=context["height"], duration=scene["duration_seconds"] if mime == "video/mp4" else None, licence={"status": "cleared", "basis": "generated_for_production", "attribution": None, "synthetic": True}, provenance=provenance, cache_key=cache_key)
+        assets.append(asset)
+        bindings[scene["id"]] = asset
+    return {"assets": assets, "bindings": bindings, "capability_hash": capability_hash}
 
 
 def _fixture_wav(text: str, duration: float, sample_rate: int) -> tuple[bytes, list[dict[str, Any]]]:
@@ -597,6 +767,243 @@ async def generate_production_narration(context: dict[str, Any]) -> dict[str, An
     return {"assets": asset_rows, "narration": narration_rows, "combined_audio_asset_id": combined_asset["id"], "combined_audio_key": combined_key, "duration_seconds": cursor, "chapters": chapters, "description": description}
 
 
+def _asset_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "production_id": str(row["production_id"]),
+        "scene_version_id": str(row["scene_version_id"]) if row["scene_version_id"] else None,
+        "asset_kind": row["asset_kind"],
+        "object_key": row["object_key"],
+        "content_hash": row["content_hash"],
+        "mime_type": row["mime_type"],
+        "byte_size": row["byte_size"],
+        "width": row["width"],
+        "height": row["height"],
+        "duration_seconds": row["duration_seconds"],
+        "licence": _json(row["licence"]),
+        "generation_provenance": _json(row["generation_provenance"]),
+        "cache_key": row["cache_key"],
+    }
+
+
+@activity.defn(name="persist-media-timeline-draft")
+async def persist_media_timeline_draft(request: dict[str, Any]) -> dict[str, Any]:
+    context, narration = request["context"], request["narration"]
+    timeline_plan = _build_default_timeline_plan(context, narration)
+    context = {
+        **context,
+        "timeline_plan": timeline_plan,
+        "timeline_plan_hash": timeline_plan["content_hash"],
+        "timeline_plan_updated_at": timeline_plan["updated_at"],
+        "timeline_source_workflow_id": context["workflow_id"],
+    }
+    settings = Settings()
+    connection = await asyncpg.connect(settings.database_dsn)
+    transaction = connection.transaction()
+    await transaction.start()
+    try:
+        existing = await connection.fetchrow(
+            "SELECT id,state FROM media_productions WHERE workflow_id=$1",
+            context["workflow_id"],
+        )
+        if existing and existing["state"] == "timeline_ready":
+            await transaction.rollback()
+            return {
+                "production_id": str(existing["id"]),
+                "state": "timeline_ready",
+                "timeline_plan_hash": timeline_plan["content_hash"],
+                "reconciled": True,
+            }
+        now = datetime.now(timezone.utc)
+        production_id = UUID(context["production_id"])
+        if existing:
+            await connection.execute(
+                """UPDATE media_productions
+                      SET state='timeline_ready',settings=$2::jsonb,completed_at=NULL
+                    WHERE id=$1""",
+                existing["id"],
+                _production_settings(context),
+            )
+            production_id = UUID(str(existing["id"]))
+        else:
+            await connection.execute(
+                """INSERT INTO media_productions(id,storyboard_version_id,storyboard_hash,workflow_id,render_tier,state,settings,correlation_id,started_by,created_at,completed_at)
+                   VALUES($1,$2,$3,$4,$5,'timeline_ready',$6::jsonb,$7,$8,$9,NULL)""",
+                production_id,
+                UUID(context["storyboard_version_id"]),
+                context["storyboard_hash"],
+                context["workflow_id"],
+                context["render_tier"],
+                _production_settings(context),
+                context["correlation_id"],
+                UUID(context["actor_id"]),
+                now,
+            )
+        for asset in narration["assets"]:
+            await connection.execute(
+                """INSERT INTO media_assets(id,production_id,scene_version_id,asset_kind,object_key,content_hash,mime_type,byte_size,width,height,duration_seconds,licence,generation_provenance,cache_key,created_at)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15)
+                   ON CONFLICT (id) DO NOTHING""",
+                UUID(asset["id"]), production_id, UUID(asset["scene_version_id"]) if asset["scene_version_id"] else None, asset["asset_kind"], asset["object_key"], asset["content_hash"], asset["mime_type"], asset["byte_size"], asset["width"], asset["height"], asset["duration_seconds"], json.dumps(asset["licence"]), json.dumps(asset["generation_provenance"]), asset["cache_key"], now,
+            )
+        for item in narration["narration"]:
+            await connection.execute(
+                """INSERT INTO narration_segments(id,production_id,script_segment_id,segment_order,request,response,original_asset_id,mastered_asset_id,duration_seconds,sample_rate,word_alignment,content_hash,parent_segment_id,created_at)
+                   VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11::jsonb,$12,NULL,$13)
+                   ON CONFLICT (id) DO NOTHING""",
+                UUID(item["id"]), production_id, UUID(item["script_segment_id"]), item["segment_order"], json.dumps(item["request"]), json.dumps(item["response"]), UUID(item["original_asset_id"]), UUID(item["mastered_asset_id"]), item["duration_seconds"], item["sample_rate"], json.dumps(item["word_alignment"]), item["content_hash"], now,
+            )
+        await append_audit(
+            connection,
+            action="media_timeline.narration_ready",
+            actor_id=UUID(context["actor_id"]),
+            target_type="media_production",
+            target_id=str(production_id),
+            correlation_id=context["correlation_id"],
+            context={
+                "workflow_id": context["workflow_id"],
+                "storyboard_version_id": context["storyboard_version_id"],
+                "storyboard_hash": context["storyboard_hash"],
+                "timeline_plan_hash": timeline_plan["content_hash"],
+                "narration_duration_seconds": narration["duration_seconds"],
+            },
+        )
+        await transaction.commit()
+        return {
+            "production_id": str(production_id),
+            "state": "timeline_ready",
+            "timeline_plan_hash": timeline_plan["content_hash"],
+            "narration_duration_seconds": narration["duration_seconds"],
+            "reconciled": False,
+        }
+    except Exception:
+        await transaction.rollback()
+        raise
+    finally:
+        await connection.close()
+
+
+@activity.defn(name="load-media-timeline-render-context")
+async def load_media_timeline_render_context(request: dict[str, Any]) -> dict[str, Any]:
+    settings = Settings()
+    production_id = UUID(str(request["production_id"]))
+    connection = await asyncpg.connect(settings.database_dsn)
+    try:
+        production = await connection.fetchrow(
+            "SELECT * FROM media_productions WHERE id=$1",
+            production_id,
+        )
+        if production is None:
+            raise ApplicationError("media production timeline not found", non_retryable=True)
+        production_settings = _json(production["settings"])
+        timeline_plan = production_settings.get("timeline_plan")
+        timeline_hash = production_settings.get("timeline_plan_hash")
+        if not isinstance(timeline_plan, dict) or not isinstance(timeline_hash, str):
+            raise ApplicationError("production has no saved narration timeline", non_retryable=True)
+        if timeline_hash != request["expected_timeline_plan_hash"]:
+            raise ApplicationError("timeline plan hash changed before rendering", non_retryable=True)
+        assets = [
+            _asset_from_row(row)
+            for row in await connection.fetch(
+                "SELECT * FROM media_assets WHERE production_id=$1 ORDER BY created_at",
+                production_id,
+            )
+        ]
+        narration_rows = await connection.fetch(
+            """SELECT ns.id,ns.script_segment_id,ns.segment_order,ns.request,ns.response,
+                      ns.original_asset_id,ns.mastered_asset_id,ns.duration_seconds,
+                      ns.sample_rate,ns.word_alignment,ns.content_hash
+               FROM narration_segments ns
+               WHERE ns.production_id=$1
+               ORDER BY ns.segment_order,ns.created_at""",
+            production_id,
+        )
+    finally:
+        await connection.close()
+    context = await load_media_production_context(
+        {
+            "workflow_id": request["workflow_id"],
+            "storyboard_version_id": str(production["storyboard_version_id"]),
+            "expected_storyboard_hash": production["storyboard_hash"],
+            "render_tier": production["render_tier"],
+            "width": int(production_settings["width"]),
+            "height": int(production_settings["height"]),
+            "fps": int(production_settings["fps"]),
+            "comfy_workflow_version_id": production_settings["comfy_workflow_version_id"],
+            "voice_profile_version_id": production_settings["voice_profile_version_id"],
+            "actor_id": request["actor_id"],
+            "correlation_id": request["correlation_id"],
+        }
+    )
+    combined = next(
+        (
+            asset
+            for asset in assets
+            if asset["id"] == timeline_plan.get("narration", {}).get("asset_id")
+        ),
+        None,
+    )
+    if combined is None:
+        combined = next(
+            (
+                asset
+                for asset in assets
+                if asset["asset_kind"] == "narration_mastered"
+                and asset["generation_provenance"].get("assembly") == "ordered-pcm-concatenation"
+            ),
+            None,
+        )
+    if combined is None:
+        raise ApplicationError("saved timeline has no mastered narration asset", non_retryable=True)
+    narration = {
+        "assets": [],
+        "narration": [
+            {
+                "id": str(row["id"]),
+                "script_segment_id": str(row["script_segment_id"]),
+                "segment_order": row["segment_order"],
+                "request": _json(row["request"]),
+                "response": _json(row["response"]),
+                "original_asset_id": str(row["original_asset_id"]),
+                "mastered_asset_id": str(row["mastered_asset_id"]),
+                "duration_seconds": row["duration_seconds"],
+                "sample_rate": row["sample_rate"],
+                "word_alignment": _json(row["word_alignment"]),
+                "content_hash": row["content_hash"],
+            }
+            for row in narration_rows
+        ],
+        "combined_audio_asset_id": combined["id"],
+        "combined_audio_key": combined["object_key"],
+        "duration_seconds": float(timeline_plan.get("duration_seconds") or combined["duration_seconds"] or 0),
+        "chapters": [
+            {
+                "timecode_seconds": float(scene.get("start_seconds") or 0),
+                "title": str(scene.get("title") or scene.get("id") or "Scene")[:160],
+                "scene_version_id": scene.get("scene_version_id"),
+            }
+            for scene in timeline_plan.get("scenes", [])
+            if isinstance(scene, dict)
+        ],
+        "description": {
+            "title": f"{context['channel_name']} production",
+            "language": context["voice_profile"]["language"],
+            "synthetic_media_disclosure": "This production contains synthetic visuals and narration where identified in the manifest.",
+            "source_count": len(context["sources"]),
+        },
+    }
+    return {
+        **context,
+        "production_id": str(production_id),
+        "timeline_plan": timeline_plan,
+        "timeline_plan_hash": timeline_hash,
+        "timeline_source_workflow_id": production["workflow_id"],
+        "render_workflow_id": request["workflow_id"],
+        "existing_assets": assets,
+        "narration": narration,
+    }
+
+
 def _probe(path: Path) -> dict[str, Any]:
     result = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)], capture_output=True, timeout=60, check=False)
     if result.returncode:
@@ -654,6 +1061,212 @@ async def _await_with_activity_heartbeat(
             task.cancel()
 
 
+def _timeline_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _timeline_narration_start(plan: dict[str, Any] | None) -> float:
+    if not isinstance(plan, dict):
+        return 0.0
+    tracks = plan.get("tracks") if isinstance(plan.get("tracks"), dict) else {}
+    for clip in tracks.get("audio", []):
+        if isinstance(clip, dict) and clip.get("kind") == "narration":
+            return max(0.0, _timeline_float(clip.get("start_seconds")))
+    return 0.0
+
+
+async def _timeline_auxiliary_assets(
+    context: dict[str, Any],
+    narration: dict[str, Any],
+    minio: Minio,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    """Create shifted captions/chapters for a render from a saved timeline plan."""
+
+    production_id = UUID(context["production_id"])
+    offset = _timeline_narration_start(context.get("timeline_plan"))
+    cursor = offset
+    srt: list[str] = []
+    vtt: list[str] = ["WEBVTT", ""]
+    for order, item in enumerate(narration["narration"], 1):
+        duration = _timeline_float(item.get("duration_seconds"), 0.1)
+        end = cursor + duration
+        text = str(item.get("request", {}).get("text") or "")
+        srt.extend([str(order), f"{_srt_time(cursor)} --> {_srt_time(end)}", text, ""])
+        vtt.extend([f"{_srt_time(cursor, '.')} --> {_srt_time(end, '.')}", text, ""])
+        cursor = end
+    chapters = narration.get("chapters") or []
+    description = narration.get("description") or {
+        "title": f"{context['channel_name']} production",
+        "language": context["voice_profile"]["language"],
+        "synthetic_media_disclosure": "This production contains synthetic visuals and narration where identified in the manifest.",
+        "source_count": len(context["sources"]),
+    }
+    auxiliaries = [
+        ("captions.srt", "caption_srt", "application/x-subrip", "\n".join(srt).encode()),
+        ("captions.vtt", "caption_vtt", "text/vtt", "\n".join(vtt).encode()),
+        ("chapters.json", "chapter", "application/json", json.dumps(chapters, sort_keys=True).encode()),
+        ("description.json", "description", "application/json", json.dumps(description, sort_keys=True).encode()),
+        ("sources.json", "source_list", "application/json", json.dumps(context["sources"], sort_keys=True).encode()),
+    ]
+    assets: list[dict[str, Any]] = []
+    for filename, kind, mime, body in auxiliaries:
+        key = f"productions/{production_id}/renders/{context['workflow_id']}/{filename}"
+        await _put(minio, settings.minio_bucket, key, body, mime)
+        assets.append(
+            _asset(
+                workflow_id=context["workflow_id"],
+                key=filename,
+                production_id=production_id,
+                kind=kind,
+                body=body,
+                mime=mime,
+                object_key=key,
+                licence={"status": "cleared", "basis": "production_metadata", "synthetic": False},
+                provenance={
+                    "storyboard_hash": context["storyboard_hash"],
+                    "script_version_id": context["script_version_id"],
+                    "timeline_plan_hash": context.get("timeline_plan_hash"),
+                    "narration_start_seconds": offset,
+                },
+            )
+        )
+    narration["chapters"] = chapters
+    narration["description"] = description
+    return assets
+
+
+def _timeline_audio_clip_specs(
+    context: dict[str, Any], narration: dict[str, Any]
+) -> list[dict[str, Any]]:
+    plan = context.get("timeline_plan") if isinstance(context.get("timeline_plan"), dict) else None
+    assets_by_id = {
+        str(asset["id"]): asset
+        for asset in [*context.get("existing_assets", []), *narration.get("assets", [])]
+        if isinstance(asset, dict)
+    }
+    if not plan:
+        return [
+            {
+                "asset": {
+                    "id": narration.get("combined_audio_asset_id"),
+                    "object_key": narration["combined_audio_key"],
+                    "mime_type": "audio/wav",
+                    "duration_seconds": narration.get("duration_seconds"),
+                },
+                "start_seconds": 0.0,
+                "source_start_seconds": 0.0,
+                "source_end_seconds": narration.get("duration_seconds"),
+                "duration_seconds": narration.get("duration_seconds"),
+                "volume": 1.0,
+            }
+        ]
+    specs: list[dict[str, Any]] = []
+    tracks = plan.get("tracks") if isinstance(plan.get("tracks"), dict) else {}
+    for track_name in ("audio", "music", "sfx"):
+        for raw in tracks.get(track_name, []):
+            if not isinstance(raw, dict):
+                continue
+            asset_id = str(raw.get("asset_id") or "")
+            if not asset_id:
+                continue
+            if raw.get("kind") == "narration" and asset_id == str(narration.get("combined_audio_asset_id")):
+                asset = {
+                    "id": asset_id,
+                    "object_key": narration["combined_audio_key"],
+                    "mime_type": "audio/wav",
+                    "duration_seconds": narration.get("duration_seconds"),
+                }
+            else:
+                asset = assets_by_id.get(asset_id)
+            if asset is None or not str(asset.get("mime_type", "")).startswith("audio/"):
+                continue
+            duration = _timeline_float(
+                raw.get("duration_seconds"),
+                _timeline_float(asset.get("duration_seconds"), 0.0),
+            )
+            if duration <= 0:
+                continue
+            specs.append(
+                {
+                    "asset": asset,
+                    "start_seconds": max(0.0, _timeline_float(raw.get("start_seconds"))),
+                    "source_start_seconds": max(0.0, _timeline_float(raw.get("source_start_seconds"))),
+                    "source_end_seconds": raw.get("source_end_seconds"),
+                    "duration_seconds": duration,
+                    "volume": min(2.0, max(0.0, _timeline_float(raw.get("volume"), 1.0))),
+                }
+            )
+    return specs
+
+
+def _audio_filter_for_clip(index: int, clip: dict[str, Any]) -> tuple[str, str]:
+    label = f"a{index}"
+    duration = max(0.05, _timeline_float(clip.get("duration_seconds"), 0.05))
+    source_start = max(0.0, _timeline_float(clip.get("source_start_seconds")))
+    source_end = clip.get("source_end_seconds")
+    if source_end is None:
+        source_end = source_start + duration
+    else:
+        source_end = max(source_start + 0.05, _timeline_float(source_end, source_start + duration))
+    start_ms = round(max(0.0, _timeline_float(clip.get("start_seconds"))) * 1000)
+    volume = min(2.0, max(0.0, _timeline_float(clip.get("volume"), 1.0)))
+    return (
+        f"[{index}:a]atrim=start={source_start:.3f}:end={source_end:.3f},"
+        f"asetpts=PTS-STARTPTS,adelay={start_ms}:all=1,volume={volume:.3f}[{label}]",
+        f"[{label}]",
+    )
+
+
+def _run_ffmpeg_mux(
+    command_prefix: list[str],
+    audio_clips: list[dict[str, Any]],
+    output_path: Path,
+    expected_duration: float,
+) -> None:
+    filters: list[str] = []
+    labels: list[str] = []
+    for index, clip in enumerate(audio_clips, 1):
+        expression, label = _audio_filter_for_clip(index, clip)
+        filters.append(expression)
+        labels.append(label)
+    if not labels:
+        raise RuntimeError("at least one audio clip is required")
+    if len(labels) == 1:
+        filters.append(f"{labels[0]}apad=pad_dur={expected_duration:.3f}[aout]")
+    else:
+        filters.append(
+            "".join(labels)
+            + f"amix=inputs={len(labels)}:duration=longest:normalize=0,apad=pad_dur={expected_duration:.3f}[aout]"
+        )
+    _run_ffmpeg(
+        [
+            *command_prefix,
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "0:v:0",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-t",
+            f"{expected_duration:.3f}",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+
 @activity.defn(name="assemble-and-qa-production")
 async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     context, scene_result, narration = request["context"], request["scene_result"], request["narration"]
@@ -661,38 +1274,105 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     minio = _minio(settings)
     production_id = UUID(context["production_id"])
     assets_by_scene: dict[str, list[dict[str, Any]]] = {}
-    for asset in scene_result["assets"]:
-        assets_by_scene.setdefault(str(asset.get("scene_version_id")), []).append(asset)
-    invalid_bindings = [scene["id"] for scene in context["scenes"] if len(assets_by_scene.get(scene["id"], [])) != 1]
-    if invalid_bindings:
-        raise ApplicationError(
-            "every approved SceneSpec must resolve to exactly one Scene Media Asset: " + ", ".join(invalid_bindings[:20]),
-            non_retryable=True,
-        )
+    if isinstance(scene_result.get("bindings"), dict):
+        for scene_id, asset in scene_result["bindings"].items():
+            assets_by_scene.setdefault(str(scene_id), []).append(asset)
+    else:
+        for asset in scene_result["assets"]:
+            assets_by_scene.setdefault(str(asset.get("scene_version_id")), []).append(asset)
+    timeline_plan = context.get("timeline_plan") if isinstance(context.get("timeline_plan"), dict) else None
+    existing_assets = [asset for asset in context.get("existing_assets", []) if isinstance(asset, dict)]
+    known_assets_by_id = {
+        str(asset["id"]): asset
+        for asset in [*existing_assets, *scene_result["assets"]]
+        if isinstance(asset, dict)
+    }
     scene_props = []
     manifest_scene_props = []
-    for scene in context["scenes"]:
-        asset = assets_by_scene[scene["id"]][0]
-        asset_url = await asyncio.to_thread(
-            minio.presigned_get_object,
-            settings.minio_bucket,
-            asset["object_key"],
-            timedelta(hours=2),
-        )
-        common = {
-            "sceneVersionId": scene["id"],
-            "durationSeconds": scene["duration_seconds"],
-            "storyboardDurationSeconds": scene.get("storyboard_duration_seconds", scene["duration_seconds"]),
-            "purpose": scene["scene_spec"]["purpose"],
-            "visualType": scene["scene_spec"]["visual_type"],
-            "onScreenText": scene["scene_spec"]["on_screen_text"],
-            "citationStyle": scene["scene_spec"]["citation_style"],
-            "syntheticMediaFlag": scene["scene_spec"]["synthetic_media_flag"],
-            "assetHash": asset["content_hash"],
-            "assetMimeType": asset["mime_type"],
+    if not timeline_plan:
+        invalid_bindings = [scene["id"] for scene in context["scenes"] if len(assets_by_scene.get(scene["id"], [])) != 1]
+        if invalid_bindings:
+            raise ApplicationError(
+                "every approved SceneSpec must resolve to exactly one Scene Media Asset: " + ", ".join(invalid_bindings[:20]),
+                non_retryable=True,
+            )
+        for scene in context["scenes"]:
+            asset = assets_by_scene[scene["id"]][0]
+            asset_url = await asyncio.to_thread(
+                minio.presigned_get_object,
+                settings.minio_bucket,
+                asset["object_key"],
+                timedelta(hours=2),
+            )
+            common = {
+                "sceneVersionId": scene["id"],
+                "durationSeconds": scene["duration_seconds"],
+                "storyboardDurationSeconds": scene.get("storyboard_duration_seconds", scene["duration_seconds"]),
+                "purpose": scene["scene_spec"]["purpose"],
+                "visualType": scene["scene_spec"]["visual_type"],
+                "onScreenText": scene["scene_spec"]["on_screen_text"],
+                "citationStyle": scene["scene_spec"]["citation_style"],
+                "syntheticMediaFlag": scene["scene_spec"]["synthetic_media_flag"],
+                "assetHash": asset["content_hash"],
+                "assetMimeType": asset["mime_type"],
+            }
+            scene_props.append({**common, "assetUrl": asset_url})
+            manifest_scene_props.append(common)
+    else:
+        context_scenes = {scene["id"]: scene for scene in context["scenes"]}
+        for item in timeline_plan.get("scenes", []):
+            if not isinstance(item, dict):
+                continue
+            scene_version_id = str(item.get("scene_version_id") or "")
+            storyboard_scene = context_scenes.get(scene_version_id)
+            video = item.get("video") if isinstance(item.get("video"), dict) else {}
+            asset_id = str(video.get("asset_id") or item.get("video_asset_id") or "")
+            asset = known_assets_by_id.get(asset_id) if asset_id else None
+            if asset is None and storyboard_scene is not None:
+                bound = assets_by_scene.get(storyboard_scene["id"], [])
+                asset = bound[0] if bound else None
+            if storyboard_scene is not None and asset is None:
+                raise ApplicationError(
+                    f"timeline storyboard scene {scene_version_id} has no visual asset binding",
+                    non_retryable=True,
+                )
+            asset_url = None
+            if asset is not None:
+                asset_url = await asyncio.to_thread(
+                    minio.presigned_get_object,
+                    settings.minio_bucket,
+                    asset["object_key"],
+                    timedelta(hours=2),
+                )
+            spec = storyboard_scene["scene_spec"] if storyboard_scene else {}
+            duration = max(0.5, _timeline_float(item.get("duration_seconds"), _timeline_float(spec.get("duration"), 3.0)))
+            trim_start = max(0.0, _timeline_float(video.get("source_start_seconds")))
+            trim_end = video.get("source_end_seconds")
+            if trim_end is not None:
+                trim_end = max(trim_start + 0.05, _timeline_float(trim_end, trim_start + duration))
+            common = {
+                "sceneVersionId": str(item.get("id") or scene_version_id or f"operator-scene-{len(scene_props) + 1}"),
+                "sceneVersionSourceId": scene_version_id or None,
+                "durationSeconds": duration,
+                "storyboardDurationSeconds": _timeline_float(storyboard_scene.get("storyboard_duration_seconds") if storyboard_scene else None, duration),
+                "purpose": str(item.get("title") or spec.get("purpose") or "Operator scene")[:2000],
+                "visualType": str(spec.get("visual_type") or ("licensed_media" if asset is not None else "branded_transition")),
+                "onScreenText": list(item.get("on_screen_text") if isinstance(item.get("on_screen_text"), list) else spec.get("on_screen_text", []))[:20],
+                "citationStyle": str(spec.get("citation_style") or ""),
+                "syntheticMediaFlag": bool(asset["licence"].get("synthetic")) if asset else bool(spec.get("synthetic_media_flag", False)),
+                "assetHash": asset["content_hash"] if asset else None,
+                "assetMimeType": asset["mime_type"] if asset else None,
+                "trimStartSeconds": trim_start,
+                "trimEndSeconds": trim_end,
+                "timelineScene": item,
+            }
+            scene_props.append({**common, "assetUrl": asset_url})
+            manifest_scene_props.append(common)
+    if timeline_plan and not narration.get("assets"):
+        narration = {
+            **narration,
+            "assets": await _timeline_auxiliary_assets(context, narration, minio, settings),
         }
-        scene_props.append({**common, "assetUrl": asset_url})
-        manifest_scene_props.append(common)
     brand_kit = context["brand"]
     brand = {**brand_kit, "name": context["channel_name"], "brandHash": context["brand_hash"], "channelProfileVersion": context["channel_profile_version"]}
     render_props = {"width": context["width"], "height": context["height"], "fps": context["fps"], "scenes": scene_props, "brand": brand}
@@ -708,17 +1388,24 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
         engine = response.headers.get("X-Render-Engine", "remotion")
         engine_version = response.headers.get("X-Render-Engine-Version", "unknown")
         composition = response.headers.get("X-Composition", "EvidenceVideo")
-    audio = await _await_with_activity_heartbeat(
-        asyncio.to_thread(_get, minio, settings.minio_bucket, narration["combined_audio_key"]),
-        "loading_mastered_narration",
-    )
+    audio_clip_specs = _timeline_audio_clip_specs(context, narration)
+    expected_duration = sum(float(scene["durationSeconds"]) for scene in scene_props)
     with tempfile.TemporaryDirectory() as directory:
-        silent_path, audio_path = Path(directory) / "visual.mp4", Path(directory) / "narration.wav"
+        silent_path = Path(directory) / "visual.mp4"
         output_path, thumb_path = Path(directory) / "master.mp4", Path(directory) / "thumbnail.jpg"
-        silent_path.write_bytes(silent_video); audio_path.write_bytes(audio)
+        silent_path.write_bytes(silent_video)
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(silent_path)]
+        for index, clip in enumerate(audio_clip_specs, 1):
+            audio_path = Path(directory) / f"audio-{index:03d}"
+            body = await _await_with_activity_heartbeat(
+                asyncio.to_thread(_get, minio, settings.minio_bucket, clip["asset"]["object_key"]),
+                f"loading_audio_track_{index}",
+            )
+            audio_path.write_bytes(body)
+            command.extend(["-i", str(audio_path)])
         await _await_with_activity_heartbeat(
-            asyncio.to_thread(_run_ffmpeg, ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(silent_path), "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest", str(output_path)]),
-            "muxing_video_and_narration",
+            asyncio.to_thread(_run_ffmpeg_mux, command, audio_clip_specs, output_path, expected_duration),
+            "mixing_timeline_audio_tracks",
         )
         final_video = output_path.read_bytes()
         probe = await _await_with_activity_heartbeat(
@@ -737,21 +1424,22 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     thumb_key = f"productions/{production_id}/thumbnail.jpg"
     await _put(minio, settings.minio_bucket, video_key, final_video, "video/mp4")
     await _put(minio, settings.minio_bucket, thumb_key, thumbnail, "image/jpeg")
-    video_asset = _asset(workflow_id=context["workflow_id"], key=f"render:{context['render_tier']}", production_id=production_id, kind=tier_kind, body=final_video, mime="video/mp4", object_key=video_key, width=context["width"], height=context["height"], duration=narration["duration_seconds"], licence={"status": "cleared", "basis": "assembled_from_cleared_assets", "synthetic": True}, provenance={"engine": engine, "engine_version": engine_version, "composition": composition, "props_hash": canonical_hash(props), "ffmpeg": "5.1.9", "storyboard_hash": context["storyboard_hash"]})
+    video_asset = _asset(workflow_id=context["workflow_id"], key=f"render:{context['render_tier']}", production_id=production_id, kind=tier_kind, body=final_video, mime="video/mp4", object_key=video_key, width=context["width"], height=context["height"], duration=expected_duration, licence={"status": "cleared", "basis": "assembled_from_cleared_assets", "synthetic": True}, provenance={"engine": engine, "engine_version": engine_version, "composition": composition, "props_hash": canonical_hash(props), "ffmpeg": "5.1.9", "storyboard_hash": context["storyboard_hash"], "timeline_plan_hash": context.get("timeline_plan_hash")})
     thumb_asset = _asset(workflow_id=context["workflow_id"], key="thumbnail", production_id=production_id, kind="thumbnail", body=thumbnail, mime="image/jpeg", object_key=thumb_key, width=context["width"], height=context["height"], licence=video_asset["licence"], provenance={"ffmpeg": "5.1.9", "source_render_hash": video_asset["content_hash"]})
     all_assets = [*scene_result["assets"], *narration["assets"], video_asset, thumb_asset]
-    manifest = {"schema_version": "1.0", "production_id": str(production_id), "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_tier": context["render_tier"], "source": {"source_kind": context.get("source_kind", "research_dossier"), "evidence_required": context.get("evidence_required", True)}, "brand": {"channel_profile_id": context["channel_profile_id"], "channel_profile_version": context["channel_profile_version"], "brand_hash": context["brand_hash"], "brand_kit": brand_kit}, "scenes": [{"scene_version_id": item["id"], "scene_hash": item["content_hash"], "production_duration_seconds": item["duration_seconds"], "storyboard_duration_seconds": item.get("storyboard_duration_seconds", item["duration_seconds"]), "scene_spec": item["scene_spec"]} for item in context["scenes"]], "narration": narration["narration"], "captions": [item for item in all_assets if item["asset_kind"].startswith("caption_")], "chapters": narration["chapters"], "sources": context["sources"], "assets": [{key: item[key] for key in ("id", "asset_kind", "object_key", "content_hash", "mime_type", "licence", "generation_provenance")} for item in all_assets], "render": {"asset_id": video_asset["id"], "content_hash": video_asset["content_hash"], "engine": engine, "engine_version": engine_version, "composition": composition, "settings": props, "probe": probe}}
+    manifest_assets = [*existing_assets, *all_assets]
+    manifest = {"schema_version": "1.0", "production_id": str(production_id), "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_tier": context["render_tier"], "source": {"source_kind": context.get("source_kind", "research_dossier"), "evidence_required": context.get("evidence_required", True)}, "brand": {"channel_profile_id": context["channel_profile_id"], "channel_profile_version": context["channel_profile_version"], "brand_hash": context["brand_hash"], "brand_kit": brand_kit}, "timeline_plan": timeline_plan, "scenes": [{"scene_version_id": item["id"], "scene_hash": item["content_hash"], "production_duration_seconds": item["duration_seconds"], "storyboard_duration_seconds": item.get("storyboard_duration_seconds", item["duration_seconds"]), "scene_spec": item["scene_spec"]} for item in context["scenes"]], "render_scenes": manifest_scene_props, "narration": narration["narration"], "captions": [item for item in manifest_assets if item["asset_kind"].startswith("caption_")], "chapters": narration["chapters"], "sources": context["sources"], "assets": [{key: item[key] for key in ("id", "asset_kind", "object_key", "content_hash", "mime_type", "licence", "generation_provenance")} for item in manifest_assets], "render": {"asset_id": video_asset["id"], "content_hash": video_asset["content_hash"], "engine": engine, "engine_version": engine_version, "composition": composition, "settings": props, "probe": probe}}
     manifest_body = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     manifest_key = f"productions/{production_id}/production-manifest.json"
     await _put(minio, settings.minio_bucket, manifest_key, manifest_body, "application/json")
     manifest_asset = _asset(workflow_id=context["workflow_id"], key="manifest", production_id=production_id, kind="manifest", body=manifest_body, mime="application/json", object_key=manifest_key, licence={"status": "cleared", "basis": "production_metadata", "synthetic": False}, provenance={"schema_version": "1.0", "storyboard_hash": context["storyboard_hash"]})
     all_assets.append(manifest_asset)
+    qa_assets = [*existing_assets, *all_assets]
     streams = probe.get("streams", [])
     has_video, has_audio = any(item.get("codec_type") == "video" for item in streams), any(item.get("codec_type") == "audio" for item in streams)
     probed_duration = float(probe.get("format", {}).get("duration", 0))
-    expected_duration = sum(scene["duration_seconds"] for scene in context["scenes"])
-    caption_assets = [item for item in all_assets if item["asset_kind"] in {"caption_srt", "caption_vtt"}]
-    licences_clear = all(item["licence"].get("status") == "cleared" for item in all_assets)
+    caption_assets = [item for item in qa_assets if item["asset_kind"] in {"caption_srt", "caption_vtt"}]
+    licences_clear = all(item["licence"].get("status") == "cleared" for item in qa_assets)
     qa_policy = (context.get("render_policy") or {}).get("qa", {})
     freshness_days = int(qa_policy.get("source_freshness_days", 365))
     caption_max_characters = int(qa_policy.get("caption_max_characters", 120))
@@ -768,7 +1456,7 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
     caption_overflow = [item["segment_key"] for item in context["segments"] if len(item["narration"]) > caption_max_characters]
     caption_rate = max((len(item["narration"].split()) / max(0.1, float(item["duration_seconds"])) for item in context["segments"]), default=0.0)
     silence_ratio = scan["silence_seconds"] / max(0.1, probed_duration)
-    synthetic_assets = [item for item in all_assets if item["licence"].get("synthetic")]
+    synthetic_assets = [item for item in qa_assets if item["licence"].get("synthetic")]
     disclosed = bool(narration["description"].get("synthetic_media_disclosure"))
     connection = await asyncpg.connect(settings.database_dsn)
     try:
@@ -788,26 +1476,32 @@ async def assemble_and_qa_production(request: dict[str, Any]) -> dict[str, Any]:
         prior_hashes = {row["content_hash"] for row in prior_rows}
     finally:
         await connection.close()
-    visual_hashes = {item["content_hash"] for item in scene_result["assets"]}
+    visual_assets = [
+        item
+        for item in qa_assets
+        if item["asset_kind"] in {"visual", "operator_clip"}
+        and str(item.get("mime_type", "")).startswith(("image/", "video/"))
+    ]
+    visual_hashes = {item["content_hash"] for item in visual_assets}
     prior_overlap = len(visual_hashes & prior_hashes)
     findings = [
         {"code": "media_decodable", "verdict": "pass" if has_video and has_audio else "fail", "message": "ffprobe found video and audio streams." if has_video and has_audio else "Render is corrupt or is missing a required stream.", "override_policy": "never", "details": {"has_video": has_video, "has_audio": has_audio}},
         {"code": "timing_alignment", "verdict": "pass" if abs(probed_duration - expected_duration) <= 1 else "fail", "message": "Render timing matches the approved storyboard." if abs(probed_duration - expected_duration) <= 1 else "Render duration diverges from storyboard timing.", "override_policy": "never", "details": {"expected_seconds": expected_duration, "actual_seconds": probed_duration}},
         {"code": "claim_evidence_coverage", "verdict": "pass" if (not evidence_required or context["claims"]["total"] == context["claims"]["supported"]) else "fail", "message": "Evidence coverage is not applicable for direct scripted-video input." if not evidence_required else ("Every narrated claim has supporting evidence." if context["claims"]["total"] == context["claims"]["supported"] else "One or more narrated claims lack supporting evidence."), "override_policy": "never", "details": {**context["claims"], "evidence_required": evidence_required}},
-        {"code": "asset_licences", "verdict": "pass" if licences_clear else "fail", "message": "Every production asset has a cleared licence basis." if licences_clear else "An asset licence is unresolved.", "override_policy": "never", "details": {"asset_count": len(all_assets)}},
+        {"code": "asset_licences", "verdict": "pass" if licences_clear else "fail", "message": "Every production asset has a cleared licence basis." if licences_clear else "An asset licence is unresolved.", "override_policy": "never", "details": {"asset_count": len(qa_assets)}},
         {"code": "captions_present", "verdict": "pass" if len(caption_assets) == 2 else "fail", "message": "SRT and WebVTT captions are present." if len(caption_assets) == 2 else "Required caption formats are missing.", "override_policy": "never", "details": {"formats": [item["mime_type"] for item in caption_assets]}},
         {"code": "contradictions_and_freshness", "verdict": "pass" if (not evidence_required or (not contradiction_issues and not expired_sources)) else "fail", "message": "Evidence freshness is not applicable for direct scripted-video input." if not evidence_required else ("No unresolved contradiction omissions or expired evidence snapshots were found." if not contradiction_issues and not expired_sources else "Contradiction review or source freshness requires attention."), "override_policy": "reasoned", "details": {"contradiction_issues": contradiction_issues, "expired_source_ids": [item["id"] for item in expired_sources], "freshness_days": freshness_days, "evidence_required": evidence_required}},
         {"code": "audio_levels", "verdict": "pass" if minimum_mean_volume <= scan["mean_volume_db"] <= maximum_mean_volume and scan["max_volume_db"] <= maximum_peak_volume else "fail", "message": "Audio loudness and peak levels are within channel thresholds." if minimum_mean_volume <= scan["mean_volume_db"] <= maximum_mean_volume and scan["max_volume_db"] <= maximum_peak_volume else "Audio is too quiet, too loud, or clipping.", "override_policy": "never", "details": {**scan, "mean_volume_range_db": [minimum_mean_volume, maximum_mean_volume], "maximum_peak_volume_db": maximum_peak_volume}},
         {"code": "audio_silence", "verdict": "pass" if silence_ratio <= maximum_silence_ratio else "fail", "message": "No excessive silence was detected." if silence_ratio <= maximum_silence_ratio else "Excessive silence was detected in the mastered audio.", "override_policy": "reasoned", "details": {"silence_ratio": silence_ratio, "maximum_silence_ratio": maximum_silence_ratio}},
         {"code": "black_and_frozen_frames", "verdict": "fail" if scan["black_segments"] else ("warn" if scan["freeze_segments"] else "pass"), "message": "No black or frozen frame runs were detected." if not scan["black_segments"] and not scan["freeze_segments"] else "Black or frozen frame runs require visual review.", "override_policy": "reasoned", "details": {"black_segments": scan["black_segments"], "freeze_segments": scan["freeze_segments"]}},
-        {"code": "caption_readability_and_sync", "verdict": "fail" if abs(narration["duration_seconds"] - probed_duration) > 1 else ("warn" if caption_overflow or caption_rate > caption_max_words_per_second else "pass"), "message": "Caption timing, line length and reading rate are within thresholds." if not caption_overflow and caption_rate <= caption_max_words_per_second and abs(narration["duration_seconds"] - probed_duration) <= 1 else "Caption timing or readability requires review.", "override_policy": "reasoned", "details": {"overflow_segment_keys": caption_overflow, "maximum_words_per_second": caption_rate, "threshold_words_per_second": caption_max_words_per_second, "sync_delta_seconds": abs(narration["duration_seconds"] - probed_duration)}},
+        {"code": "caption_readability_and_sync", "verdict": "fail" if abs(expected_duration - probed_duration) > 1 else ("warn" if caption_overflow or caption_rate > caption_max_words_per_second else "pass"), "message": "Caption timing, line length and reading rate are within thresholds." if not caption_overflow and caption_rate <= caption_max_words_per_second and abs(expected_duration - probed_duration) <= 1 else "Caption timing or readability requires review.", "override_policy": "reasoned", "details": {"overflow_segment_keys": caption_overflow, "maximum_words_per_second": caption_rate, "threshold_words_per_second": caption_max_words_per_second, "sync_delta_seconds": abs(expected_duration - probed_duration)}},
         {"code": "chapters_sources_accessibility", "verdict": "pass" if narration["chapters"] and (context["sources"] or not evidence_required) and all(scene["scene_spec"].get("accessibility_notes") for scene in context["scenes"]) else "fail", "message": "Chapters and scene accessibility notes are present; source list is not applicable." if not evidence_required and narration["chapters"] else "Chapters, source list and scene accessibility notes are present.", "override_policy": "reasoned", "details": {"chapters": len(narration["chapters"]), "sources": len(context["sources"]), "evidence_required": evidence_required}},
         {"code": "synthetic_disclosure", "verdict": "pass" if not synthetic_assets or disclosed else "fail", "message": "Synthetic visual and narration disclosure is recorded in the manifest and description." if not synthetic_assets or disclosed else "Synthetic assets exist without the required disclosure.", "override_policy": "reasoned", "details": {"disclosed": disclosed, "synthetic_asset_count": len(synthetic_assets)}},
-        {"code": "repeated_asset_similarity", "verdict": "warn" if len({item["content_hash"] for item in scene_result["assets"]}) < len(scene_result["assets"]) else "pass", "message": "Scene asset hashes were checked for exact repetition.", "override_policy": "reasoned", "details": {"scene_assets": len(scene_result["assets"]), "unique_hashes": len({item["content_hash"] for item in scene_result["assets"]})}},
+        {"code": "repeated_asset_similarity", "verdict": "warn" if len({item["content_hash"] for item in visual_assets}) < len(visual_assets) else "pass", "message": "Scene asset hashes were checked for exact repetition.", "override_policy": "reasoned", "details": {"scene_assets": len(visual_assets), "unique_hashes": len({item["content_hash"] for item in visual_assets})}},
         {"code": "prior_video_similarity", "verdict": "warn" if prior_overlap else "pass", "message": "Scene asset hashes were compared with prior channel productions.", "override_policy": "reasoned", "details": {"overlapping_asset_hashes": prior_overlap, "prior_asset_hashes": len(prior_hashes)}},
     ]
     verdict = "fail" if any(item["verdict"] == "fail" for item in findings) else ("warn" if any(item["verdict"] == "warn" for item in findings) else "pass")
-    qa = {"verdict": verdict, "policy_snapshot": {"version": "media-qa-2", "mandatory": [item["code"] for item in findings if item["override_policy"] == "never"], "thresholds": {"source_freshness_days": freshness_days, "caption_max_characters": caption_max_characters, "caption_max_words_per_second": caption_max_words_per_second, "minimum_mean_volume_db": minimum_mean_volume, "maximum_mean_volume_db": maximum_mean_volume, "maximum_peak_volume_db": maximum_peak_volume, "maximum_silence_ratio": maximum_silence_ratio}}, "metrics": {"expected_duration_seconds": expected_duration, "probed_duration_seconds": probed_duration, "stream_count": len(streams), "asset_count": len(all_assets), "caption_formats": 2, "audio_scan": scan, "caption_max_words_per_second": caption_rate, "prior_visual_hash_overlap": prior_overlap}, "findings": findings}
+    qa = {"verdict": verdict, "policy_snapshot": {"version": "media-qa-2", "mandatory": [item["code"] for item in findings if item["override_policy"] == "never"], "thresholds": {"source_freshness_days": freshness_days, "caption_max_characters": caption_max_characters, "caption_max_words_per_second": caption_max_words_per_second, "minimum_mean_volume_db": minimum_mean_volume, "maximum_mean_volume_db": maximum_mean_volume, "maximum_peak_volume_db": maximum_peak_volume, "maximum_silence_ratio": maximum_silence_ratio}}, "metrics": {"expected_duration_seconds": expected_duration, "probed_duration_seconds": probed_duration, "stream_count": len(streams), "asset_count": len(qa_assets), "caption_formats": 2, "audio_scan": scan, "caption_max_words_per_second": caption_rate, "prior_visual_hash_overlap": prior_overlap, "timeline_plan_hash": context.get("timeline_plan_hash")}, "findings": findings}
     qa["content_hash"] = canonical_hash(qa)
     return {"assets": all_assets, "manifest": {"id": str(uuid5(NAMESPACE_URL, f"{context['workflow_id']}:manifest:1")), "document": manifest, "content_hash": hashlib.sha256(manifest_body).hexdigest(), "object_key": manifest_key}, "render": {"id": str(uuid5(NAMESPACE_URL, f"{context['workflow_id']}:render:1")), "video_asset_id": video_asset["id"], "content_hash": video_asset["content_hash"], "engine": engine, "engine_version": engine_version, "composition": composition, "settings": props, "probe": probe}, "qa": qa, "narration": narration["narration"]}
 
@@ -821,10 +1515,11 @@ async def persist_media_production(request: dict[str, Any]) -> dict[str, Any]:
     await transaction.start()
     try:
         existing = await connection.fetchrow(
-            "SELECT id,state,completed_at FROM media_productions WHERE workflow_id=$1",
+            "SELECT id,state,completed_at FROM media_productions WHERE workflow_id=$1 OR id=$2",
             context["workflow_id"],
+            UUID(context["production_id"]),
         )
-        if existing and existing["completed_at"] is not None:
+        if existing and existing["completed_at"] is not None and existing["state"] != "timeline_ready":
             await transaction.rollback()
             return {"production_id": str(existing["id"]), "state": existing["state"], "reconciled": True}
         now = datetime.now(timezone.utc)
@@ -868,9 +1563,21 @@ async def persist_media_production(request: dict[str, Any]) -> dict[str, Any]:
                 UUID(item["id"]), production_id, UUID(item["script_segment_id"]), item["segment_order"], json.dumps(item["request"]), json.dumps(item["response"]), UUID(item["original_asset_id"]), UUID(item["mastered_asset_id"]), item["duration_seconds"], item["sample_rate"], json.dumps(item["word_alignment"]), item["content_hash"], now,
             )
         manifest, render, qa = result["manifest"], result["render"], result["qa"]
-        await connection.execute("INSERT INTO production_manifests(id,production_id,manifest_version,document,content_hash,object_key,created_at) VALUES($1,$2,1,$3::jsonb,$4,$5,$6)", UUID(manifest["id"]), production_id, json.dumps(manifest["document"]), manifest["content_hash"], manifest["object_key"], now)
+        manifest_version = int(
+            await connection.fetchval(
+                "SELECT COALESCE(MAX(manifest_version),0)+1 FROM production_manifests WHERE production_id=$1",
+                production_id,
+            )
+        )
+        render_number = int(
+            await connection.fetchval(
+                "SELECT COALESCE(MAX(render_number),0)+1 FROM production_renders WHERE production_id=$1",
+                production_id,
+            )
+        )
+        await connection.execute("INSERT INTO production_manifests(id,production_id,manifest_version,document,content_hash,object_key,created_at) VALUES($1,$2,$3,$4::jsonb,$5,$6,$7)", UUID(manifest["id"]), production_id, manifest_version, json.dumps(manifest["document"]), manifest["content_hash"], manifest["object_key"], now)
         await connection.execute("""INSERT INTO production_renders(id,production_id,render_number,tier,video_asset_id,manifest_id,render_engine,render_engine_version,composition,settings,probe,content_hash,created_at)
-                                    VALUES($1,$2,1,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12)""", UUID(render["id"]), production_id, context["render_tier"], UUID(render["video_asset_id"]), UUID(manifest["id"]), render["engine"], render["engine_version"], render["composition"], json.dumps(render["settings"]), json.dumps(render["probe"]), render["content_hash"], now)
+                                    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13)""", UUID(render["id"]), production_id, render_number, context["render_tier"], UUID(render["video_asset_id"]), UUID(manifest["id"]), render["engine"], render["engine_version"], render["composition"], json.dumps(render["settings"]), json.dumps(render["probe"]), render["content_hash"], now)
         report_id = uuid5(NAMESPACE_URL, f"{context['workflow_id']}:qa:1")
         await connection.execute("INSERT INTO qa_reports(id,render_id,verdict,policy_snapshot,metrics,content_hash,created_at) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7)", report_id, UUID(render["id"]), qa["verdict"], json.dumps(qa["policy_snapshot"]), json.dumps(qa["metrics"]), qa["content_hash"], now)
         for order, finding in enumerate(qa["findings"], 1):
@@ -878,7 +1585,7 @@ async def persist_media_production(request: dict[str, Any]) -> dict[str, Any]:
                                         VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,$7::jsonb,$8,$9)""", uuid5(NAMESPACE_URL, f"{context['workflow_id']}:qa:{finding['code']}"), report_id, order, finding["code"], finding["verdict"], finding["message"], json.dumps(finding["details"]), finding["override_policy"], now)
         await append_audit(connection, action="media_production.completed" if qa["verdict"] != "fail" else "media_production.blocked", actor_id=UUID(context["actor_id"]), target_type="media_production", target_id=str(production_id), correlation_id=context["correlation_id"], context={"workflow_id": context["workflow_id"], "storyboard_version_id": context["storyboard_version_id"], "storyboard_hash": context["storyboard_hash"], "render_hash": render["content_hash"], "manifest_hash": manifest["content_hash"], "qa_hash": qa["content_hash"], "qa_verdict": qa["verdict"]})
         await transaction.commit()
-        return {"production_id": str(production_id), "state": final_state, "render_id": render["id"], "render_hash": render["content_hash"], "manifest_hash": manifest["content_hash"], "qa_verdict": qa["verdict"], "reconciled": False}
+        return {"production_id": str(production_id), "state": final_state, "render_id": render["id"], "render_hash": render["content_hash"], "manifest_hash": manifest["content_hash"], "qa_verdict": qa["verdict"], "render_number": render_number, "manifest_version": manifest_version, "reconciled": False}
     except Exception:
         await transaction.rollback()
         raise

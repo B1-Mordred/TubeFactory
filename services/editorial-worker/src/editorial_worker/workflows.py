@@ -3123,6 +3123,136 @@ class MediaProductionWorkflow:
         return {"workflow_id": workflow.info().workflow_id, "state": self._state, "progress": self._progress, "result": self._result}
 
 
+@workflow.defn(name="media-timeline-draft")
+class MediaTimelineDraftWorkflow:
+    def __init__(self) -> None:
+        self._state = "CREATED"
+        self._progress = 0
+        self._result: dict[str, Any] | None = None
+
+    @workflow.run
+    async def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        context: dict[str, Any] | None = None
+        try:
+            self._state, self._progress = "VALIDATING_APPROVED_INPUTS", 5
+            context = await workflow.execute_activity(
+                "load-media-production-context", request,
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+            )
+            await workflow.execute_activity(
+                "record-media-production-state", {"context": context, "state": "queued"},
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+            )
+            self._state, self._progress = "GENERATING_AND_MASTERING_NARRATION", 30
+            await workflow.execute_activity(
+                "record-media-production-state", {"context": context, "state": "generating_narration"},
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+            )
+            narration = await workflow.execute_activity(
+                "generate-production-narration", context,
+                start_to_close_timeout=timedelta(minutes=45),
+                heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(initial_interval=timedelta(seconds=5), maximum_interval=timedelta(minutes=1), maximum_attempts=3),
+            )
+            self._state, self._progress = "SYNCHRONIZING_PRODUCTION_TIMELINE", 70
+            synchronized = await workflow.execute_activity(
+                "synchronize-media-timing", {"context": context, "narration": narration},
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+            context, narration = synchronized["context"], synchronized["narration"]
+            self._state, self._progress = "PERSISTING_TIMELINE_DRAFT", 90
+            self._result = await workflow.execute_activity(
+                "persist-media-timeline-draft", {"context": context, "narration": narration},
+                start_to_close_timeout=timedelta(minutes=5), retry_policy=_DB_RETRY,
+            )
+            self._state, self._progress = "TIMELINE_READY", 100
+            return self._result
+        except Exception:
+            self._state = "TIMELINE_DRAFT_FAILED"
+            if context is not None:
+                try:
+                    await workflow.execute_activity(
+                        "record-media-production-state", {"context": context, "state": "failed"},
+                        start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+                    )
+                except Exception:
+                    pass
+            raise
+
+    @workflow.query(name="status")
+    def status(self) -> dict[str, Any]:
+        return {"workflow_id": workflow.info().workflow_id, "state": self._state, "progress": self._progress, "result": self._result}
+
+
+@workflow.defn(name="media-timeline-render")
+class MediaTimelineRenderWorkflow:
+    def __init__(self) -> None:
+        self._state = "CREATED"
+        self._progress = 0
+        self._result: dict[str, Any] | None = None
+
+    @workflow.run
+    async def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        context: dict[str, Any] | None = None
+        try:
+            self._state, self._progress = "LOADING_SAVED_TIMELINE", 10
+            context = await workflow.execute_activity(
+                "load-media-timeline-render-context", request,
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+            )
+            narration = context["narration"]
+            self._state, self._progress = "GENERATING_MISSING_SCENE_ASSETS", 35
+            await workflow.execute_activity(
+                "record-media-production-state", {"context": context, "state": "generating_assets"},
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+            )
+            scene_result = await workflow.execute_activity(
+                "generate-scene-media-assets", context,
+                start_to_close_timeout=timedelta(minutes=45),
+                heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(initial_interval=timedelta(seconds=5), maximum_interval=timedelta(minutes=1), maximum_attempts=3),
+            )
+            self._state, self._progress = "TIMELINE_ASSEMBLY_AND_QA", 70
+            await workflow.execute_activity(
+                "record-media-production-state", {"context": context, "state": "assembling"},
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+            )
+            assembled = await workflow.execute_activity(
+                "assemble-and-qa-production",
+                {"context": context, "scene_result": scene_result, "narration": narration},
+                start_to_close_timeout=timedelta(hours=2),
+                heartbeat_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(initial_interval=timedelta(seconds=10), maximum_interval=timedelta(minutes=2), maximum_attempts=2),
+            )
+            self._state, self._progress = "PERSISTING_IMMUTABLE_PROVENANCE", 95
+            await workflow.execute_activity(
+                "record-media-production-state", {"context": context, "state": "quality_assurance"},
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+            )
+            self._result = await workflow.execute_activity(
+                "persist-media-production", {"context": context, "result": assembled},
+                start_to_close_timeout=timedelta(minutes=5), retry_policy=_DB_RETRY,
+            )
+            self._state = "MEDIA_READY" if self._result["state"] == "ready" else "MEDIA_BLOCKED"
+            self._progress = 100
+            return self._result
+        except Exception:
+            self._state = "TIMELINE_RENDER_FAILED"
+            if context is not None:
+                try:
+                    await workflow.execute_activity(
+                        "record-media-production-state", {"context": context, "state": "failed"},
+                        start_to_close_timeout=timedelta(minutes=2), retry_policy=_DB_RETRY,
+                    )
+                except Exception:
+                    pass
+            raise
+
+    @workflow.query(name="status")
+    def status(self) -> dict[str, Any]:
+        return {"workflow_id": workflow.info().workflow_id, "state": self._state, "progress": self._progress, "result": self._result}
+
+
 @workflow.defn(name="scene-media-regeneration")
 class SceneMediaRegenerationWorkflow:
     def __init__(self) -> None:

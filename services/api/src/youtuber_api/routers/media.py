@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import mimetypes
 import re
+import subprocess
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -54,6 +58,9 @@ from youtuber_api.schemas import (
     ComfyWorkflowWrite,
     MediaAssetView,
     MediaProductionStart,
+    MediaTimelineDraftStart,
+    MediaTimelinePlanWrite,
+    MediaTimelineRenderStart,
     MediaProductionView,
     MediaRegenerationStart,
     PublishMetadataWrite,
@@ -104,6 +111,58 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _timeline_plan_hash(plan: dict[str, Any]) -> str:
+    return _digest({key: value for key, value in plan.items() if key not in {"content_hash", "updated_at"}})
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number == number and abs(number) != float("inf") else default
+
+
+def _safe_filename(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip(".-")
+    return name[:160] or "operator-clip"
+
+
+def _probe_media(path: Path) -> dict[str, Any]:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode:
+        return {"probe_error": result.stderr.decode(errors="replace")[-1000:]}
+    payload = json.loads(result.stdout or b"{}")
+    streams = payload.get("streams", [])
+    video = next((item for item in streams if item.get("codec_type") == "video"), None)
+    duration = _safe_float(payload.get("format", {}).get("duration"), 0.0) or _safe_float((video or {}).get("duration"), 0.0)
+    return {
+        "duration_seconds": duration or None,
+        "width": int(video["width"]) if video and str(video.get("width", "")).isdigit() else None,
+        "height": int(video["height"]) if video and str(video.get("height", "")).isdigit() else None,
+        "streams": [
+            {
+                "codec_type": item.get("codec_type"),
+                "codec_name": item.get("codec_name"),
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "duration": item.get("duration"),
+            }
+            for item in streams
+            if item.get("codec_type") in {"video", "audio"}
+        ],
+    }
+
+
+def _asset_view(item: MediaAssetModel) -> MediaAssetView:
+    return MediaAssetView.model_validate(item, from_attributes=True)
+
+
 async def _direct_storyboard_placeholders(
     session: AsyncSession, storyboard_version_id: UUID
 ) -> list[str]:
@@ -125,6 +184,188 @@ async def _direct_storyboard_placeholders(
     return sorted(
         set(re.findall(r"\[[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9_.:-]{1,80}\]", _canonical(specs).decode()))
     )
+
+
+async def _normalise_timeline_plan(
+    session: AsyncSession,
+    production: MediaProductionModel,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(plan, dict) or plan.get("schema_version") != "media_timeline.v1":
+        raise HTTPException(status_code=422, detail="Timeline plan must use schema_version media_timeline.v1")
+    settings = dict(production.settings or {})
+    base = settings.get("timeline_plan")
+    if not isinstance(base, dict):
+        raise HTTPException(status_code=409, detail="Create the narration timeline before editing it")
+    rows = list(
+        await session.scalars(
+            select(SceneVersionModel).where(
+                SceneVersionModel.storyboard_version_id == production.storyboard_version_id
+            ).order_by(SceneVersionModel.scene_order)
+        )
+    )
+    required_scene_ids = [str(item.id) for item in rows]
+    scenes = plan.get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        raise HTTPException(status_code=422, detail="Timeline plan must contain scenes")
+    storyboard_scenes = [item for item in scenes if isinstance(item, dict) and item.get("role") == "storyboard"]
+    if [str(item.get("scene_version_id")) for item in storyboard_scenes] != required_scene_ids:
+        raise HTTPException(status_code=422, detail="Storyboard scenes must remain present, ordered, and undeleted")
+    base_scenes = base.get("scenes")
+    if not isinstance(base_scenes, list):
+        raise HTTPException(status_code=409, detail="Stored narration timeline is incomplete; recreate the timeline draft")
+    base_scenes_by_id = {
+        str(item.get("scene_version_id")): item
+        for item in base_scenes
+        if isinstance(item, dict) and item.get("scene_version_id")
+    }
+    assets = list(await session.scalars(select(MediaAssetModel).where(MediaAssetModel.production_id == production.id)))
+    assets_by_id = {str(item.id): item for item in assets}
+
+    intro = [item for item in scenes if isinstance(item, dict) and item.get("role") == "intro"]
+    outro = [item for item in scenes if isinstance(item, dict) and item.get("role") == "outro"]
+    unsupported = [item for item in scenes if not isinstance(item, dict) or item.get("role") not in {"intro", "storyboard", "outro"}]
+    if unsupported:
+        raise HTTPException(status_code=422, detail="Only intro, storyboard, and outro scenes are supported")
+    ordered = [*intro, *storyboard_scenes, *outro]
+    cursor = 0.0
+    normalised_scenes: list[dict[str, Any]] = []
+    video_track: list[dict[str, Any]] = []
+    for index, raw in enumerate(ordered, 1):
+        role = str(raw.get("role"))
+        duration = max(0.5, min(900.0, _safe_float(raw.get("duration_seconds"), 3.0)))
+        if role == "storyboard":
+            base_scene = base_scenes_by_id.get(str(raw.get("scene_version_id")))
+            if base_scene is None:
+                raise HTTPException(status_code=409, detail="Stored narration timeline no longer matches the approved storyboard; recreate the timeline draft")
+            duration = _safe_float(base_scene.get("duration_seconds"), duration)
+        scene_id = str(raw.get("id") or f"{role}:{index}")
+        video = raw.get("video") if isinstance(raw.get("video"), dict) else {}
+        asset_id = video.get("asset_id")
+        if asset_id in {"", None}:
+            asset_id = None
+        if asset_id is not None:
+            asset = assets_by_id.get(str(asset_id))
+            if asset is None:
+                raise HTTPException(status_code=422, detail=f"Timeline scene {scene_id} references an unknown media asset")
+            if not asset.mime_type.startswith(("image/", "video/")):
+                raise HTTPException(status_code=422, detail=f"Timeline scene {scene_id} must use an image or video asset")
+        source_start = max(0.0, _safe_float(video.get("source_start_seconds"), 0.0))
+        source_end_raw = video.get("source_end_seconds")
+        source_end = None if source_end_raw in {None, ""} else max(source_start + 0.05, _safe_float(source_end_raw, source_start + duration))
+        start = round(cursor, 3)
+        end = round(cursor + duration, 3)
+        normalised = {
+            **raw,
+            "id": scene_id,
+            "role": role,
+            "start_seconds": start,
+            "duration_seconds": round(duration, 3),
+            "end_seconds": end,
+            "video": {
+                **video,
+                "mode": "operator_clip" if asset_id else "generated",
+                "asset_id": str(asset_id) if asset_id else None,
+                "source_start_seconds": round(source_start, 3),
+                "source_end_seconds": round(source_end, 3) if source_end is not None else None,
+                "fit": str(video.get("fit") or "cover"),
+                "volume": 0.0,
+            },
+            "can_delete": role != "storyboard",
+            "locked_to_narration": role == "storyboard",
+        }
+        if role == "storyboard":
+            normalised["scene_version_id"] = str(raw["scene_version_id"])
+            normalised["scene_hash"] = str(raw.get("scene_hash") or "")
+        normalised_scenes.append(normalised)
+        video_track.append(
+            {
+                "id": f"video:{scene_id}",
+                "kind": "scene_visual",
+                "scene_id": scene_id,
+                "asset_id": str(asset_id) if asset_id else None,
+                "mode": normalised["video"]["mode"],
+                "start_seconds": start,
+                "duration_seconds": round(duration, 3),
+                "end_seconds": end,
+                "source_start_seconds": round(source_start, 3),
+                "source_end_seconds": round(source_end, 3) if source_end is not None else None,
+                "fit": normalised["video"]["fit"],
+                "volume": 0.0,
+            }
+        )
+        cursor = end
+
+    narration = base.get("narration", {})
+    narration_duration = _safe_float(narration.get("duration_seconds"), 0.0)
+    narration_start = next((scene["start_seconds"] for scene in normalised_scenes if scene["role"] == "storyboard"), 0.0)
+    raw_tracks = plan.get("tracks") if isinstance(plan.get("tracks"), dict) else {}
+    audio_track: list[dict[str, Any]] = [
+        {
+            "id": "audio:narration-master",
+            "kind": "narration",
+            "asset_id": narration.get("asset_id"),
+            "start_seconds": round(narration_start, 3),
+            "duration_seconds": round(narration_duration, 3),
+            "end_seconds": round(narration_start + narration_duration, 3),
+            "source_start_seconds": 0.0,
+            "source_end_seconds": round(narration_duration, 3),
+            "volume": 1.0,
+            "locked": True,
+        }
+    ]
+    for track_name in ("audio", "music", "sfx"):
+        for raw in raw_tracks.get(track_name, []):
+            if not isinstance(raw, dict) or raw.get("kind") == "narration":
+                continue
+            asset_id = str(raw.get("asset_id") or "")
+            asset = assets_by_id.get(asset_id)
+            if asset is None or not asset.mime_type.startswith("audio/"):
+                raise HTTPException(status_code=422, detail="Audio tracks must reference uploaded audio assets")
+            duration = max(0.05, min(900.0, _safe_float(raw.get("duration_seconds"), asset.duration_seconds or 1.0)))
+            start = max(0.0, _safe_float(raw.get("start_seconds"), 0.0))
+            source_start = max(0.0, _safe_float(raw.get("source_start_seconds"), 0.0))
+            source_end_raw = raw.get("source_end_seconds")
+            source_end = None if source_end_raw in {None, ""} else max(source_start + 0.05, _safe_float(source_end_raw, source_start + duration))
+            audio_track.append(
+                {
+                    **raw,
+                    "id": str(raw.get("id") or f"{track_name}:{asset_id}:{len(audio_track)}"),
+                    "kind": str(raw.get("kind") or f"operator_{track_name}"),
+                    "asset_id": asset_id,
+                    "start_seconds": round(start, 3),
+                    "duration_seconds": round(duration, 3),
+                    "end_seconds": round(start + duration, 3),
+                    "source_start_seconds": round(source_start, 3),
+                    "source_end_seconds": round(source_end, 3) if source_end is not None else None,
+                    "volume": min(2.0, max(0.0, _safe_float(raw.get("volume"), 1.0))),
+                    "locked": False,
+                }
+            )
+
+    normalised_plan = {
+        **plan,
+        "production_id": str(production.id),
+        "storyboard_version_id": str(production.storyboard_version_id),
+        "storyboard_hash": production.storyboard_hash,
+        "render_tier": production.render_tier,
+        "width": settings.get("width", 854),
+        "height": settings.get("height", 480),
+        "fps": settings.get("fps", 24),
+        "duration_seconds": round(cursor, 3),
+        "narration": narration,
+        "scenes": normalised_scenes,
+        "tracks": {
+            "video": video_track,
+            "audio": audio_track,
+            "music": [],
+            "sfx": [],
+        },
+        "editorial_controls": base.get("editorial_controls", {}),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    normalised_plan["content_hash"] = _timeline_plan_hash(normalised_plan)
+    return normalised_plan
 
 
 async def _commit(session: AsyncSession, detail: str) -> None:
@@ -290,6 +531,8 @@ async def _production_view(session: AsyncSession, production: MediaProductionMod
         qa=None if not report else {"id": str(report.id), "verdict": report.verdict, "content_hash": report.content_hash, "metrics": report.metrics, "policy_snapshot": report.policy_snapshot},
         findings=[QAFindingView(id=item.id, code=item.code, verdict=item.verdict, message=item.message, scene_version_id=item.scene_version_id, timecode_seconds=item.timecode_seconds, details=item.details, override_policy=item.override_policy, overridden=override is not None, override_reason=override.reason if override else None) for item, override in finding_rows],
         approval=None if not approval else {"id": str(approval.id), "decision": approval.decision, "comment": approval.comment, "actor_id": str(approval.actor_id), "created_at": approval.created_at.isoformat()},
+        timeline_plan=production.settings.get("timeline_plan") if isinstance(production.settings, dict) else None,
+        timeline_plan_hash=production.settings.get("timeline_plan_hash") if isinstance(production.settings, dict) else None,
     )
 
 
@@ -379,6 +622,235 @@ async def start_production(
         await session.flush()
     await gateway.start("media-production", existing.request_payload if existing else workflow_payload)
     await append_audit(session, action="media_production.reconciled" if existing else "media_production.started", actor_id=actor.id, target_type="storyboard_version", target_id=str(storyboard.id), correlation_id=request.state.correlation_id, context={"workflow_id": workflow_id, "storyboard_hash": storyboard.content_hash, "render_tier": payload.render_tier, "comfy_workflow_version_id": str(workflow.id), "voice_profile_version_id": str(voice.id)})
+    await session.commit()
+    description = await gateway.describe(workflow_id)
+    description["correlation_id"] = request.state.correlation_id
+    return ResearchWorkflowView.model_validate(description)
+
+
+@router.post("/timeline-drafts", response_model=ResearchWorkflowView, status_code=202)
+async def start_timeline_draft(
+    payload: MediaTimelineDraftStart,
+    request: Request,
+    actor: Operator,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ResearchWorkflowView:
+    storyboard = await session.get(StoryboardVersionModel, payload.storyboard_version_id)
+    storyboard_record = await session.get(StoryboardModel, storyboard.storyboard_id) if storyboard else None
+    if (
+        storyboard is None
+        or storyboard_record is None
+        or storyboard_record.status != "approved"
+        or storyboard_record.current_version_id != storyboard.id
+        or storyboard.content_hash != payload.expected_storyboard_hash
+    ):
+        raise HTTPException(status_code=409, detail="Use the exact approved storyboard version and hash")
+    existing_production = await session.scalar(
+        select(MediaProductionModel).where(
+            MediaProductionModel.storyboard_version_id == storyboard.id,
+            MediaProductionModel.render_tier == payload.render_tier,
+            MediaProductionModel.state.in_(
+                {
+                    "queued",
+                    "generating_narration",
+                    "generating_assets",
+                    "assembling",
+                    "quality_assurance",
+                    "timeline_ready",
+                }
+            ),
+        )
+    )
+    if existing_production is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "An active narration timeline or render already exists for this storyboard and tier",
+                "production_id": str(existing_production.id),
+                "state": existing_production.state,
+            },
+        )
+    approval = await session.scalar(select(ApprovalModel.id).where(ApprovalModel.target_type == "storyboard_version", ApprovalModel.target_id == storyboard.id, ApprovalModel.target_version == storyboard.version_number, ApprovalModel.target_hash == storyboard.content_hash, ApprovalModel.decision == "approved"))
+    if approval is None:
+        raise HTTPException(status_code=409, detail="Storyboard version has no exact-hash approval")
+    unresolved = await _direct_storyboard_placeholders(session, storyboard.id)
+    if unresolved:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Narration timeline is blocked until placeholders are resolved",
+                "placeholder_tokens": unresolved,
+            },
+        )
+    workflow_head = await session.get(ComfyWorkflowHeadModel, payload.workflow_key)
+    voice_head = await session.get(VoiceProfileHeadModel, payload.voice_profile_key)
+    workflow = await session.get(ComfyWorkflowVersionModel, workflow_head.active_version_id) if workflow_head else None
+    voice = await session.get(VoiceProfileVersionModel, voice_head.active_version_id) if voice_head else None
+    if workflow is None or workflow.approval_state != "approved":
+        raise HTTPException(status_code=409, detail="Select an active approved ComfyUI workflow")
+    if voice is None or not voice.enabled:
+        raise HTTPException(status_code=409, detail="Select an active enabled voice profile")
+    if {"width": payload.width, "height": payload.height} not in workflow.allowed_resolutions:
+        raise HTTPException(status_code=422, detail="Resolution is not allowed by this workflow version")
+    workflow_id = f"media-timeline-draft-{payload.idempotency_key}"
+    workflow_payload = {**payload.model_dump(mode="json"), "workflow_id": workflow_id, "actor_id": str(actor.id), "correlation_id": request.state.correlation_id, "comfy_workflow_version_id": str(workflow.id), "voice_profile_version_id": str(voice.id)}
+    existing = await session.get(WorkflowControlRecordModel, workflow_id)
+    gateway = TemporalEditorialGateway(request.app.state.temporal_client)
+    if existing:
+        comparable = {key: value for key, value in existing.request_payload.items() if key not in {"actor_id", "correlation_id"}}
+        proposed = {key: value for key, value in workflow_payload.items() if key not in {"actor_id", "correlation_id"}}
+        if existing.workflow_type != "media-timeline-draft" or comparable != proposed:
+            raise HTTPException(status_code=409, detail="Idempotency key is already used by another request")
+    else:
+        session.add(WorkflowControlRecordModel(workflow_id=workflow_id, workflow_type="media-timeline-draft", request_payload=workflow_payload, parent_workflow_id=None, correlation_id=request.state.correlation_id, started_by=actor.id, created_at=datetime.now(timezone.utc)))
+        await session.flush()
+    await gateway.start("media-timeline-draft", existing.request_payload if existing else workflow_payload)
+    await append_audit(session, action="media_timeline.draft_started" if not existing else "media_timeline.draft_reconciled", actor_id=actor.id, target_type="storyboard_version", target_id=str(storyboard.id), correlation_id=request.state.correlation_id, context={"workflow_id": workflow_id, "storyboard_hash": storyboard.content_hash, "render_tier": payload.render_tier, "voice_profile_version_id": str(voice.id)})
+    await session.commit()
+    description = await gateway.describe(workflow_id)
+    description["correlation_id"] = request.state.correlation_id
+    return ResearchWorkflowView.model_validate(description)
+
+
+@router.post("/productions/{production_id}/clips", response_model=MediaAssetView, status_code=201)
+async def upload_operator_clip(
+    production_id: UUID,
+    request: Request,
+    actor: Operator,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    file: Annotated[UploadFile, File(...)],
+    licence_basis: Annotated[str, Form(min_length=3, max_length=240)] = "operator_supplied",
+    comment: Annotated[str, Form(max_length=2000)] = "",
+) -> MediaAssetView:
+    production = await session.get(MediaProductionModel, production_id)
+    if production is None:
+        raise HTTPException(status_code=404, detail="Media production not found")
+    if production.state == "cancelled":
+        raise HTTPException(status_code=409, detail="Cancelled productions cannot accept clips")
+    mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    allowed = {
+        "image/png", "image/jpeg", "image/webp",
+        "video/mp4", "video/webm", "video/quicktime",
+        "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/aac", "audio/ogg", "audio/mp4",
+    }
+    if mime not in allowed:
+        raise HTTPException(status_code=415, detail="Upload a supported image, video, or audio file")
+    maximum_bytes = 2 * 1024 * 1024 * 1024
+    digest = hashlib.sha256()
+    size = 0
+    suffix = Path(file.filename or "").suffix.lower()[:12]
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / f"upload{suffix or '.bin'}"
+        with path.open("wb") as handle:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > maximum_bytes:
+                    raise HTTPException(status_code=413, detail="Clip upload exceeds the 2 GiB limit")
+                digest.update(chunk)
+                handle.write(chunk)
+        if size == 0:
+            raise HTTPException(status_code=422, detail="Uploaded clip is empty")
+        probe = _probe_media(path)
+        asset_id = uuid4()
+        filename = _safe_filename(file.filename or f"{asset_id}{suffix or ''}")
+        object_key = f"productions/{production.id}/operator-clips/{asset_id}-{filename}"
+        await asyncio.to_thread(
+            request.app.state.minio_client.fput_object,
+            get_settings().minio_bucket,
+            object_key,
+            str(path),
+            content_type=mime,
+        )
+    now = datetime.now(timezone.utc)
+    asset = MediaAssetModel(
+        id=asset_id,
+        production_id=production.id,
+        scene_version_id=None,
+        asset_kind="operator_clip",
+        object_key=object_key,
+        content_hash=digest.hexdigest(),
+        mime_type=mime,
+        byte_size=size,
+        width=probe.get("width"),
+        height=probe.get("height"),
+        duration_seconds=probe.get("duration_seconds"),
+        licence={"status": "cleared", "basis": licence_basis, "comment": comment, "synthetic": False},
+        generation_provenance={"schema_version": "operator_clip.v1", "uploaded_by": str(actor.id), "filename": file.filename, "probe": probe},
+        cache_key=None,
+        created_at=now,
+    )
+    session.add(asset)
+    await append_audit(session, action="media_timeline.clip_uploaded", actor_id=actor.id, target_type="media_production", target_id=str(production.id), correlation_id=request.state.correlation_id, context={"asset_id": str(asset.id), "mime_type": mime, "byte_size": size, "content_hash": asset.content_hash, "licence_basis": licence_basis})
+    await session.commit()
+    return _asset_view(asset)
+
+
+@router.put("/productions/{production_id}/timeline-plan", response_model=MediaProductionView)
+async def save_timeline_plan(
+    production_id: UUID,
+    payload: MediaTimelinePlanWrite,
+    request: Request,
+    actor: Operator,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> MediaProductionView:
+    production = await session.get(MediaProductionModel, production_id)
+    if production is None:
+        raise HTTPException(status_code=404, detail="Media production not found")
+    settings = dict(production.settings or {})
+    current_hash = settings.get("timeline_plan_hash")
+    if payload.expected_timeline_plan_hash and payload.expected_timeline_plan_hash != current_hash:
+        raise HTTPException(status_code=409, detail="Timeline changed; reload before saving")
+    plan = await _normalise_timeline_plan(session, production, payload.timeline_plan)
+    settings["timeline_plan"] = plan
+    settings["timeline_plan_hash"] = plan["content_hash"]
+    settings["timeline_plan_updated_at"] = plan["updated_at"]
+    production.settings = settings
+    if production.state not in {"ready", "blocked"}:
+        production.state = "timeline_ready"
+    await append_audit(session, action="media_timeline.plan_saved", actor_id=actor.id, target_type="media_production", target_id=str(production.id), correlation_id=request.state.correlation_id, context={"timeline_plan_hash": plan["content_hash"], "comment": payload.comment, "scene_count": len(plan["scenes"])})
+    await session.commit()
+    return await _production_view(session, production)
+
+
+@router.post("/productions/{production_id}/timeline-render", response_model=ResearchWorkflowView, status_code=202)
+async def start_timeline_render(
+    production_id: UUID,
+    payload: MediaTimelineRenderStart,
+    request: Request,
+    actor: Operator,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ResearchWorkflowView:
+    production = await session.get(MediaProductionModel, production_id)
+    if production is None:
+        raise HTTPException(status_code=404, detail="Media production not found")
+    settings = production.settings or {}
+    if settings.get("timeline_plan_hash") != payload.expected_timeline_plan_hash:
+        raise HTTPException(status_code=409, detail="Timeline changed; reload before rendering")
+    if not isinstance(settings.get("timeline_plan"), dict):
+        raise HTTPException(status_code=409, detail="Save a narration timeline before rendering")
+    workflow_id = f"media-timeline-render-{payload.idempotency_key}"
+    workflow_payload = {
+        "workflow_id": workflow_id,
+        "production_id": str(production.id),
+        "expected_timeline_plan_hash": payload.expected_timeline_plan_hash,
+        "actor_id": str(actor.id),
+        "correlation_id": request.state.correlation_id,
+    }
+    existing = await session.get(WorkflowControlRecordModel, workflow_id)
+    gateway = TemporalEditorialGateway(request.app.state.temporal_client)
+    if existing:
+        comparable = {key: value for key, value in existing.request_payload.items() if key not in {"actor_id", "correlation_id"}}
+        proposed = {key: value for key, value in workflow_payload.items() if key not in {"actor_id", "correlation_id"}}
+        if existing.workflow_type != "media-timeline-render" or comparable != proposed:
+            raise HTTPException(status_code=409, detail="Idempotency key is already used by another request")
+    else:
+        session.add(WorkflowControlRecordModel(workflow_id=workflow_id, workflow_type="media-timeline-render", request_payload=workflow_payload, parent_workflow_id=production.workflow_id, correlation_id=request.state.correlation_id, started_by=actor.id, created_at=datetime.now(timezone.utc)))
+        await session.flush()
+    await gateway.start("media-timeline-render", existing.request_payload if existing else workflow_payload)
+    await append_audit(session, action="media_timeline.render_started" if not existing else "media_timeline.render_reconciled", actor_id=actor.id, target_type="media_production", target_id=str(production.id), correlation_id=request.state.correlation_id, context={"workflow_id": workflow_id, "timeline_plan_hash": payload.expected_timeline_plan_hash})
     await session.commit()
     description = await gateway.describe(workflow_id)
     description["correlation_id"] = request.state.correlation_id

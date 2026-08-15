@@ -30,6 +30,8 @@ class TemporalEditorialGateway(TemporalResearchGateway):
             "scene-alternative-generation",
             "storyboard-generation",
             "media-production",
+            "media-timeline-draft",
+            "media-timeline-render",
             "scene-media-regeneration",
             "narration-segment-regeneration",
         }:
