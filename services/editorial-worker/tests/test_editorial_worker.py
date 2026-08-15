@@ -478,6 +478,8 @@ def test_scoped_verifier_repair_defaults_to_single_pass_before_fallback() -> Non
 
     assert "maximum_attempts: int | None = None" in source
     assert "maximum_attempts = 1 if allowed_segment_keys is not None else 3" in source
+    assert "len(segment_keys) > _SCOPED_VERIFIER_REPAIR_SEGMENT_LIMIT" in source
+    assert "break" in source
 
 
 def test_verifier_correction_boundary_is_ordered_bounded_and_lock_aware() -> None:

@@ -19,6 +19,7 @@ _MODEL_RETRY = RetryPolicy(
 _EDITORIAL_MODEL_ACTIVITY_TIMEOUT = timedelta(minutes=12)
 _EDITORIAL_MODEL_RETRY = RetryPolicy(maximum_attempts=1)
 _DB_RETRY = RetryPolicy(maximum_attempts=5)
+_SCOPED_VERIFIER_REPAIR_SEGMENT_LIMIT = 3
 _SCRIPT_SEGMENT_TYPES = (
     "hook", "thesis", "context", "evidence", "counterevidence",
     "uncertainty", "conclusion", "call_to_action",
@@ -2193,6 +2194,11 @@ async def _refine_script_with_verifier(
             verifier["output"],
             allowed_segment_keys=allowed_segment_keys,
         )
+        if (
+            allowed_segment_keys is not None
+            and len(segment_keys) > _SCOPED_VERIFIER_REPAIR_SEGMENT_LIMIT
+        ):
+            break
         if not segment_keys:
             break
         for focused_segment_keys in _correction_batches(segment_keys):
